@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>VYNE™ — Terms of Service</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet"/>
+<!--
+  Deliberately standalone (see about.html's comment) — does NOT load
+  vyne-client.js. Legal pages must be reachable by a prospective customer
+  who has never signed in, and must never depend on an active session.
+-->
+<style>
+:root{
+  --navy:#01203D;--navy-2:#0A2E4D;--ink:#132433;--paper:#F3F1EB;--panel:#FFFFFF;
+  --panel-raised:#FAF8F3;--line:#E8E3D8;--line-strong:#D8D3C7;--quiet:#6C7783;--quiet-soft:#9AA4AE;
+  --gold:#A88553;--gold-2:#C6A46B;--signal-bg:#F4ECDD;--live:#2F7D4F;--live-bg:#E9F2EC;
+  --warn:#A9761C;--warn-bg:#F8EFDC;--danger:#B0324B;--danger-bg:#F7E7EB;
+  --r-sm:9px;--r-lg:14px;--r-pill:999px;
+  --shadow:0 1px 2px rgba(16,33,47,.05),0 10px 30px rgba(16,33,47,.06);
+}
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:var(--paper);color:var(--ink);font-family:'Inter',system-ui,sans-serif;font-size:14px;line-height:1.65;
+  -webkit-font-smoothing:antialiased;min-height:100vh}
+.page{max-width:820px;margin:0 auto;padding:2rem}
+a{color:var(--gold);font-weight:600;text-decoration:none}
+a:hover{text-decoration:underline}
+.header{display:flex;align-items:center;justify-content:space-between;margin-bottom:26px;padding-bottom:1rem;border-bottom:1px solid rgba(184,151,42,0.3)}
+.logo-row{display:flex;align-items:center;gap:12px}
+.logo-hex{width:40px;height:40px}
+.logo-text{font-family:'Space Grotesk','Inter',sans-serif;font-size:18px;color:#132433;letter-spacing:0.08em}
+.logo-sub{font-size:10px;color:#7A5C1E;letter-spacing:0.2em;text-transform:uppercase;display:block}
+.sub{font-size:12px;color:var(--quiet);margin-bottom:18px}
+.legal-nav{display:flex;gap:16px;font-size:12.5px;margin-bottom:20px}
+.banner{border-radius:var(--r-lg);padding:16px 18px;font-size:13px;font-weight:600;margin-bottom:24px;line-height:1.6;background:var(--warn-bg);color:var(--warn)}
+.panel{background:var(--panel-raised);border:1px solid var(--line);border-radius:var(--r-lg);box-shadow:var(--shadow);padding:28px 30px;margin-bottom:20px}
+h1{font-family:'Space Grotesk',sans-serif;font-size:24px;color:var(--navy);margin-bottom:6px}
+.doc-meta{font-size:12px;color:var(--quiet-soft);margin-bottom:24px}
+h2{font-family:'Space Grotesk',sans-serif;font-size:15px;color:var(--navy);margin:26px 0 10px}
+h2:first-of-type{margin-top:0}
+p{margin-bottom:12px;color:var(--ink)}
+ul,ol{margin:0 0 12px 22px}
+li{margin-bottom:6px}
+.placeholder{background:var(--signal-bg);color:#7A5C1E;padding:1px 6px;border-radius:4px;font-weight:600;font-size:12.5px}
+.footer{margin-top:36px;font-size:11.5px;color:var(--quiet-soft);text-align:center;line-height:1.7}
+</style>
+</head>
+<body>
+<div class="page">
+<div class="header">
+  <div class="logo-row">
+    <svg class="logo-hex" viewBox="0 0 40 40" fill="none">
+      <polygon points="20,2 36,10 36,30 20,38 4,30 4,10" fill="none" stroke="#C6A46B" stroke-width="1.8"/>
+      <circle cx="20" cy="20" r="9" fill="none" stroke="#C6A46B" stroke-width="1.4"/>
+      <line x1="14" y1="26" x2="26" y2="14" stroke="#C6A46B" stroke-width="1.4"/>
+    </svg>
+    <div>
+      <div class="logo-text">VYNORA</div>
+      <span class="logo-sub">Legal</span>
+    </div>
+  </div>
+</div>
+<div class="sub"><a href="index.html">← Back to VYNE</a></div>
+<div class="legal-nav">
+  <a href="terms.html">Terms of Service</a>
+  <a href="privacy.html">Privacy Policy</a>
+  <a href="dpa.html">Data Processing Agreement</a>
+</div>
+
+<div class="banner">
+  ⚠ DRAFT TEMPLATE — NOT LEGAL ADVICE. This document was generated as a starting point for a US-based B2B
+  SaaS terms of service and has NOT been reviewed by an attorney. Vynora Consulting must have this reviewed
+  and customized by qualified legal counsel — including the entity name, governing law, dispute resolution
+  terms, and every <span class="placeholder">bracketed placeholder</span> below — before relying on it or
+  publishing it as binding.
+</div>
+
+<div class="panel">
+<h1>Terms of Service</h1>
+<div class="doc-meta">Draft — not yet in effect. Last updated: <span class="placeholder">[DATE]</span></div>
+
+<h2>1. Agreement to Terms</h2>
+<p>These Terms of Service ("Terms") govern access to and use of the VYNE™ AI Readiness Diagnostic platform
+(the "Service"), provided by <span class="placeholder">[Vynora Consulting LLC, a Delaware limited liability
+company]</span> ("Vynora," "we," "us"). By creating a tenant account, signing an order form, or using the
+Service, the consulting firm entering into this agreement ("Customer," "you," "your firm") agrees to be
+bound by these Terms. If you are accepting these Terms on behalf of an organization, you represent that you
+have authority to bind that organization.</p>
+
+<h2>2. The Service</h2>
+<p>VYNE is a multi-tenant software platform that helps consulting firms run AI-readiness diagnostic
+engagements for their own clients: structured interviews, AI-assisted synthesis of findings, maturity
+scoring across defined dimensions, roadmap and solution-design generation, and related reporting. Vynora
+provides the platform; Customer is solely responsible for the professional services, advice, and
+deliverables it provides to its own clients using outputs from the Service.</p>
+
+<h2>3. Accounts, Tenants, and Users</h2>
+<p>Each Customer operates within an isolated tenant. Customer is responsible for all activity under its
+tenant, including consultant ("owner"/"consultant" role) accounts it creates and interviewee accounts it
+invites on behalf of its own clients. Customer must maintain the accuracy of account information and use
+reasonable measures (including multi-factor authentication where offered) to prevent unauthorized access.
+Vynora is not responsible for losses caused by Customer's failure to safeguard credentials.</p>
+
+<h2>4. Subscription, Fees, and Payment</h2>
+<p>Access to paid plans is billed on a subscription basis through our payment processor (Stripe) as
+described at checkout. Fees are exclusive of taxes unless stated otherwise. Except as required by law or
+expressly stated in an order form, fees are non-refundable. Vynora may change subscription pricing
+prospectively with notice before the next billing period; continued use after a price change takes effect
+constitutes acceptance. Non-payment may result in suspension or downgrade of Service access after a
+reasonable cure period, consistent with the account status shown in Customer's Account &amp; Subscription
+page.</p>
+
+<h2>5. Customer Data and Client Data</h2>
+<p>"Customer Data" means information Customer or its authorized users submit to the Service, including
+briefing materials, interview responses collected from Customer's own clients' personnel ("Interviewees"),
+synthesis outputs, and roadmap/solution-design content. As between the parties, Customer owns Customer Data.
+Customer represents that it has all necessary rights and consents to submit Interviewee responses to the
+Service, including any notices required under applicable privacy law. Vynora processes Customer Data as
+described in the <a href="privacy.html">Privacy Policy</a> and, where applicable, the
+<a href="dpa.html">Data Processing Agreement</a>.</p>
+
+<h2>6. Acceptable Use</h2>
+<p>Customer will not, and will not permit any user to: (a) use the Service to violate applicable law or a
+third party's rights; (b) attempt to access another tenant's data or bypass tenant isolation; (c) submit
+data that Customer lacks the right to submit, including special categories of personal data unless expressly
+agreed in writing; (d) reverse engineer or attempt to extract the underlying models, prompts, or source code
+of the Service beyond what is permitted by applicable law; or (e) use the Service to build a competing
+product.</p>
+
+<h2>7. AI-Generated Content</h2>
+<p>The Service uses third-party and Vynora-hosted large language models to generate synthesis summaries,
+maturity scores, roadmap narratives, and solution design documents. AI-generated content may be inaccurate,
+incomplete, or unsuitable for a particular purpose, and is provided as a drafting aid, not as professional
+advice. Customer is responsible for reviewing, verifying, and taking professional responsibility for any
+AI-generated output before relying on it or presenting it to its own clients. Vynora disclaims all
+warranties regarding the accuracy of AI-generated content.</p>
+
+<h2>8. Intellectual Property</h2>
+<p>Vynora and its licensors retain all right, title, and interest in the Service, including its software,
+design, and underlying technology, excluding Customer Data. Subject to these Terms and payment of applicable
+fees, Vynora grants Customer a non-exclusive, non-transferable license to access and use the Service during
+the subscription term for Customer's internal consulting business purposes.</p>
+
+<h2>9. Confidentiality</h2>
+<p>Each party may receive confidential information of the other. Each party will use the other's
+confidential information only to perform its obligations under these Terms and will protect it with at
+least the same degree of care it uses for its own confidential information of similar nature, and no less
+than reasonable care.</p>
+
+<h2>10. Term, Suspension, and Termination</h2>
+<p>These Terms remain in effect while Customer maintains an active subscription or trial. Either party may
+terminate for the other's uncured material breach after <span class="placeholder">[30]</span> days' written
+notice. Vynora may suspend access immediately for security risks, suspected fraud, or non-payment. Upon
+termination, Customer's right to access the Service ends; Vynora will make Customer Data available for
+export for a reasonable period as described in the DPA, after which it may be deleted in accordance with our
+data retention practices.</p>
+
+<h2>11. Disclaimers</h2>
+<p>THE SERVICE IS PROVIDED "AS IS" AND "AS AVAILABLE." TO THE MAXIMUM EXTENT PERMITTED BY LAW, VYNORA
+DISCLAIMS ALL WARRANTIES, EXPRESS OR IMPLIED, INCLUDING MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE,
+AND NON-INFRINGEMENT, AND DOES NOT WARRANT THAT THE SERVICE WILL BE UNINTERRUPTED, ERROR-FREE, OR THAT
+AI-GENERATED OUTPUT WILL BE ACCURATE.</p>
+
+<h2>12. Limitation of Liability</h2>
+<p>TO THE MAXIMUM EXTENT PERMITTED BY LAW, NEITHER PARTY WILL BE LIABLE FOR INDIRECT, INCIDENTAL, SPECIAL,
+CONSEQUENTIAL, OR PUNITIVE DAMAGES, OR LOST PROFITS OR REVENUE, ARISING OUT OF OR RELATED TO THESE TERMS OR
+THE SERVICE. EACH PARTY'S TOTAL LIABILITY ARISING OUT OF OR RELATED TO THESE TERMS WILL NOT EXCEED THE FEES
+PAID OR PAYABLE BY CUSTOMER TO VYNORA IN THE <span class="placeholder">[TWELVE (12)]</span> MONTHS PRECEDING
+THE CLAIM. This limitation does not apply to a party's indemnification obligations, breach of confidentiality,
+or either party's willful misconduct, to the extent such limitation is unenforceable under applicable law.</p>
+
+<h2>13. Indemnification</h2>
+<p>Customer will indemnify and hold Vynora harmless from third-party claims arising from Customer Data,
+Customer's breach of Section 6 (Acceptable Use), or Customer's violation of applicable law in connection with
+its use of the Service, including its collection of Interviewee responses.</p>
+
+<h2>14. Governing Law and Disputes</h2>
+<p>These Terms are governed by the laws of <span class="placeholder">[the State of Delaware, USA]</span>,
+without regard to conflict-of-law principles. The parties will attempt to resolve disputes informally first;
+unresolved disputes will be subject to the exclusive jurisdiction of the courts located in
+<span class="placeholder">[COUNTY, STATE]</span>, unless a different dispute resolution mechanism (e.g.
+arbitration) is specified in an executed order form.</p>
+
+<h2>15. Changes to These Terms</h2>
+<p>Vynora may update these Terms from time to time. Material changes will be notified via the Service or by
+email to the account owner at least <span class="placeholder">[30]</span> days before taking effect. Continued
+use of the Service after the effective date constitutes acceptance of the updated Terms.</p>
+
+<h2>16. Contact</h2>
+<p>Questions about these Terms may be directed to <span class="placeholder">[legal@vynora.example]</span>.</p>
+
+</div>
+
+<div class="footer">
+  This is a template, not a substitute for advice from a licensed attorney in your jurisdiction. ·
+  <a href="index.html">← Back to VYNE</a>
+</div>
+</div><!-- /.page -->
+</body>
+</html>

@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>VYNE™ Platform — Operator Console</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet"/>
+<style>
+:root{
+  --navy:#01203D;--navy-2:#0A2E4D;--ink:#132433;--paper:#F3F1EB;--panel:#FFFFFF;
+  --panel-raised:#FAF8F3;--line:#E8E3D8;--line-strong:#D8D3C7;--quiet:#6C7783;--quiet-soft:#9AA4AE;
+  --gold:#A88553;--gold-2:#C6A46B;--signal-bg:#F4ECDD;--live:#2F7D4F;--live-bg:#E9F2EC;
+  --danger:#B0324B;--danger-bg:#F7E7EB;
+  --r-sm:9px;--r-md:12px;--r-lg:14px;--r-pill:999px;
+  --shadow:0 1px 2px rgba(16,33,47,.05),0 10px 30px rgba(16,33,47,.06);
+  --shadow-lift:0 2px 6px rgba(16,33,47,.06),0 18px 46px rgba(16,33,47,.10);
+}
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:var(--paper);color:var(--ink);font-family:'Inter',system-ui,sans-serif;font-size:14px;
+  line-height:1.55;-webkit-font-smoothing:antialiased;min-height:100vh;padding:32px 2rem 60px;font-variant-numeric:tabular-nums}
+.wrap{max-width:1080px;margin:0 auto}
+.header{display:flex;align-items:center;justify-content:space-between;margin-bottom:26px;padding-bottom:1rem;border-bottom:1px solid rgba(184,151,42,0.3)}
+.logo-row{display:flex;align-items:center;gap:12px}
+.logo-hex{width:36px;height:36px}
+.logo-text{font-family:'Space Grotesk','Inter',sans-serif;font-size:17px;color:var(--ink);letter-spacing:0.08em}
+.logo-sub{font-size:10px;color:#7A5C1E;letter-spacing:0.2em;text-transform:uppercase;display:block}
+.header-title{font-family:'Space Grotesk','Inter',sans-serif;font-size:20px;color:var(--ink)}
+.header-sub{font-size:12px;color:#46535F;margin-top:2px}
+.card{background:var(--panel-raised);border:1px solid var(--line);border-radius:var(--r-lg);box-shadow:var(--shadow);padding:26px}
+.gate-card{max-width:440px;margin:60px auto}
+.gate-card h2{font-size:16px;font-weight:700;margin-bottom:6px}
+.gate-card p{font-size:12.5px;color:var(--quiet);line-height:1.6;margin-bottom:16px}
+input,textarea{width:100%;background:rgba(1,32,61,0.05);border:1px solid var(--line-strong);border-radius:var(--r-sm);
+  padding:10px 12px;color:var(--ink);font-family:inherit;font-size:13.5px;outline:none;transition:border-color .15s}
+input:focus,textarea:focus{border-color:var(--gold)}
+input::placeholder{color:var(--quiet-soft)}
+label.field{display:block;font-size:11.5px;font-weight:600;color:var(--quiet);text-transform:uppercase;letter-spacing:.04em;margin:0 0 5px}
+.field-row{margin-bottom:12px}
+button{background:var(--navy);color:#fff;border:none;border-radius:var(--r-sm);padding:11px 16px;
+  font-weight:600;font-size:13.5px;cursor:pointer;font-family:inherit;transition:background .15s,transform .08s}
+button:hover{background:var(--navy-2)}
+button:active{transform:translateY(1px)}
+button.ghost{background:transparent;color:var(--navy);border:1px solid var(--line-strong)}
+button.ghost:hover{background:rgba(1,32,61,0.05);border-color:var(--gold)}
+button.sm{padding:6px 11px;font-size:12px}
+button:disabled{opacity:.5;cursor:default;pointer-events:none}
+.msg{font-size:12.5px;margin-top:12px;color:var(--quiet);line-height:1.5;min-height:16px}
+.msg.err{color:var(--danger)}
+.msg.ok{color:var(--live)}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.section{margin-bottom:24px}
+.section-title{font-size:14.5px;font-weight:700;margin-bottom:4px}
+.section-sub{font-size:12px;color:var(--quiet);margin-bottom:14px;line-height:1.55}
+.pwd-row{display:flex;gap:8px}
+.pwd-row input{flex:1}
+.success-box{margin-top:16px;border:1px solid rgba(47,125,79,.25);background:var(--live-bg);border-radius:var(--r-md);padding:16px}
+.success-box .kv{display:flex;justify-content:space-between;gap:10px;font-size:12.5px;padding:5px 0;border-bottom:1px dashed rgba(1,32,61,.08)}
+.success-box .kv:last-child{border-bottom:none}
+.success-box .kv b{font-weight:700;color:var(--navy)}
+.success-box code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;background:rgba(1,32,61,.06);padding:2px 6px;border-radius:5px}
+.linkline{display:flex;align-items:center;gap:8px;margin-top:10px}
+.linkline input{flex:1;font-size:12px;background:#fff}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{text-align:left;font-size:10.5px;font-weight:700;color:var(--quiet);text-transform:uppercase;letter-spacing:.05em;
+  padding:8px 10px;border-bottom:1px solid var(--line-strong)}
+td{padding:9px 10px;border-bottom:1px solid var(--line);vertical-align:middle}
+tr:last-child td{border-bottom:none}
+td input{font-size:12.5px;padding:6px 8px}
+.badge{display:inline-block;font-size:10.5px;font-weight:700;padding:2px 9px;border-radius:var(--r-pill);letter-spacing:.03em}
+.badge.active{background:var(--live-bg);color:var(--live)}
+.badge.suspended{background:var(--danger-bg);color:var(--danger)}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11.5px;color:var(--quiet)}
+.row-actions{display:flex;gap:6px;align-items:center}
+.editcell{display:flex;gap:6px;align-items:center}
+.editcell input{width:150px}
+.hidden{display:none !important}
+.toolbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;gap:12px}
+.toolbar input{max-width:260px}
+.empty{padding:26px;text-align:center;color:var(--quiet-soft);font-size:13px}
+.topline{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
+.topline a{font-size:12px;color:var(--quiet);text-decoration:none}
+.topline a:hover{color:var(--gold)}
+.footer{margin-top:30px;font-size:11px;color:var(--quiet-soft);text-align:center;line-height:1.7}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="header">
+    <div class="logo-row">
+      <svg class="logo-hex" viewBox="0 0 40 40" fill="none">
+        <polygon points="20,2 36,10 36,30 20,38 4,30 4,10" fill="none" stroke="#C6A46B" stroke-width="1.8"/>
+        <circle cx="20" cy="20" r="9" fill="none" stroke="#C6A46B" stroke-width="1.4"/>
+        <line x1="14" y1="26" x2="26" y2="14" stroke="#C6A46B" stroke-width="1.4"/>
+      </svg>
+      <div>
+        <div class="logo-text">VYNORA</div>
+        <span class="logo-sub">Platform Hub</span>
+      </div>
+    </div>
+    <div style="text-align:right">
+      <div class="header-title">Operator Console</div>
+      <div class="header-sub">Provision firms &amp; manage white-label identity — not linked from the app, bookmark this URL</div>
+    </div>
+  </div>
+
+  <!-- ── Operator key gate ────────────────────────────────────────────── -->
+  <div class="card gate-card" id="gate-card">
+    <h2>Enter your operator key</h2>
+    <p>This is the same <code class="mono">SIGNUP_ACCESS_KEY</code> you've been passing as
+      <code class="mono">x-signup-key</code> in curl. It's checked by the API on every request from
+      this page — nothing is stored server-side, and this page has no other authentication.
+      Don't share this URL with anyone who shouldn't be able to create firms.</p>
+    <div class="field-row">
+      <label class="field">Operator key</label>
+      <input id="gate-key" type="password" placeholder="Your SIGNUP_ACCESS_KEY" autocomplete="off"/>
+    </div>
+    <p style="font-size:12px;color:var(--quiet)">Held in this tab's session storage only — cleared when you close the
+      tab, and never persisted to disk. This page shares an origin with the customer-facing app, so the
+      operator key deliberately isn't kept around any longer than the tab is open.</p>
+    <button onclick="unlock()" style="width:100%">Unlock console</button>
+    <div class="msg" id="gate-msg"></div>
+  </div>
+
+  <!-- ── Console (post-unlock) ────────────────────────────────────────── -->
+  <div id="console" class="hidden">
+    <div class="topline">
+      <span></span>
+      <a href="#" onclick="lock();return false">🔒 lock console</a>
+    </div>
+
+    <div class="card section">
+      <div class="section-title">Provision a new firm</div>
+      <div class="section-sub">Creates the Identity Platform tenant, the owner's login, and a friendly slug —
+        the same thing <code class="mono">POST /api/signup</code> does. Share the login link it returns
+        with the firm's owner; that's their entire onboarding.</div>
+      <div class="grid2">
+        <div class="field-row">
+          <label class="field">Firm name</label>
+          <input id="p-firmname" type="text" placeholder="Meridian Advisors"/>
+        </div>
+        <div class="field-row">
+          <label class="field">Owner name</label>
+          <input id="p-ownername" type="text" placeholder="Jane Meridian"/>
+        </div>
+        <div class="field-row">
+          <label class="field">Owner email</label>
+          <input id="p-owneremail" type="email" placeholder="owner@meridianadvisors.com"/>
+        </div>
+        <div class="field-row">
+          <label class="field">Temporary password (10+ characters)</label>
+          <div class="pwd-row">
+            <input id="p-ownerpassword" type="text" placeholder="Generated or typed here"/>
+            <button class="ghost sm" type="button" onclick="genPassword()">Generate</button>
+          </div>
+        </div>
+      </div>
+      <button onclick="provision()" id="provision-btn">Provision firm</button>
+      <div class="msg" id="provision-msg"></div>
+      <div class="success-box hidden" id="provision-success">
+        <div class="kv"><span>Firm</span><b id="ps-name"></b></div>
+        <div class="kv"><span>Slug</span><code id="ps-slug"></code></div>
+        <div class="kv"><span>IdP tenant id</span><code id="ps-idp"></code></div>
+        <div style="font-size:12px;color:var(--quiet);margin-top:10px">Send the owner this link — it's their entire onboarding:</div>
+        <div class="linkline">
+          <input id="ps-link" type="text" readonly/>
+          <button class="ghost sm" type="button" onclick="copyField('ps-link')">Copy</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="card section">
+      <div class="toolbar">
+        <div class="section-title" style="margin:0">Existing firms</div>
+        <input id="firm-filter" type="text" placeholder="Filter by name or slug…" oninput="renderFirms()"/>
+      </div>
+      <div id="firms-table-wrap">
+        <div class="empty" id="firms-loading">Loading firms…</div>
+      </div>
+      <div class="msg" id="firms-msg"></div>
+    </div>
+  </div>
+
+  <div class="footer">Operator-only surface · protected by SIGNUP_ACCESS_KEY, not by Identity Platform login</div>
+</div>
+
+<script type="module">
+const API_BASE = window.VYNE_API_BASE || "";
+let OPERATOR_KEY = null;
+let firms = [];
+
+// V225-audit HIGH fix: this used to also check/persist to localStorage via
+// an opt-in "remember on this device" checkbox. localStorage on the SAME
+// ORIGIN as the customer-facing app is a defense-in-depth gap for a
+// credential this powerful (it can provision arbitrary tenants) — an XSS
+// bug anywhere else on this origin would be able to read it indefinitely,
+// not just for the current tab. sessionStorage still survives a reload
+// (so an operator mid-task doesn't get logged out by accident) but is
+// cleared when the tab closes and isn't shared across tabs/windows.
+function storedKey() {
+  try { return sessionStorage.getItem("vyne_admin_key"); }
+  catch (e) { return null; }
+}
+
+async function apiFetch(path, opts) {
+  opts = opts || {};
+  const headers = Object.assign({ "x-signup-key": OPERATOR_KEY }, opts.body ? { "content-type": "application/json" } : {}, opts.headers || {});
+  const r = await fetch(API_BASE + path, Object.assign({}, opts, {
+    headers, body: opts.body ? JSON.stringify(opts.body) : undefined,
+  }));
+  let body = null;
+  try { body = await r.json(); } catch (e) {}
+  if (!r.ok) {
+    const err = new Error((body && (body.detail ? JSON.stringify(body.detail) : body.error)) || ("HTTP " + r.status));
+    err.status = r.status; err.body = body;
+    throw err;
+  }
+  return body;
+}
+
+window.unlock = async function () {
+  const msg = document.getElementById("gate-msg");
+  const key = document.getElementById("gate-key").value.trim();
+  if (!key) { msg.className = "msg err"; msg.textContent = "Enter your operator key."; return; }
+  msg.className = "msg"; msg.textContent = "Checking…";
+  OPERATOR_KEY = key;
+  try {
+    await apiFetch("/api/firms");
+  } catch (err) {
+    OPERATOR_KEY = null;
+    msg.className = "msg err";
+    msg.textContent = err.status === 403 ? "That key was rejected — check SIGNUP_ACCESS_KEY on the API." : ("Couldn't reach the API — " + err.message);
+    return;
+  }
+  try { sessionStorage.setItem("vyne_admin_key", key); } catch (e) {}
+  document.getElementById("gate-card").classList.add("hidden");
+  document.getElementById("console").classList.remove("hidden");
+  loadFirms();
+};
+
+window.lock = function () {
+  OPERATOR_KEY = null;
+  try { sessionStorage.removeItem("vyne_admin_key"); } catch (e) {}
+  document.getElementById("console").classList.add("hidden");
+  document.getElementById("gate-card").classList.remove("hidden");
+  document.getElementById("gate-key").value = "";
+  document.getElementById("gate-msg").textContent = "";
+};
+
+window.genPassword = function () {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789!@#$%";
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  let out = "";
+  for (let i = 0; i < bytes.length; i++) out += chars[bytes[i] % chars.length];
+  document.getElementById("p-ownerpassword").value = out;
+};
+
+window.copyField = function (id) {
+  const el = document.getElementById(id);
+  el.select();
+  navigator.clipboard?.writeText(el.value).catch(() => document.execCommand("copy"));
+};
+
+window.provision = async function () {
+  const msg = document.getElementById("provision-msg");
+  const btn = document.getElementById("provision-btn");
+  document.getElementById("provision-success").classList.add("hidden");
+  const firmName = document.getElementById("p-firmname").value.trim();
+  const ownerName = document.getElementById("p-ownername").value.trim();
+  const ownerEmail = document.getElementById("p-owneremail").value.trim();
+  const ownerPassword = document.getElementById("p-ownerpassword").value;
+  if (!firmName || !ownerEmail || !ownerPassword) {
+    msg.className = "msg err"; msg.textContent = "Firm name, owner email, and a password are required.";
+    return;
+  }
+  if (ownerPassword.length < 10) {
+    msg.className = "msg err"; msg.textContent = "Password needs to be at least 10 characters — use Generate if you're not sure.";
+    return;
+  }
+  btn.disabled = true;
+  msg.className = "msg"; msg.textContent = "Provisioning…";
+  try {
+    const result = await apiFetch("/api/signup", {
+      method: "POST",
+      body: { firmName, ownerEmail, ownerPassword, ownerName: ownerName || undefined },
+    });
+    msg.className = "msg ok"; msg.textContent = "Firm provisioned.";
+    document.getElementById("ps-name").textContent = firmName;
+    document.getElementById("ps-slug").textContent = result.slug;
+    document.getElementById("ps-idp").textContent = result.idpTenantId;
+    document.getElementById("ps-link").value = location.origin + result.loginPath;
+    document.getElementById("provision-success").classList.remove("hidden");
+    document.getElementById("p-firmname").value = "";
+    document.getElementById("p-ownername").value = "";
+    document.getElementById("p-owneremail").value = "";
+    document.getElementById("p-ownerpassword").value = "";
+    loadFirms();
+  } catch (err) {
+    msg.className = "msg err";
+    msg.textContent = describeError(err);
+  } finally {
+    btn.disabled = false;
+  }
+};
+
+function describeError(err) {
+  if (err.status === 403) return "Operator key rejected — try locking and re-entering it.";
+  if (err.status === 409) return "That slug or domain is already bound to another firm.";
+  if (err.status === 400) return "Rejected: " + (err.message || "invalid input");
+  if (err.status === 500) return "Provisioning failed on the server — check Cloud Run logs (often an IAM permission on the service account).";
+  return err.message || "Something went wrong.";
+}
+
+async function loadFirms() {
+  const wrap = document.getElementById("firms-table-wrap");
+  const msg = document.getElementById("firms-msg");
+  wrap.innerHTML = '<div class="empty" id="firms-loading">Loading firms…</div>';
+  try {
+    const d = await apiFetch("/api/firms");
+    firms = d.firms || [];
+    renderFirms();
+  } catch (err) {
+    wrap.innerHTML = "";
+    msg.className = "msg err";
+    msg.textContent = describeError(err);
+  }
+}
+
+window.renderFirms = function () {
+  const wrap = document.getElementById("firms-table-wrap");
+  const filter = (document.getElementById("firm-filter").value || "").trim().toLowerCase();
+  const rows = firms.filter(function (f) {
+    if (!filter) return true;
+    return (f.name || "").toLowerCase().includes(filter) || (f.slug || "").toLowerCase().includes(filter);
+  });
+  if (!rows.length) {
+    wrap.innerHTML = '<div class="empty">' + (firms.length ? "No firms match that filter." : "No firms provisioned yet.") + "</div>";
+    return;
+  }
+  const table = document.createElement("table");
+  table.innerHTML = "<thead><tr><th>Firm</th><th>Slug</th><th>Custom domain</th><th>Status</th><th>Login link</th><th>IdP tenant id</th><th></th></tr></thead>";
+  const tbody = document.createElement("tbody");
+  rows.forEach(function (f) { tbody.appendChild(firmRow(f)); });
+  table.appendChild(tbody);
+  wrap.innerHTML = "";
+  wrap.appendChild(table);
+};
+
+function firmRow(f) {
+  const tr = document.createElement("tr");
+
+  const tdName = document.createElement("td");
+  tdName.textContent = f.name;
+  tr.appendChild(tdName);
+
+  tr.appendChild(editableCell(f, "slug", f.slug || "—"));
+  tr.appendChild(editableCell(f, "customDomain", f.customDomain || "—"));
+
+  const tdStatus = document.createElement("td");
+  const badge = document.createElement("span");
+  badge.className = "badge " + (f.status === "active" ? "active" : "suspended");
+  badge.textContent = f.status;
+  tdStatus.appendChild(badge);
+  tr.appendChild(tdStatus);
+
+  const tdLink = document.createElement("td");
+  if (f.slug) {
+    const btn = document.createElement("button");
+    btn.className = "ghost sm";
+    btn.textContent = "Copy link";
+    btn.onclick = function () {
+      navigator.clipboard?.writeText(location.origin + "/?firm=" + f.slug).catch(() => {});
+      btn.textContent = "Copied!";
+      setTimeout(function () { btn.textContent = "Copy link"; }, 1500);
+    };
+    tdLink.appendChild(btn);
+  } else {
+    tdLink.innerHTML = '<span class="mono">no slug yet</span>';
+  }
+  tr.appendChild(tdLink);
+
+  const tdIdp = document.createElement("td");
+  tdIdp.innerHTML = '<span class="mono">' + f.idpTenantId + "</span>";
+  tr.appendChild(tdIdp);
+
+  tr.appendChild(document.createElement("td"));
+  return tr;
+}
+
+function editableCell(f, key, displayVal) {
+  const td = document.createElement("td");
+  const span = document.createElement("span");
+  span.textContent = displayVal;
+  span.style.cursor = "pointer";
+  span.title = "Click to edit";
+  span.onclick = function () { startEdit(td, f, key); };
+  td.appendChild(span);
+  return td;
+}
+
+function startEdit(td, f, key) {
+  const current = f[key] || "";
+  td.innerHTML = "";
+  const box = document.createElement("div");
+  box.className = "editcell";
+  const input = document.createElement("input");
+  input.type = "text";
+  input.value = current;
+  input.placeholder = key === "slug" ? "lowercase-slug" : "sub.domain.com";
+  const save = document.createElement("button");
+  save.className = "sm"; save.textContent = "Save";
+  const cancel = document.createElement("button");
+  cancel.className = "ghost sm"; cancel.textContent = "✕";
+  cancel.onclick = function () { renderFirms(); };
+  save.onclick = async function () {
+    const val = input.value.trim();
+    if (key === "slug" && val === "") {
+      document.getElementById("firms-msg").className = "msg err";
+      document.getElementById("firms-msg").textContent = "A firm's slug can't be cleared — set a new one instead of leaving it blank.";
+      return;
+    }
+    save.disabled = true;
+    const payload = { idpTenantId: f.idpTenantId };
+    payload[key] = val === "" ? (key === "customDomain" ? null : undefined) : val;
+    try {
+      const updated = await apiFetch("/api/firm", { method: "PATCH", body: payload });
+      f.slug = updated.slug; f.customDomain = updated.customDomain;
+      renderFirms();
+    } catch (err) {
+      document.getElementById("firms-msg").className = "msg err";
+      document.getElementById("firms-msg").textContent = describeError(err);
+      save.disabled = false;
+    }
+  };
+  box.appendChild(input); box.appendChild(save); box.appendChild(cancel);
+  td.appendChild(box);
+  input.focus();
+}
+
+(function boot() {
+  const key = storedKey();
+  if (key) {
+    OPERATOR_KEY = key;
+    document.getElementById("gate-card").classList.add("hidden");
+    document.getElementById("console").classList.remove("hidden");
+    loadFirms().catch(function () {}); // if the stored key is stale, table shows the 403 message and user can lock/re-enter
+  }
+})();
+</script>
+</body>
+</html>

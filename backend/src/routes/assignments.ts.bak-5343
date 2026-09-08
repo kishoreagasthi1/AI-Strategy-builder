@@ -1,0 +1,759 @@
+/**
+ * Client assignments API (Phase 5) — owners control which clients each
+ * consultant can see. Server-enforced everywhere client data is served.
+ *
+ *   GET    /api/assignments            owner: all rows · consultant: own rows
+ *   GET    /api/my-clients             clients the caller may work on
+ *   POST   /api/assignments            owner: { email, clientName }
+ *   DELETE /api/assignments            owner: { email, clientName }
+ *
+ * Team management (owners create the consultant logins they then assign):
+ *   GET    /api/team                   owner: all owner/consultant members
+ *   POST   /api/team                   owner: { email, name?, password? } →
+ *                                      consultant login (dev: signs in with
+ *                                      the id; IdP: real tenant user)
+ *   DELETE /api/team                   owner: { email } — removes a
+ *                                      consultant's membership + assignments
+ */
+import type { FastifyInstance } from "fastify";
+import { z } from "zod";
+import { withTenant, withoutTenant } from "../db/pool.js";
+import { requireRole } from "../auth/middleware.js";
+import { legacyNormClient, normClient, planClientRename, purgeClientKeys } from "../auth/clients.js";
+import {
+  invalidateNorms, invalidateTenantNorms, invalidateMembershipUid,
+} from "../auth/cache.js";
+import { auditLog } from "../audit/log.js";
+
+const Body = z.object({
+  email: z.string().min(3).max(200),
+  clientName: z.string().min(1).max(200),
+});
+
+/** Resolve a tenant member (owner/consultant) by email. */
+async function memberByEmail(tenantId: string, email: string):
+  Promise<{ id: string; role: string; name: string | null } | undefined> {
+  return withoutTenant(async (c) => {
+    const r = await c.query<{ id: string; role: string; name: string | null }>(
+      `SELECT u.id, m.role, u.name
+         FROM users u JOIN memberships m ON m.user_id = u.id
+        WHERE m.tenant_id = $1 AND lower(u.email) = lower($2)
+          AND m.role IN ('owner','consultant')
+        ORDER BY m.created_at DESC LIMIT 1`,
+      [tenantId, email]
+    );
+    return r.rows[0];
+  });
+}
+
+const TeamBody = z.object({
+  email: z.string().min(3).max(200),
+  name: z.string().max(200).optional(),
+  /** Initial password when running with Identity Platform; ignored in dev. */
+  password: z.string().min(10).max(200).optional(),
+});
+
+export async function assignmentRoutes(app: FastifyInstance): Promise<void> {
+  // ── Team: list owner/consultant members ──────────────────────────────────
+  app.get(
+    "/api/team",
+    { preHandler: requireRole("owner") },
+    async (req) => {
+      const ctx = req.ctx!;
+      const members = await withoutTenant(async (c) => {
+        const r = await c.query(
+          `SELECT u.id, u.email, u.name, m.role, m.created_at
+             FROM users u JOIN memberships m ON m.user_id = u.id
+            WHERE m.tenant_id = $1 AND m.role IN ('owner','consultant')
+            ORDER BY m.role, u.email`, [ctx.tenantId]);
+        return r.rows;
+      });
+      return { members };
+    }
+  );
+
+  // ── Team: add a consultant login ─────────────────────────────────────────
+  app.post(
+    "/api/team",
+    { preHandler: requireRole("owner") },
+    async (req, reply) => {
+      const ctx = req.ctx!;
+      const parsed = TeamBody.safeParse(req.body);
+      if (!parsed.success) { reply.code(400).send({ error: "invalid_input" }); return; }
+      const { email, name, password } = parsed.data;
+
+      const devAuth = process.env.DEV_AUTH === "1" && process.env.NODE_ENV !== "production";
+      let idpUid = email;
+      if (!devAuth) {
+        const { getAuth } = await import("firebase-admin/auth");
+        const t = await withoutTenant(async (c) => {
+          const r = await c.query<{ idp_tenant_id: string | null }>(
+            `SELECT idp_tenant_id FROM tenants WHERE id = $1`, [ctx.tenantId]);
+          return r.rows[0]?.idp_tenant_id;
+        });
+        if (!t) { reply.code(500).send({ error: "tenant_missing_idp" }); return; }
+        if (!password) { reply.code(400).send({ error: "password_required" }); return; }
+        const pool = getAuth().tenantManager().authForTenant(t);
+        try {
+          const u = await pool.createUser({ email, password, displayName: name ?? email });
+          idpUid = u.uid;
+        } catch (e: unknown) {
+          // Re-adding a previously removed consultant: reuse the orphaned IdP
+          // login, resetting its password/name to this invite's values.
+          const code = (e as { errorInfo?: { code?: string }; code?: string });
+          if ((code.errorInfo?.code ?? code.code) === "auth/email-already-exists") {
+            /*
+             * v5.32.57 SECURITY — the owner-side twin of the escalation fixed
+             * in routes/interviews.ts. Adding a "consultant" whose email is
+             * already an OWNER's re-credentials that owner's account. This
+             * route is owner-only so the blast radius is smaller, but a firm
+             * with two owners is exactly the case where one should not be able
+             * to silently take the other's login — and until now not even the
+             * audit trail recorded that a password had been changed.
+             */
+            const holder = await withoutTenant(async (c) => {
+              const r = await c.query<{ role: string }>(
+                `SELECT m.role
+                   FROM users u JOIN memberships m ON m.user_id = u.id
+                  WHERE lower(u.email) = lower($1) AND m.tenant_id = $2
+                  ORDER BY CASE m.role WHEN 'owner' THEN 0 WHEN 'consultant' THEN 1 ELSE 2 END
+                  LIMIT 1`,
+                [email, ctx.tenantId]
+              );
+              return r.rows[0]?.role ?? null;
+            });
+            if (holder === "owner" && ctx.userId) {
+              await auditLog(ctx.tenantId, ctx.userId, "idp_credential_reset_refused",
+                { email, existingRole: holder, via: "team_add" });
+              reply.code(409).send({
+                error: "email_belongs_to_an_owner",
+                detail: `${email} is already an owner of this firm. Adding them again here would reset their password.`,
+              });
+              return;
+            }
+            const existing = await pool.getUserByEmail(email);
+            await pool.updateUser(existing.uid, { password, displayName: name ?? email });
+            idpUid = existing.uid;
+            await auditLog(ctx.tenantId, ctx.userId, "idp_credential_reset",
+              { email, via: "team_add" });
+          } else {
+            throw e;
+          }
+        }
+      }
+
+      const result = await withoutTenant(async (c) => {
+        await c.query("BEGIN");
+        try {
+          const u = await c.query<{ id: string }>(
+            `INSERT INTO users (identity_platform_uid, email, name) VALUES ($1, $2, $3)
+             ON CONFLICT (identity_platform_uid)
+             DO UPDATE SET name = COALESCE(EXCLUDED.name, users.name)
+             RETURNING id`,
+            [idpUid, email, name ?? null]
+          );
+          const existing = await c.query<{ role: string }>(
+            `SELECT role FROM memberships WHERE user_id = $1 AND tenant_id = $2`,
+            [u.rows[0].id, ctx.tenantId]
+          );
+          if (existing.rows[0] && existing.rows[0].role === "interviewee") {
+            await c.query("ROLLBACK");
+            return { error: "is_interviewee" as const };
+          }
+          await c.query(
+            `INSERT INTO memberships (user_id, tenant_id, role) VALUES ($1, $2, 'consultant')
+             ON CONFLICT (user_id, tenant_id) DO NOTHING`,
+            [u.rows[0].id, ctx.tenantId]
+          );
+          await c.query("COMMIT");
+          return { id: u.rows[0].id };
+        } catch (e) {
+          await c.query("ROLLBACK");
+          throw e;
+        }
+      });
+      if ("error" in result) {
+        reply.code(409).send({ error: "is_interviewee", detail: "That login belongs to an interviewee. Use a different email for the consultant." });
+        return;
+      }
+      // A membership was inserted for this uid; drop any cached resolution so a
+      // (possibly cross-tenant) stale entry can't outlive the change (v5.34.0).
+      invalidateMembershipUid(idpUid);
+      await auditLog(ctx.tenantId, ctx.userId, "consultant_added", { email, name: name ?? null });
+      reply.code(201).send({
+        ok: true, id: result.id,
+        loginHint: devAuth
+          ? `Dev mode: they sign in on the landing page with "${email}".`
+          : `They sign in with your firm tenant ID + ${email}.`,
+      });
+    }
+  );
+
+  // ── Team: remove a consultant (membership + their assignments) ───────────
+  app.delete(
+    "/api/team",
+    { preHandler: requireRole("owner") },
+    async (req, reply) => {
+      const ctx = req.ctx!;
+      const parsed = z.object({ email: z.string().min(3).max(200) }).safeParse(req.body);
+      if (!parsed.success) { reply.code(400).send({ error: "invalid_input" }); return; }
+      const member = await memberByEmail(ctx.tenantId, parsed.data.email);
+      if (!member) { reply.code(404).send({ error: "no_such_member" }); return; }
+      if (member.role === "owner") {
+        reply.code(400).send({ error: "cannot_remove_owner", detail: "Owners cannot be removed here." });
+        return;
+      }
+      await withTenant(ctx.tenantId, async (c) => {
+        await c.query(`DELETE FROM client_assignments WHERE user_id = $1`, [member.id]);
+      });
+      const info = await withoutTenant(async (c) => {
+        await c.query(
+          `DELETE FROM memberships WHERE user_id = $1 AND tenant_id = $2 AND role = 'consultant'`,
+          [member.id, ctx.tenantId]);
+        const r = await c.query<{ uid: string; idp: string | null }>(
+          `SELECT u.identity_platform_uid AS uid, t.idp_tenant_id AS idp
+             FROM users u, tenants t WHERE u.id = $1 AND t.id = $2`,
+          [member.id, ctx.tenantId]);
+        return r.rows[0] ?? null;
+      });
+      // Revoke cached access immediately on THIS instance (v5.34.0): the
+      // consultant's membership and scope are gone, so drop both caches rather
+      // than let a hit keep them alive until the TTL. info.uid is the IdP uid
+      // the membership cache is keyed on.
+      invalidateNorms(ctx.tenantId, member.id);
+      if (info?.uid) invalidateMembershipUid(info.uid);
+      // Remove the IdP login too (v5.22) so re-adding the same email later
+      // creates cleanly. Best-effort — membership removal already revoked access.
+      const devAuth = process.env.DEV_AUTH === "1" && process.env.NODE_ENV !== "production";
+      if (info?.idp && !devAuth) {
+        try {
+          const { getAuth } = await import("firebase-admin/auth");
+          await getAuth().tenantManager().authForTenant(info.idp).deleteUser(info.uid);
+        } catch (e) {
+          req.log.warn({ err: e }, "IdP consultant cleanup failed (non-fatal)");
+        }
+      }
+      await auditLog(ctx.tenantId, ctx.userId, "consultant_removed", { email: parsed.data.email });
+      return { ok: true };
+    }
+  );
+
+  // ── Client deletion: permanently remove ONE client's data everywhere ──────
+  // Owner-only. Deletes the client's interviews (rows + their private session
+  // namespaces), interviewee logins that only existed for this client, the
+  // engagements rows, consultant assignments, and every workspace key that
+  // belongs to the client (briefing, engagement, sessions, synthesis, roadmap
+  // slices) — shared indexes keep other clients' entries untouched.
+  app.delete(
+    "/api/clients",
+    { preHandler: requireRole("owner") },
+    async (req, reply) => {
+      const ctx = req.ctx!;
+      const parsed = z.object({ clientName: z.string().min(1).max(200) }).safeParse(req.body);
+      if (!parsed.success) { reply.code(400).send({ error: "invalid_input" }); return; }
+      const clientName = parsed.data.clientName.trim();
+      const norm = normClient(clientName);
+      // v5.32.29 (audit M-4): a client whose data straddles the v5.32.26
+      // widening has some keys and assignment rows at the legacy 30-char norm.
+      // Erasure has to reach both, or this endpoint quietly leaves the data it
+      // promises to delete — a GDPR exposure, and the residue is still
+      // readable through an assignment row at the legacy norm.
+      const legacy = legacyNormClient(clientName);
+      const allNorms = [...new Set([norm, legacy])];
+
+      const result = await withTenant(ctx.tenantId, async (c) => {
+        /* 1. Interviews (norm-matched) + their private state namespaces.
+         *
+         * v5.32.59 SCALE. This was an unqualified SELECT of EVERY interview
+         * row in the firm, materialised in the process, filtered in
+         * JavaScript, and then deleted with TWO round-trips PER ROW. For a
+         * firm with ten thousand interviews, deleting one client meant
+         * loading ten thousand rows and issuing up to twenty thousand
+         * statements inside a single transaction.
+         *
+         * The filter stays in JavaScript deliberately. normClient() is the
+         * authority on what belongs to a client and reproducing it in SQL
+         * means reproducing JS's toLowerCase() semantics exactly; get that
+         * subtly wrong on a GDPR-erasure endpoint and the failure mode is
+         * data quietly left behind — which is the bug v5.32.29 was raised
+         * for. So: same predicate, evaluated on bounded pages, with the
+         * deletes batched. Peak memory is now one page plus the matches,
+         * and the matches are bounded by the client's own history. */
+        const PAGE = 500;
+        const mine: { id: string; state_module: string; interviewee_user_id: string | null; client_name: string }[] = [];
+        let afterId: string | null = null;
+        for (;;) {
+          type IvRow = { id: string; state_module: string; interviewee_user_id: string | null; client_name: string };
+          const page: { rows: IvRow[] } = await c.query<IvRow>(
+            afterId
+              ? `SELECT id, state_module, interviewee_user_id, client_name FROM interviews
+                  WHERE id > $1 ORDER BY id LIMIT ${PAGE}`
+              : `SELECT id, state_module, interviewee_user_id, client_name FROM interviews
+                  ORDER BY id LIMIT ${PAGE}`,
+            afterId ? [afterId] : []
+          );
+          if (!page.rows.length) break;
+          for (const r of page.rows) if (normClient(r.client_name) === norm) mine.push(r);
+          afterId = page.rows[page.rows.length - 1].id;
+          if (page.rows.length < PAGE) break;
+        }
+        for (let i = 0; i < mine.length; i += 200) {
+          const chunk = mine.slice(i, i + 200);
+          await c.query(`DELETE FROM module_state WHERE module = ANY($1::text[])`,
+            [chunk.map((r) => r.state_module)]);
+          await c.query(`DELETE FROM interviews WHERE id = ANY($1::uuid[])`,
+            [chunk.map((r) => r.id)]);
+        }
+        // Which of those interviewees still have OTHER interviews in this firm?
+        const userIds = [...new Set(mine.map((r) => r.interviewee_user_id).filter((x): x is string => Boolean(x)))];
+        let orphaned: string[] = [];
+        if (userIds.length) {
+          const still = await c.query<{ interviewee_user_id: string }>(
+            `SELECT DISTINCT interviewee_user_id FROM interviews WHERE interviewee_user_id = ANY($1::uuid[])`,
+            [userIds]);
+          const keep = new Set(still.rows.map((r) => r.interviewee_user_id));
+          orphaned = userIds.filter((u) => !keep.has(u));
+        }
+        // 2. Engagements table rows. Same treatment as the interviews scan
+        //    above — paged read, batched delete, JS predicate unchanged.
+        const engIds: string[] = [];
+        let afterEng: string | null = null;
+        for (;;) {
+          type EngRow = { id: string; client_name: string };
+          const page: { rows: EngRow[] } = await c.query<EngRow>(
+            afterEng
+              ? `SELECT id, client_name FROM engagements WHERE id > $1 ORDER BY id LIMIT ${PAGE}`
+              : `SELECT id, client_name FROM engagements ORDER BY id LIMIT ${PAGE}`,
+            afterEng ? [afterEng] : []
+          );
+          if (!page.rows.length) break;
+          for (const r of page.rows) if (normClient(r.client_name) === norm) engIds.push(r.id);
+          afterEng = page.rows[page.rows.length - 1].id;
+          if (page.rows.length < PAGE) break;
+        }
+        let engCount = 0;
+        for (let i = 0; i < engIds.length; i += 200) {
+          const chunk = engIds.slice(i, i + 200);
+          await c.query(`DELETE FROM engagements WHERE id = ANY($1::uuid[])`, [chunk]);
+          engCount += chunk.length;
+        }
+        // 3. Consultant assignments for this client.
+        await c.query(`DELETE FROM client_assignments WHERE client_norm = ANY($1::text[])`, [allNorms]);
+        // 4. Workspace purge via the shared resolver.
+        const ws = await c.query<{ key: string; value: { v: string } }>(
+          `SELECT key, value FROM module_state WHERE module = 'workspace'`);
+        const state: Record<string, string> = {};
+        for (const row of ws.rows) state[row.key] = row.value.v;
+        const { sets, deletes } = purgeClientKeys(state, norm, [legacy]);
+        for (const [k, v] of Object.entries(sets)) {
+          await c.query(
+            `UPDATE module_state SET value = $1, updated_by = $2, updated_at = now()
+              WHERE module = 'workspace' AND key = $3`,
+            [JSON.stringify({ v }), ctx.userId, k]);
+        }
+        if (deletes.length) {
+          await c.query(`DELETE FROM module_state WHERE module = 'workspace' AND key = ANY($1::text[])`, [deletes]);
+        }
+        return { interviews: mine.length, engagements: engCount, workspaceKeys: deletes.length, orphaned };
+      });
+
+      // This removed client_assignments rows across potentially many
+      // consultants; a targeted per-user invalidation can't enumerate them, so
+      // clear the whole tenant's scope cache (v5.34.0).
+      invalidateTenantNorms(ctx.tenantId);
+      // Interviewee logins that only existed for this client lose their
+      // membership (memberships has no RLS — system path) AND their IdP
+      // login (v5.22), so the same email can be re-invited cleanly later.
+      const devAuth = process.env.DEV_AUTH === "1" && process.env.NODE_ENV !== "production";
+      for (const uid of result.orphaned) {
+        const info = await withoutTenant(async (c) => {
+          await c.query(
+            `DELETE FROM memberships WHERE user_id = $1 AND tenant_id = $2 AND role = 'interviewee'`,
+            [uid, ctx.tenantId]);
+          const r = await c.query<{ uid: string; idp: string | null }>(
+            `SELECT u.identity_platform_uid AS uid, t.idp_tenant_id AS idp
+               FROM users u, tenants t WHERE u.id = $1 AND t.id = $2`,
+            [uid, ctx.tenantId]);
+          return r.rows[0] ?? null;
+        });
+        if (info?.uid) invalidateMembershipUid(info.uid);
+        if (info?.idp && !devAuth) {
+          try {
+            const { getAuth } = await import("firebase-admin/auth");
+            await getAuth().tenantManager().authForTenant(info.idp).deleteUser(info.uid);
+          } catch (e) {
+            req.log.warn({ err: e }, "IdP interviewee cleanup failed (non-fatal)");
+          }
+        }
+      }
+
+      await auditLog(ctx.tenantId, ctx.userId, "client_deleted", {
+        clientName,
+        interviews: result.interviews,
+        engagements: result.engagements,
+        workspaceKeys: result.workspaceKeys,
+        intervieweeLoginsRemoved: result.orphaned.length,
+      });
+      return {
+        ok: true, clientName,
+        interviews: result.interviews,
+        engagements: result.engagements,
+        workspaceKeys: result.workspaceKeys,
+        intervieweeLoginsRemoved: result.orphaned.length,
+      };
+    }
+  );
+
+  // v5.32.7: renames a client EVERYWHERE its identity is stored — the
+  // canonical engagements row(s), every interview, every consultant
+  // assignment (so access survives the rename; client_norm is load-bearing
+  // for access control, see auth/clients.ts), and every workspace key that
+  // embeds the name, via the same hand-maintained key-family list
+  // purgeClientKeys() above already uses. One transaction, so a partial
+  // rename (e.g. workspace keys updated but assignments left pointing at the
+  // old norm, silently revoking a consultant's access) can't happen.
+  //
+  // Refuses with 409 if the new name's norm collides with a DIFFERENT
+  // existing client's records already in this workspace — see the
+  // V225-audit MEDIUM note on normClient()'s 30-char truncation in
+  // auth/clients.ts. Merging two clients onto one norm is not something this
+  // endpoint will do silently.
+  app.patch(
+    "/api/clients/rename",
+    { preHandler: requireRole("owner") },
+    async (req, reply) => {
+      const ctx = req.ctx!;
+      const parsed = z
+        .object({
+          // v5.32.93 — the client is identified by its ENGAGEMENT CODE.
+          // clientName remains accepted (and is the only identifier an
+          // engagement predating the index can offer), but whenever a code
+          // resolves, the SERVER decides what that engagement is currently
+          // called. See planClientRename() in auth/clients.ts for why the
+          // browser must not be the authority on the old name.
+          engagementCode: z.string().min(1).max(64).nullish(),
+          clientName: z.string().min(1).max(200).nullish(),
+          newClientName: z.string().min(1).max(200),
+        })
+        .safeParse(req.body);
+      if (!parsed.success) {
+        reply.code(400).send({ error: "invalid_input" });
+        return;
+      }
+      const oldName = (parsed.data.clientName ?? "").trim();
+      const engagementCode = (parsed.data.engagementCode ?? "").trim();
+      const newName = parsed.data.newClientName.trim();
+      const newNorm = normClient(newName);
+      if ((!oldName && !engagementCode) || !newNorm) {
+        reply.code(400).send({ error: "invalid_input" });
+        return;
+      }
+      if (oldName && normClient(oldName) === newNorm && oldName === newName) {
+        return { ok: true, clientName: newName, unchanged: true };
+      }
+
+      const result = await withTenant(ctx.tenantId, async (c) => {
+        const ws = await c.query<{ key: string; value: { v: string } }>(
+          `SELECT key, value FROM module_state WHERE module = 'workspace'`
+        );
+        const state: Record<string, string> = {};
+        for (const row of ws.rows) state[row.key] = row.value.v;
+        const engs = await c.query<{ id: string; client_name: string }>(
+          `SELECT id, client_name FROM engagements`
+        );
+        const ivs = await c.query<{ id: string; client_name: string }>(
+          `SELECT id, client_name FROM interviews`
+        );
+        const asg = await c.query<{ user_id: string; client_name: string; client_norm: string; created_by: string | null; created_at: string }>(
+          `SELECT user_id, client_name, client_norm, created_by, created_at FROM client_assignments`
+        );
+
+        // One planner, shared with frontend/test/rename-cycle-e2e.mjs, so the
+        // browser test drives this exact algorithm rather than an imitation.
+        const plan = planClientRename({
+          state,
+          engagements: engs.rows,
+          interviews: ivs.rows,
+          assignments: asg.rows,
+          target: { code: engagementCode || null, clientName: oldName || null },
+          newName,
+        });
+        if (plan.conflict) {
+          return {
+            conflict: plan.conflict,
+            workspaceKeysChanged: 0, engagementsRenamed: 0, interviewsRenamed: 0,
+            assignmentsMoved: 0, code: plan.code, report: plan.report,
+          };
+        }
+        const change = { sets: plan.sets, deletes: plan.deletes };
+
+        for (const [k, v] of Object.entries(change.sets)) {
+          await c.query(
+            `INSERT INTO module_state (tenant_id, module, key, value, updated_by)
+             VALUES (NULLIF(current_setting('app.tenant_id', true), '')::uuid, 'workspace', $1, $2, $3)
+             ON CONFLICT (tenant_id, module, key)
+             DO UPDATE SET value = EXCLUDED.value, updated_by = EXCLUDED.updated_by, updated_at = now()`,
+            [k, JSON.stringify({ v }), ctx.userId]
+          );
+        }
+        if (change.deletes.length) {
+          await c.query(`DELETE FROM module_state WHERE module = 'workspace' AND key = ANY($1::text[])`, [
+            change.deletes,
+          ]);
+        }
+
+        // Canonical engagements row(s) — chosen by the planner from every
+        // norm this engagement is currently found under, not from the caller's
+        // idea of its name.
+        for (const id of plan.engagementIds) {
+          await c.query(`UPDATE engagements SET client_name = $1, updated_at = now() WHERE id = $2`, [
+            newName,
+            id,
+          ]);
+        }
+
+        // Interviews — client_name here also drives interviewee
+        // bootstrap/client-scoping (see ivModuleAllowed in auth/clients.ts
+        // consumers), so it moves in lockstep, in the same transaction.
+        for (const id of plan.interviewIds) {
+          await c.query(`UPDATE interviews SET client_name = $1 WHERE id = $2`, [newName, id]);
+        }
+
+        // Consultant assignments — access must survive the rename, not
+        // silently revoke on next login because client_norm no longer
+        // matches anything. plan.assignmentNorms already includes legacy-norm
+        // rows (audit M-4) and any norm left over from a half-finished rename.
+        let assignmentsMoved = 0;
+        const oldNormsForAssign = plan.assignmentNorms;
+        if (oldNormsForAssign.length && oldNormsForAssign.every((n) => n === plan.newNorm)) {
+          const r = await c.query(
+            `UPDATE client_assignments SET client_name = $1 WHERE client_norm = ANY($2::text[])`,
+            [newName, oldNormsForAssign]
+          );
+          assignmentsMoved = r.rowCount ?? 0;
+        } else if (oldNormsForAssign.length) {
+          const rows = await c.query<{ user_id: string; created_by: string | null; created_at: string }>(
+            `SELECT user_id, created_by, created_at FROM client_assignments WHERE client_norm = ANY($1::text[])`,
+            [oldNormsForAssign]
+          );
+          for (const row of rows.rows) {
+            await c.query(
+              `INSERT INTO client_assignments (tenant_id, user_id, client_name, client_norm, created_by, created_at)
+               VALUES (current_setting('app.tenant_id', true)::uuid, $1, $2, $3, $4, $5)
+               ON CONFLICT (tenant_id, user_id, client_norm)
+               DO UPDATE SET client_name = EXCLUDED.client_name`,
+              [row.user_id, newName, plan.newNorm, row.created_by, row.created_at]
+            );
+          }
+          if (rows.rows.length) {
+            await c.query(
+              `DELETE FROM client_assignments WHERE client_norm = ANY($1::text[]) AND client_norm <> $2`,
+              [oldNormsForAssign, plan.newNorm]
+            );
+          }
+          assignmentsMoved = rows.rows.length;
+        }
+
+        /* ── Billing history (v5.33.3, audit MEDIUM) ──────────────────────────
+         *
+         * usage_events.client_norm is FROZEN at write time and is what
+         * GET /api/billing/summary authorizes historical rows on
+         * (billing.ts: `events.filter(e => normSetHas(allowed, e.clientNorm))`).
+         * The rename moved engagements, interviews, workspace state and
+         * assignments and left this table alone, which produces two symptoms
+         * that look unrelated:
+         *
+         *   · The renamed client loses its own spend history — the rows are
+         *     still there, under a norm nobody is assigned to any more.
+         *   · Reusing the old name later — a first-class flow since v5.33.1 —
+         *     hands the NEXT client's consultant the previous client's spend,
+         *     model mix and timestamps. A metadata leak across clients inside
+         *     the firm.
+         *
+         * clients.ts's own migration note at the top of the file lists
+         * usage_events among the client_norm-carrying tables. The note was
+         * right and the code never followed it.
+         *
+         * Included in the same transaction as everything else: a rename that
+         * half-moves billing is worse than one that fails, because nothing
+         * surfaces it. Counted and returned so the caller can see it happened.
+         */
+        let usageRekeyed = 0;
+        {
+          /* report.ownedNorms is every norm the planner established this
+           * engagement is found under — the same set renameOwnedKeys() moves
+           * workspace state from, widened through the engagement code. Using it
+           * rather than assignmentNorms alone matters: a client with no
+           * consultant assigned still has usage rows, and those still have to
+           * follow the rename. Legacy 30-char norms are in there too, so a row
+           * written before the v5.32.26 widening moves as well. */
+          const oldNorms = [...new Set([
+            ...plan.assignmentNorms,
+            ...plan.report.ownedNorms,
+          ])].filter((n) => n && n !== plan.newNorm);
+          if (oldNorms.length) {
+            const r = await c.query(
+              `UPDATE usage_events SET client_norm = $1 WHERE client_norm = ANY($2::text[])`,
+              [plan.newNorm, oldNorms]
+            );
+            usageRekeyed = r.rowCount ?? 0;
+          }
+        }
+
+        return {
+          conflict: null,
+          workspaceKeysChanged: Object.keys(change.sets).length + change.deletes.length,
+          engagementsRenamed: plan.engagementIds.length,
+          interviewsRenamed: plan.interviewIds.length,
+          assignmentsMoved,
+          usageRekeyed,
+          code: plan.code,
+          report: plan.report,
+        };
+      });
+
+      if (result.conflict) {
+        reply.code(409).send({ error: "name_collision", detail: result.conflict });
+        return;
+      }
+
+      // Assignments moved onto the new norm, so any consultant's cached
+      // allowed-norm set for this firm is now stale (v5.34.0).
+      invalidateTenantNorms(ctx.tenantId);
+
+      await auditLog(ctx.tenantId, ctx.userId, "client_renamed", {
+        from: oldName,
+        to: newName,
+        engagementCode: result.code,
+        engagementsRenamed: result.engagementsRenamed,
+        interviewsRenamed: result.interviewsRenamed,
+        assignmentsMoved: result.assignmentsMoved,
+        workspaceKeysChanged: result.workspaceKeysChanged,
+        // v5.32.93: the audit trail records what was NOT renamed too. A rename
+        // that reported success while stranding rows under another norm is the
+        // failure this whole change is about; it must be visible afterwards.
+        residue: result.report.residue,
+        keysRepaired: result.report.keysRepaired,
+        duplicateIndexNormsRemoved: result.report.duplicateIndexNormsRemoved,
+        debrisOverwritten: result.report.debrisOverwritten,
+      });
+      if (result.report.residue.length) {
+        req.log.error(
+          { residue: result.report.residue, code: result.code, to: newName },
+          "client rename left records under the old identity"
+        );
+      }
+      return {
+        ok: true,
+        clientName: newName,
+        engagementCode: result.code,
+        engagementsRenamed: result.engagementsRenamed,
+        interviewsRenamed: result.interviewsRenamed,
+        assignmentsMoved: result.assignmentsMoved,
+        workspaceKeysChanged: result.workspaceKeysChanged,
+        report: result.report,
+      };
+    }
+  );
+
+  app.get(
+    "/api/assignments",
+    { preHandler: requireRole("owner", "consultant") },
+    async (req) => {
+      const ctx = req.ctx!;
+      return withTenant(ctx.tenantId, async (c) => {
+        const r = ctx.role === "owner"
+          ? await c.query(
+              `SELECT a.user_id, a.client_name, a.client_norm, a.created_at,
+                      u.email, u.name
+                 FROM client_assignments a JOIN users u ON u.id = a.user_id
+                ORDER BY u.email, a.client_name`)
+          : await c.query(
+              `SELECT a.user_id, a.client_name, a.client_norm, a.created_at
+                 FROM client_assignments a WHERE a.user_id = $1
+                ORDER BY a.client_name`, [ctx.userId]);
+        return { assignments: r.rows };
+      });
+    }
+  );
+
+  // Clients the caller can work on. Owners get every client seen anywhere
+  // (engagements + interviews + assignments); consultants get exactly their
+  // assignments.
+  app.get(
+    "/api/my-clients",
+    { preHandler: requireRole("owner", "consultant") },
+    async (req) => {
+      const ctx = req.ctx!;
+      return withTenant(ctx.tenantId, async (c) => {
+        if (ctx.role === "owner") {
+          // Engagements included so a client created via the briefing flow
+          // (Pre-Engagement) appears in the login picker even before any
+          // interview exists or a consultant is assigned.
+          const r = await c.query<{ client_name: string }>(
+            `SELECT client_name FROM interviews
+             UNION SELECT client_name FROM client_assignments
+             UNION SELECT client_name FROM engagements
+             ORDER BY client_name`);
+          return { role: "owner", clients: r.rows.map((x) => x.client_name) };
+        }
+        const r = await c.query<{ client_name: string }>(
+          `SELECT DISTINCT client_name FROM client_assignments
+            WHERE user_id = $1 ORDER BY client_name`, [ctx.userId]);
+        return { role: ctx.role, clients: r.rows.map((x) => x.client_name) };
+      });
+    }
+  );
+
+  app.post(
+    "/api/assignments",
+    { preHandler: requireRole("owner") },
+    async (req, reply) => {
+      const ctx = req.ctx!;
+      const parsed = Body.safeParse(req.body);
+      if (!parsed.success) { reply.code(400).send({ error: "invalid_input" }); return; }
+      const member = await memberByEmail(ctx.tenantId, parsed.data.email);
+      if (!member) { reply.code(404).send({ error: "no_such_member", detail: "No owner/consultant with that email in this firm — add them in the Team section first." }); return; }
+      const clientName = parsed.data.clientName.trim();
+      await withTenant(ctx.tenantId, async (c) => {
+        await c.query(
+          `INSERT INTO client_assignments (tenant_id, user_id, client_name, client_norm, created_by)
+           VALUES (NULLIF(current_setting('app.tenant_id', true), '')::uuid, $1, $2, $3, $4)
+           ON CONFLICT (tenant_id, user_id, client_norm)
+           DO UPDATE SET client_name = EXCLUDED.client_name`,
+          [member.id, clientName, normClient(clientName), ctx.userId]
+        );
+      });
+      invalidateNorms(ctx.tenantId, member.id); // scope grew (v5.34.0)
+      await auditLog(ctx.tenantId, ctx.userId, "client_assignment_added", {
+        assigneeEmail: parsed.data.email, clientName,
+      });
+      reply.code(201).send({ ok: true, userId: member.id, clientNorm: normClient(clientName) });
+    }
+  );
+
+  app.delete(
+    "/api/assignments",
+    { preHandler: requireRole("owner") },
+    async (req, reply) => {
+      const ctx = req.ctx!;
+      const parsed = Body.safeParse(req.body);
+      if (!parsed.success) { reply.code(400).send({ error: "invalid_input" }); return; }
+      const member = await memberByEmail(ctx.tenantId, parsed.data.email);
+      if (!member) { reply.code(404).send({ error: "no_such_member" }); return; }
+      const n = await withTenant(ctx.tenantId, async (c) => {
+        const r = await c.query(
+          `DELETE FROM client_assignments WHERE user_id = $1 AND client_norm = $2`,
+          [member.id, normClient(parsed.data.clientName)]
+        );
+        return r.rowCount ?? 0;
+      });
+      if (!n) { reply.code(404).send({ error: "not_found" }); return; }
+      invalidateNorms(ctx.tenantId, member.id); // scope shrank (v5.34.0)
+      await auditLog(ctx.tenantId, ctx.userId, "client_assignment_removed", {
+        assigneeEmail: parsed.data.email, clientName: parsed.data.clientName,
+      });
+      return { ok: true };
+    }
+  );
+}
