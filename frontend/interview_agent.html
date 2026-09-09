@@ -3873,24 +3873,24 @@ function startLiveVoice(isResume){
   // readyState is queued, not dropped. Role (e.g. CDO) is named once,
   // naturally, in the stage-setting.
   var _ivRole = (S.stakeholderRole || '').trim();
+  // v5.34.13: opening BEHAVIOUR now lives in the pinned system instruction
+  // (interviewerPersona.ts OPENING_DIRECTIVE). Sending the long instruction as
+  // a USER turn made the native-audio model reply in TEXT instead of speaking,
+  // so the interview opened silently. We now send only a SHORT trigger; the
+  // persona delivers the greeting/stage-setting/first-question aloud.
   var _openingLine = isResume
-    ? 'The stakeholder has returned to continue. Welcome them back in one sentence, briefly recap where you left off, then ask your next question.'
-    : 'Begin the interview now. First greet ' + (S.stakeholderName || 'the interviewee')
-      + ' warmly by name and introduce yourself in one sentence. Then, in two or three'
-      + ' sentences, set the stage: acknowledge their role'
-      + (_ivRole ? ' as ' + _ivRole : '')
-      + ' at ' + (S.client || 'their organisation') + ' once, naturally, and say you would'
-      + ' value their perspective given that vantage point. This is a short, conversational'
-      + ' diagnostic about how ' + (S.client || 'their organisation') + ' approaches AI readiness'
-      + (S.industry ? ' in the ' + S.industry + ' industry' : '')
-      + '; there are no right or wrong answers. Then transition naturally into your first'
-      + ' question. Keep the whole opening brief — well under a minute of speech.';
+    ? 'I have returned to continue the interview. Please welcome me back briefly and ask your next question.'
+    : 'Please begin the interview now.';
   LIVE = window.vyneLiveInterview.create({
     state: S,
     clientName: S.client,
     interviewerName: identity.name || S.interviewerName || undefined,
     voice: identity.voice || S.interviewerVoice || undefined,
     context: buildLiveContext(),
+    // v5.34.14: surface connection progress so the setup window never reads
+    // as a frozen/silent screen. The first spoken turn from a native-audio
+    // model can take a few seconds; say what's happening meanwhile.
+    onNote: function(msg){ try{ setStatus('thinking', 'Connecting to your interviewer…'); }catch(e){} },
     onScore: function(sd){ try{ applyScoreData(sd); autoSave(); }catch(e){} },
     onTurns: function(){
       // Persist the transcript as it accumulates so a dropped connection or a
@@ -3935,6 +3935,7 @@ function startLiveVoice(isResume){
     onError: function(r){ setVoiceBadge('standard', liveReasonText(r)); },
     onEnded: function(){ setVoiceBadge('standard', 'session ended'); }
   });
+  try{ setStatus('thinking', 'Connecting to your interviewer…'); }catch(e){}
   return LIVE.start().then(function(){
     setVoiceBadge('live', LIVE_VOICE_IN_USE);
     setStatus('ready','Listening...');

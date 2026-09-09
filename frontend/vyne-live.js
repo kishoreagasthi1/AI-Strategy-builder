@@ -74,13 +74,20 @@
    * the first that reaches setupComplete. The winner is reported to the caller
    * so it can be pinned once observed.
    */
+  // v5.34.14: order variants by what actually connects FIRST. The working
+  // combination in production (verified live via socket tracing) is
+  // v1beta / BidiGenerateContentConstrained / access_token. It used to be
+  // LAST, so every interview opened five doomed sockets (~1-2s each) before
+  // the sixth connected — ~8-11s of dead air that read as 'no sound / broken'.
+  // Trying the known-good one first drops first-audio to ~2-3s. The rest
+  // remain as ordered fallbacks in case the endpoint shape changes again.
   var WS_VARIANTS = [
-    { v: 'v1alpha', svc: 'BidiGenerateContent',            auth: 'key' },
-    { v: 'v1beta',  svc: 'BidiGenerateContent',            auth: 'key' },
-    { v: 'v1alpha', svc: 'BidiGenerateContentConstrained', auth: 'key' },
+    { v: 'v1beta',  svc: 'BidiGenerateContentConstrained', auth: 'access_token' },
+    { v: 'v1alpha', svc: 'BidiGenerateContentConstrained', auth: 'access_token' },
     { v: 'v1beta',  svc: 'BidiGenerateContentConstrained', auth: 'key' },
-    { v: 'v1alpha', svc: 'BidiGenerateContent',            auth: 'access_token' },
-    { v: 'v1beta',  svc: 'BidiGenerateContentConstrained', auth: 'access_token' }
+    { v: 'v1alpha', svc: 'BidiGenerateContentConstrained', auth: 'key' },
+    { v: 'v1beta',  svc: 'BidiGenerateContent',            auth: 'key' },
+    { v: 'v1alpha', svc: 'BidiGenerateContent',            auth: 'key' }
   ];
   function wsUrl(variant, token) {
     return WS_HOST + '/ws/google.ai.generativelanguage.' + variant.v +
