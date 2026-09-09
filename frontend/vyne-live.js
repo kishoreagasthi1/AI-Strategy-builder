@@ -532,6 +532,12 @@
           self._sawFirstResponse = true;
           if (self._openingRetryTimer) { clearTimeout(self._openingRetryTimer); self._openingRetryTimer = null; }
         }
+        // v5.34.16: expose a simple 'agent has produced a frame' flag on the
+        // session so the interview layer's open() can detect a dropped
+        // opening (warmup) and resend it — the opening goes through
+        // sendText directly, not the _pendingText flush, so the retry must
+        // live where the opening is actually sent (LiveInterview.open).
+        if (f.audio.length || f.agentText) { self._gotAgentFrame = true; }
 
         if (f.interrupted) {
           self.queue.flush();

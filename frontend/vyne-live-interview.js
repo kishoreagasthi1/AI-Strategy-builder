@@ -328,9 +328,26 @@
     return this._openSession();
   };
 
-  /** Open the interview so the interviewee does not have to speak first. */
+  /** Open the interview so the interviewee does not have to speak first.
+   *
+   * v5.34.16: warmup retry on the ACTUAL opening path. setupComplete does
+   * not mean the model can generate yet; an opening sent in that instant is
+   * sometimes silently dropped, so the interview opened mute (intermittent).
+   * If no agent frame arrives within 3.5s, resend the opening ONCE. The
+   * session sets _gotAgentFrame on any response; we check that, not a
+   * timer alone, so a session that DID answer is never double-prompted. */
   LiveInterview.prototype.open = function (line) {
-    if (this.session) this.session.sendText(line);
+    var self = this;
+    if (!this.session) return;
+    this.session._gotAgentFrame = false;
+    this.session.sendText(line);
+    if (this._openRetry) { clearTimeout(this._openRetry); }
+    this._openRetry = setTimeout(function () {
+      var s = self.session;
+      if (s && !s.closed && !self._muted && s.ws && s.ws.readyState === 1 && !s._gotAgentFrame) {
+        try { s.sendText(line); } catch (e) {}
+      }
+    }, 3500);
   };
 
   LiveInterview.prototype.say = function (text) {
