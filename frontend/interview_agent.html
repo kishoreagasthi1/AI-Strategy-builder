@@ -3857,6 +3857,16 @@ function startLiveVoice(isResume){
   // and the current assignment is the one that should be honoured. S is the
   // fallback for a session that started before this field existed.
   var identity = assignedInterviewerIdentity();
+  // v5.34.7: tear down any prior live session BEFORE creating a new one.
+  // Restarting an interview reassigned LIVE to a fresh session without
+  // stopping the old one, so its budget reservation never released
+  // (next mint hit the per-user cap -> 429 too_many_live_sessions ->
+  // robotic TTS fallback) and its socket could stay alive (overlapping
+  // voices). stop() fires the /close beacon that releases the hold.
+  if (LIVE) {
+    try { LIVE.stop('restart'); } catch (e) {}
+    LIVE = null;
+  }
   LIVE = window.vyneLiveInterview.create({
     state: S,
     clientName: S.client,
