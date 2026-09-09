@@ -3857,6 +3857,18 @@ function startLiveVoice(isResume){
   // and the current assignment is the one that should be honoured. S is the
   // fallback for a session that started before this field existed.
   var identity = assignedInterviewerIdentity();
+  // v5.34.9: build the opening line up front so onReady (fired when the
+  // socket is truly ready) can send it. See onReady below.
+  var _openingLine = isResume
+    ? 'The stakeholder has returned to continue. Welcome them back in one sentence, briefly recap where you left off, then ask your next question.'
+    : 'Begin the interview now. First greet ' + (S.stakeholderName || 'the interviewee')
+      + ' warmly by name and introduce yourself in one sentence. Then, in two or three'
+      + ' sentences, set the stage: this is a short, conversational diagnostic about how '
+      + (S.client || 'their organisation') + ' approaches AI readiness'
+      + (S.industry ? ' in the ' + S.industry + ' industry' : '')
+      + '; you want their candid perspective and there are no right or wrong answers.'
+      + ' Then transition naturally into your first question. Keep the whole opening'
+      + ' brief — well under a minute of speech.';
   // v5.34.7: tear down any prior live session BEFORE creating a new one.
   // Restarting an interview reassigned LIVE to a fresh session without
   // stopping the old one, so its budget reservation never released
@@ -3893,7 +3905,18 @@ function startLiveVoice(isResume){
         setVoiceBadge('live', LIVE_VOICE_IN_USE + ' · ⚠ scoring: ' + liveReasonText(info.code));
       }
     },
-    onReady: function(g){ LIVE_VOICE_IN_USE = (g && g.voice) || ''; setVoiceBadge('live', LIVE_VOICE_IN_USE); },
+    onReady: function(g){
+      LIVE_VOICE_IN_USE = (g && g.voice) || '';
+      setVoiceBadge('live', LIVE_VOICE_IN_USE);
+      // v5.34.9: send the opening HERE (socket confirmed ready) rather than
+      // from start().then(), where on a fast restart it fired before setup
+      // completed and the opening turn was dropped — session alive but
+      // silent. Guarded so it fires exactly once per session.
+      if(LIVE && !LIVE._openingSent && _openingLine){
+        LIVE._openingSent = true;
+        try{ LIVE.open(_openingLine); }catch(e){}
+      }
+    },
     onState: function(st){ if(st === 'live') setVoiceBadge('live', LIVE_VOICE_IN_USE); },
     // Renewal is expected on a long interview, not an error — the grant is
     // deliberately short because it takes a budget hold up front. Say what is
@@ -3908,16 +3931,7 @@ function startLiveVoice(isResume){
     // land LAST and wipe the voice name straight back off the badge.
     setVoiceBadge('live', LIVE_VOICE_IN_USE);
     setStatus('ready','Listening...');
-    LIVE.open(isResume
-      ? 'The stakeholder has returned to continue. Welcome them back in one sentence, briefly recap where you left off, then ask your next question.'
-      : 'Begin the interview now. First greet ' + (S.stakeholderName || 'the interviewee')
-        + ' warmly by name and introduce yourself in one sentence. Then, in two or three'
-        + ' sentences, set the stage: this is a short, conversational diagnostic about how '
-        + (S.client || 'their organisation') + ' approaches AI readiness'
-        + (S.industry ? ' in the ' + S.industry + ' industry' : '')
-        + '; you want their candid perspective and there are no right or wrong answers.'
-        + ' Then transition naturally into your first question. Keep the whole opening'
-        + ' brief — well under a minute of speech.');
+    // v5.34.9: opening is now sent from onReady (socket-ready), not here.
     return true;
   });
 }
