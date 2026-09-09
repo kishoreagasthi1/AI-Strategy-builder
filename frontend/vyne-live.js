@@ -506,14 +506,32 @@
           if (!settled) { settled = true; resolve(self); }
           if (self.opts.onReady) { try { self.opts.onReady(self.grant); } catch (e) {} }
           // v5.34.11: flush any text queued before the socket was OPEN.
+          // v5.34.15: opening warmup retry. "setupComplete" does not mean the
+          // model is ready to GENERATE — a turn sent in the instant after it can
+          // be silently dropped (intermittently), so the interview opened mute
+          // even though the opening was sent. Remember the opening turn and, if
+          // NO response frame (audio or text) arrives within a few seconds,
+          // resend it once. This self-heals the race regardless of warmup time.
           if (self._pendingText && self._pendingText.length) {
             var _q = self._pendingText; self._pendingText = null;
+            self._openingTurn = _q[_q.length - 1];
+            self._sawFirstResponse = false;
             for (var _i = 0; _i < _q.length; _i++) { self.sendText(_q[_i]); }
+            self._openingRetryTimer = setTimeout(function () {
+              if (!self._sawFirstResponse && !self.closed && self.ws && self.ws.readyState === 1 && self._openingTurn) {
+                try { self.sendText(self._openingTurn); } catch (e) {}
+              }
+            }, 3500);
           }
         }
 
         if (self.opts.onFrame) { try { self.opts.onFrame(msg); } catch (e) {} }
         var f = parseServerFrame(msg);
+        // v5.34.15: first real response cancels the opening warmup retry.
+        if (!self._sawFirstResponse && (f.audio.length || f.agentText)) {
+          self._sawFirstResponse = true;
+          if (self._openingRetryTimer) { clearTimeout(self._openingRetryTimer); self._openingRetryTimer = null; }
+        }
 
         if (f.interrupted) {
           self.queue.flush();
