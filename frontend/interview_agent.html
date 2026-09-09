@@ -4158,6 +4158,11 @@ async function setInterviewPaused(paused){
       if(LIVE.isAlive()){
         LIVE.setMuted(false);
       }else{
+        // The paused session is GONE, not merely muted, so resuming re-mints a
+        // whole new grant. Worth seeing in the trace: this is the step that can
+        // be refused, and a refusal here is the difference between "resumes"
+        // and "never speaks again".
+        VL('RESUME: live session is dead — re-minting a new one', { renewals: (LIVE && LIVE.renewals) || 0 });
         try{
           await startLiveVoice(true);
           showToast('Reconnected — the session had timed out while paused');

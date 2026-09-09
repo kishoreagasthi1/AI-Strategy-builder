@@ -296,4 +296,57 @@ describe("opening reaches the wire on auto-start", () => {
     // would have kept the pattern going for as long as the cap allowed.
     expect(openingsOnWire(sent, OPENING).length).toBe(2);
   });
+
+  /**
+   * v5.34.20 — a talkative agent must not push the interesting events out.
+   *
+   * Reported from a real session: the trace filled with one line per audio
+   * frame (~20/second), so by the time the user paused, everything explaining
+   * the pause had rolled off the ring. Audio-only frames are now counted and
+   * rolled up. This asserts both halves: the flood collapses, AND the event
+   * that follows it survives in order.
+   */
+  it("rolls up audio frames so surrounding events survive the ring", async () => {
+    const logged: string[] = [];
+    win.console = { ...console, log: (line: string) => { logged.push(String(line)); } };
+    win.VYNE_LIVE_DEBUG = true;
+
+    const LIVE = win.vyneLiveInterview.create({
+      state: {},
+      onReady: function () { LIVE.open(OPENING); },
+    });
+    await LIVE.start();
+    await settle(15);
+
+    for (let i = 0; i < 500; i++) sockets[0].speak();
+    // The event that must not be buried.
+    sockets[0].onclose?.({ code: 1011, reason: "server went away" });
+    await settle(20);
+
+    const audioLines = logged.filter((l) => l.includes("frame AUDIO"));
+    expect(audioLines.length).toBeLessThan(20);       // was 500, one per frame
+    expect(logged.some((l) => l.includes("ws CLOSE"))).toBe(true);
+
+    // And the ring holds it, which is what the user actually reads back.
+    const ring = win.__vyneLiveLog as Array<{ tag: string }>;
+    expect(ring.some((e) => e.tag.includes("ws CLOSE"))).toBe(true);
+    expect(ring.some((e) => e.tag.includes("session.stop"))).toBe(true);
+  });
+
+  /** The capture helpers the operator drives from the console. */
+  it("exposes log clear/mark helpers that keep the trace readable", async () => {
+    win.VYNE_LIVE_DEBUG = true;
+    win.console = { ...console, log: () => {} };
+    const LIVE = win.vyneLiveInterview.create({ state: {}, onReady: function () { LIVE.open(OPENING); } });
+    await LIVE.start();
+    await settle(15);
+    expect((win.__vyneLiveLog as unknown[]).length).toBeGreaterThan(1);
+
+    win.vyneLiveLogClear("about to pause");
+    win.vyneLiveMark("clicked Pause");
+    const ring = win.__vyneLiveLog as Array<{ tag: string }>;
+    expect(ring.length).toBe(2);
+    expect(ring[0].tag).toContain("log cleared: about to pause");
+    expect(ring[1].tag).toContain("MARK: clicked Pause");
+  });
 });

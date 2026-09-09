@@ -74,10 +74,24 @@
     try {
       var buf = window.__vyneLiveLog || (window.__vyneLiveLog = []);
       buf.push({ t: dt, tag: tag, data: data });
-      if (buf.length > 4000) buf.splice(0, buf.length - 4000);
+      // v5.34.20: a live turn produces audio frames at ~20/second, so a chatty
+      // ring rolls the interesting events — a pause, a close, a teardown — off
+      // the end before anyone can read them. Audio frames are now rolled up
+      // (see _traceFrame) AND the ring is large enough to hold a whole
+      // interview's worth of events. Overridable for a very long session.
+      var cap = Number(window.VYNE_LIVE_LOG_MAX) || 20000;
+      if (buf.length > cap) buf.splice(0, buf.length - cap);
     } catch (e) {}
   }
   window.vyneLiveLog = vlog;
+  /** Start a clean capture — call right before the thing you want to see. */
+  window.vyneLiveLogClear = function (note) {
+    window.__vyneLiveLog = [];
+    vlog('--- log cleared' + (note ? ': ' + note : '') + ' ---');
+    return 'cleared';
+  };
+  /** Drop a labelled marker into the trace, e.g. just before clicking Pause. */
+  window.vyneLiveMark = function (label) { vlog('>>> MARK: ' + String(label)); return 'marked'; };
   /** Paste-ready transcript of the whole trace. `copy(vyneLiveLogDump())`. */
   window.vyneLiveLogDump = function () {
     var buf = window.__vyneLiveLog || [];
@@ -336,9 +350,28 @@
    * dropped, because the frame shape is Google's to change and a new envelope
    * would otherwise present as silence.
    */
+  /**
+   * Emit the pending audio-frame rollup, if any.
+   *
+   * Audio arrives ~20 frames a second. Logging each one buried every event that
+   * matters — the pause, the close, the teardown — under hundreds of identical
+   * lines, which is exactly the report this addresses. Audio-only frames are
+   * counted instead, and the count is flushed when something INTERESTING
+   * happens or when the run gets long, so "the agent spoke for 12 seconds"
+   * costs one line rather than 240.
+   */
+  function _flushAudioRun(sess) {
+    if (!sess._audioRun || !sess._audioRun.n) return;
+    vlog('frame AUDIO x' + sess._audioRun.n + ' (rolled up)', {
+      b64Bytes: sess._audioRun.bytes,
+      spanMs: Date.now() - sess._audioRun.startedAt
+    });
+    sess._audioRun = null;
+  }
+
   function _traceFrame(sess, msg) {
     if (window.VYNE_LIVE_DEBUG === false) return;
-    if (!msg || typeof msg !== 'object') { vlog('frame <non-object>', msg); return; }
+    if (!msg || typeof msg !== 'object') { _flushAudioRun(sess); vlog('frame <non-object>', msg); return; }
     if (msg.setupComplete) { vlog('frame setupComplete'); return; }
     var sc = msg.serverContent;
     if (sc) {
@@ -377,9 +410,27 @@
       if (sc.turnComplete) bits.push('turnComplete');
       if (sc.generationComplete) bits.push('generationComplete');
       if (!bits.length) bits.push('serverContent(empty) keys=' + Object.keys(sc).join(','));
+
+      // An AUDIO-ONLY frame carries no information the previous one did not.
+      // Count it; print the first of a run and then only a periodic rollup.
+      var audioOnly = audioN > 0 && bits.length === 1;
+      if (audioOnly) {
+        if (!sess._audioRun) {
+          sess._audioRun = { n: 0, bytes: 0, startedAt: Date.now() };
+          vlog('frame AUDIO (run starts; further frames rolled up)');
+        }
+        sess._audioRun.n++;
+        sess._audioRun.bytes += audioBytes;
+        if (sess._audioRun.n % 100 === 0) _flushAudioRun(sess);
+        return;
+      }
+      // Anything else is an event worth seeing in sequence, so close the run
+      // first — otherwise the rollup would print after the event it preceded.
+      _flushAudioRun(sess);
       vlog('frame ' + bits.join(' + '), Object.keys(detail).length ? detail : undefined);
       return;
     }
+    _flushAudioRun(sess);
     if (msg.usageMetadata) {
       vlog('frame usageMetadata', { in: msg.usageMetadata.promptTokenCount, out: msg.usageMetadata.responseTokenCount });
       return;
@@ -530,6 +581,12 @@
         // caller falls back to the existing text + TTS path rather than
         // failing the interview.
         return r.json().catch(function () { return {}; }).then(function (b) {
+          // The refusal reason is the whole story on a reconnect: every
+          // pause/resume cycle mints a FRESH grant, and a user is capped at a
+          // few open grants inside a rolling window (routes/voice.ts), so a
+          // session that will not come back after a second or third pause looks
+          // exactly like this line and nothing else.
+          vlog('grant REFUSED by our server', { status: r.status, error: b.error, detail: b.detail });
           var e = new Error(b.error || ('live_session_http_' + r.status));
           e.code = b.error; e.status = r.status;
           throw e;
@@ -618,7 +675,28 @@
       var node = self.micCtx.createScriptProcessor(FRAME_SAMPLES, 1, 1);
       self.node = node;
       node.onaudioprocess = function (ev) {
-        if (self.closed || self.muted || !self.ws || self.ws.readyState !== 1) return;
+        if (self.closed || !self.ws || self.ws.readyState !== 1) return;
+        // v5.34.21: keepalive while paused. A muted session used to send
+        // NOTHING (return on self.muted), so the socket went idle and the
+        // SERVER closed it — pause tore the whole session down, Resume had
+        // to re-mint, and after a few cycles the concurrency cap refused it
+        // (the 'stops after the Nth pause' bug). Instead, while muted, keep
+        // the socket warm with a low-rate SILENT frame (all zeros): the
+        // uplink stays alive, the model hears quiet (not an interruption),
+        // and Resume simply unmutes a still-living session — no teardown,
+        // no re-mint, no cap.
+        if (self.muted) {
+          var nowTs = Date.now();
+          if (!self._lastKeepAlive || (nowTs - self._lastKeepAlive) >= 2000) {
+            self._lastKeepAlive = nowTs;
+            try {
+              var silent = new Int16Array(FRAME_SAMPLES); // zero-filled = silence
+              self.ws.send(JSON.stringify(buildAudioFrame(silent)));
+              if (!self._keepAliveLogged) { self._keepAliveLogged = true; vlog('paused — sending silent keepalive frames to hold the socket'); }
+            } catch (e) { /* socket closing — close handler tidies up */ }
+          }
+          return;
+        }
         // Mic frames leave every ~128ms, so log the first and then sparsely.
         // They matter here for one reason: uplink audio is what the model's
         // activity detection can INTERRUPT a turn on, so a dropped opening
@@ -823,8 +901,15 @@
       };
 
       ws.onclose = function (ev) {
-        vlog('ws CLOSE', { code: ev.code, reason: ev.reason, sawSetup: sawSetup,
-                           audioEverReceived: !!self._firstAudioAt });
+        vlog('ws CLOSE — the SERVER closed the socket', {
+          code: ev.code, reason: ev.reason, sawSetup: sawSetup,
+          audioEverReceived: !!self._firstAudioAt,
+          muted: !!self.muted,
+          // A paused session sends no microphone frames at all, so the socket
+          // goes idle. If a close lands shortly after a pause with the session
+          // muted, that is the shape of an idle timeout rather than a fault.
+          secondsSinceOpen: self.startedAt ? Math.round((Date.now() - self.startedAt) / 1000) : 0
+        });
         clearTimeout(setupTimer);
         // The close code and reason are the ONLY explanation the server gives
         // when it rejects a session after the handshake. Without them this
@@ -857,6 +942,7 @@
     var was = this.muted;
     vlog('session.setMuted(' + !!m + ')', { was: !!was });
     this.muted = !!m;
+    if (!this.muted) { this._keepAliveLogged = false; this._lastKeepAlive = 0; }
     if (this.muted && !was) {
       // Entering pause: flush the playback queue. queue.flush() stops every
       // audio source already scheduled on the output context, so nothing keeps
@@ -902,9 +988,32 @@
 
   VyneLiveSession.prototype.stop = function (reason) {
     if (this.closed) return;
-    vlog('session.stop(' + reason + ')', { audioEverReceived: !!this._firstAudioAt,
-                                           micFrames: this._micFrames || 0,
-                                           gotAgentFrame: !!this._gotAgentFrame });
+    /*
+     * v5.34.20: WHO tore this session down, and was it us?
+     *
+     * A pause was observed to end with isAlive:false and both AudioContexts
+     * closed — a full teardown, not a mute. setMuted() cannot do that, so
+     * either something calls stop() directly, or the socket closed underneath
+     * us and ws.onclose called stop('closed:...') on our behalf. Those two have
+     * completely different remedies, and only the stack tells them apart:
+     * a frame mentioning ws.onclose means the SERVER dropped us.
+     *
+     * Worth knowing while reading it: muting stops microphone frames entirely
+     * (see node.onaudioprocess), so a paused session sends nothing at all and
+     * looks idle to the server.
+     */
+    vlog('session.stop(' + reason + ')', {
+      audioEverReceived: !!this._firstAudioAt,
+      micFrames: this._micFrames || 0,
+      gotAgentFrame: !!this._gotAgentFrame,
+      muted: !!this.muted,
+      wsState: rs(this.ws),
+      secondsAlive: this.startedAt ? Math.round((Date.now() - this.startedAt) / 1000) : 0,
+      via: (function () {
+        try { return String(new Error().stack || '').split('\n').slice(2, 7).join(' | '); }
+        catch (e) { return 'unavailable'; }
+      })()
+    });
     this.closed = true;
     if (this.timer) { clearTimeout(this.timer); this.timer = null; }
     if (this.queue) this.queue.flush();
