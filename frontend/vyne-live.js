@@ -498,6 +498,11 @@
           self.timer = setTimeout(function () { self.stop('max_duration'); }, maxMs);
           if (!settled) { settled = true; resolve(self); }
           if (self.opts.onReady) { try { self.opts.onReady(self.grant); } catch (e) {} }
+          // v5.34.11: flush any text queued before the socket was OPEN.
+          if (self._pendingText && self._pendingText.length) {
+            var _q = self._pendingText; self._pendingText = null;
+            for (var _i = 0; _i < _q.length; _i++) { self.sendText(_q[_i]); }
+          }
         }
 
         if (self.opts.onFrame) { try { self.opts.onFrame(msg); } catch (e) {} }
@@ -584,7 +589,18 @@
   /** Send a text turn — used to open the interview without waiting for the
    *  interviewee to speak first, and by the type-instead fallback. */
   VyneLiveSession.prototype.sendText = function (text) {
-    if (!this.ws || this.ws.readyState !== 1) return false;
+    // v5.34.11: queue text sent before the socket is OPEN instead of
+    // silently dropping it. The opening turn is sent right after the
+    // session resolves; on a fast start/restart the socket can be a beat
+    // away from readyState OPEN, and the old guard returned false into the
+    // void — session alive but SILENT. Queue now, flush on setupComplete.
+    if (!this.ws || this.ws.readyState !== 1) {
+      if (this.ws && this.ws.readyState === 0) {
+        (this._pendingText || (this._pendingText = [])).push(String(text));
+        return true;
+      }
+      return false;
+    }
     this.ws.send(JSON.stringify({
       clientContent: {
         turns: [{ role: 'user', parts: [{ text: String(text) }] }],

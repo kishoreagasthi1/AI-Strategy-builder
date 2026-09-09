@@ -519,6 +519,35 @@ export async function interviewRoutes(app: FastifyInstance): Promise<void> {
         }
       });
 
+      // Duplicate guard (v5.34.11): one interview per (person, client, round).
+      // A NULL round matches a NULL round — same real interview. A different
+      // round_number is a legitimately separate interview (016) and does NOT
+      // collide. Blocks with a clear 409 instead of silently creating another
+      // row; to run a fresh one the consultant deletes the existing interview
+      // first (DELETE /api/interviews/:id).
+      const dup = await withTenant(ctx.tenantId, async (c) => {
+        const r = await c.query<{ id: string; status: string }>(
+          `SELECT id, status FROM interviews
+            WHERE interviewee_user_id = $1
+              AND lower(client_name) = lower($2)
+              AND round_number IS NOT DISTINCT FROM $3
+            LIMIT 1`,
+          [result, clientName, roundNumber ?? null]
+        );
+        return r.rows[0] ?? null;
+      });
+      if (dup) {
+        reply.code(409).send({
+          error: "duplicate_interview",
+          detail: `${intervieweeName} already has an interview for ${clientName}`
+            + (roundNumber ? ` (round ${roundNumber})` : "")
+            + `. Reuse it from the tracker, or delete it there first to start a fresh one.`,
+          existingId: dup.id,
+          existingStatus: dup.status,
+        });
+        return;
+      }
+
       // 2. Interview row with its private state namespace.
       const row = await withTenant(ctx.tenantId, async (c) => {
         const r = await c.query<{ id: string }>(

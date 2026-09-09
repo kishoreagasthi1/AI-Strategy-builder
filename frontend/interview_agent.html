@@ -3867,6 +3867,24 @@ function startLiveVoice(isResume){
     try { LIVE.stop('restart'); } catch (e) {}
     LIVE = null;
   }
+  // v5.34.11: opening built here so onReady (fired at setupComplete)
+  // can send it the instant the socket is truly ready. The queue in
+  // vyne-live.js backs this up — a send that still races ahead of
+  // readyState is queued, not dropped. Role (e.g. CDO) is named once,
+  // naturally, in the stage-setting.
+  var _ivRole = (S.stakeholderRole || '').trim();
+  var _openingLine = isResume
+    ? 'The stakeholder has returned to continue. Welcome them back in one sentence, briefly recap where you left off, then ask your next question.'
+    : 'Begin the interview now. First greet ' + (S.stakeholderName || 'the interviewee')
+      + ' warmly by name and introduce yourself in one sentence. Then, in two or three'
+      + ' sentences, set the stage: acknowledge their role'
+      + (_ivRole ? ' as ' + _ivRole : '')
+      + ' at ' + (S.client || 'their organisation') + ' once, naturally, and say you would'
+      + ' value their perspective given that vantage point. This is a short, conversational'
+      + ' diagnostic about how ' + (S.client || 'their organisation') + ' approaches AI readiness'
+      + (S.industry ? ' in the ' + S.industry + ' industry' : '')
+      + '; there are no right or wrong answers. Then transition naturally into your first'
+      + ' question. Keep the whole opening brief — well under a minute of speech.';
   LIVE = window.vyneLiveInterview.create({
     state: S,
     clientName: S.client,
@@ -3893,7 +3911,19 @@ function startLiveVoice(isResume){
         setVoiceBadge('live', LIVE_VOICE_IN_USE + ' · ⚠ scoring: ' + liveReasonText(info.code));
       }
     },
-    onReady: function(g){ LIVE_VOICE_IN_USE = (g && g.voice) || ''; setVoiceBadge('live', LIVE_VOICE_IN_USE); },
+    onReady: function(g){
+      LIVE_VOICE_IN_USE = (g && g.voice) || '';
+      setVoiceBadge('live', LIVE_VOICE_IN_USE);
+      // v5.34.11: a freshly-ready session must be audible and must
+      // deliver its opening exactly once. Clear any stale mute/paused
+      // state, then open. Backed by the vyne-live.js send-queue.
+      if(LIVE && !LIVE._openingSent){
+        LIVE._openingSent = true;
+        try{ LIVE.setMuted(false); }catch(e){}
+        if(typeof IV_CLOCK !== 'undefined') IV_CLOCK.paused = false;
+        try{ LIVE.open(_openingLine); }catch(e){}
+      }
+    },
     onState: function(st){ if(st === 'live') setVoiceBadge('live', LIVE_VOICE_IN_USE); },
     // Renewal is expected on a long interview, not an error — the grant is
     // deliberately short because it takes a budget hold up front. Say what is
@@ -3904,20 +3934,15 @@ function startLiveVoice(isResume){
     onEnded: function(){ setVoiceBadge('standard', 'session ended'); }
   });
   return LIVE.start().then(function(){
-    // Carries the voice, like the two callbacks above. Bare 'live' here used to
-    // land LAST and wipe the voice name straight back off the badge.
     setVoiceBadge('live', LIVE_VOICE_IN_USE);
     setStatus('ready','Listening...');
-    LIVE.open(isResume
-      ? 'The stakeholder has returned to continue. Welcome them back in one sentence, briefly recap where you left off, then ask your next question.'
-      : 'Begin the interview now. First greet ' + (S.stakeholderName || 'the interviewee')
-        + ' warmly by name and introduce yourself in one sentence. Then, in two or three'
-        + ' sentences, set the stage: this is a short, conversational diagnostic about how '
-        + (S.client || 'their organisation') + ' approaches AI readiness'
-        + (S.industry ? ' in the ' + S.industry + ' industry' : '')
-        + '; you want their candid perspective and there are no right or wrong answers.'
-        + ' Then transition naturally into your first question. Keep the whole opening'
-        + ' brief — well under a minute of speech.');
+    // v5.34.11: backstop — if onReady has not already sent the opening
+    // (timing), send it here. _openingSent guards against a double open,
+    // and the vyne-live.js queue handles a socket a beat behind.
+    if(LIVE && !LIVE._openingSent){
+      LIVE._openingSent = true;
+      try{ LIVE.open(_openingLine); }catch(e){}
+    }
     return true;
   });
 }
