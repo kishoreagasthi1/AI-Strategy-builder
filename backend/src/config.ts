@@ -75,7 +75,14 @@ export function loadConfig(): AppConfig {
     anthropicApiKey: process.env.ANTHROPIC_API_KEY,
     llmDefaultChain: process.env.LLM_DEFAULT_CHAIN?.split(",").map((s) => s.trim()),
     blockFreeTier: env === "production" && process.env.ALLOW_FREE_TIER !== "1",
-    geminiPaidTier: process.env.GEMINI_PAID === "1",
+    // Accept GEMINI_PAID_TIER as well as GEMINI_PAID: deploy/deploy.sh has only
+    // ever forwarded the _TIER spelling, so an operator following the deploy
+    // path set a variable nothing read. The consequence is not a warning — a
+    // billed key reads as free tier, and free tier is hard-blocked in
+    // production, so realtime voice answers 503 live_free_tier_blocked and the
+    // interview drops to TTS. Reading both spellings costs nothing and removes
+    // a class of "configured correctly, still off" report.
+    geminiPaidTier: process.env.GEMINI_PAID === "1" || process.env.GEMINI_PAID_TIER === "1",
     sentryDsn: process.env.SENTRY_DSN,
     stripeSecretKey: process.env.STRIPE_SECRET_KEY,
     stripeWebhookSecret: process.env.STRIPE_WEBHOOK_SECRET,

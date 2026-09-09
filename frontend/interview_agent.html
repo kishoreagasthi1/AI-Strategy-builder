@@ -3847,7 +3847,40 @@ function liveActive(){
   return !!(LIVE && LIVE.session && !LIVE.stopped && LIVE.isAlive());
 }
 
+/** Shared live-path trace (vyne-live.js). No-op if that file is stale-cached. */
+function VL(tag, data){ if(window.vyneLiveLog){ try{ window.vyneLiveLog(tag, data); }catch(e){} } }
+
+/* ── THE WAIT BEFORE THE FIRST WORD (v5.34.19) ───────────────────────────────
+ *
+ * A native-audio model composes an opening in TEXT before it speaks. Measured
+ * on a real session: first audio at 15.5 seconds. Nothing is wrong during those
+ * fifteen seconds — but the page said "Listening..." the moment the socket
+ * connected, so the interviewee sat in front of a screen that claimed to be
+ * listening while nobody spoke. That is indistinguishable from broken, and it
+ * is what every "the interview is silent" report has actually looked like.
+ *
+ * So the page now says what is true from the tap until the first AUDIO frame,
+ * and only then hands over to "Listening...". This is the honest fix for the
+ * wait; the persona's OPENING_DIRECTIVE is the fix for its LENGTH.
+ */
+var LIVE_PREPARING_MSG = 'Connecting you with your interviewer — they\'ll begin speaking in a few seconds…';
+/** True from the tap until the agent's first audio; keeps the message stable. */
+var LIVE_AWAITING_FIRST_AUDIO = false;
+
+function setLivePreparing(){
+  LIVE_AWAITING_FIRST_AUDIO = true;
+  try{ setStatus('thinking', LIVE_PREPARING_MSG); }catch(e){}
+}
+/** First audio (or first spoken transcript) — the wait is over exactly once. */
+function clearLivePreparing(){
+  if(!LIVE_AWAITING_FIRST_AUDIO) return;
+  LIVE_AWAITING_FIRST_AUDIO = false;
+  VL('UI: first audio — clearing preparing message');
+  try{ setStatus('ready','Listening...'); }catch(e){}
+}
+
 function startLiveVoice(isResume){
+  VL('startLiveVoice()', { isResume: !!isResume, voiceMode: S.voiceMode });
   if(!window.vyneLiveInterview || !window.vyneLiveInterview.available()){
     setVoiceBadge('standard', 'realtime not supported in this browser');
     return Promise.reject(new Error('unsupported'));
@@ -3864,6 +3897,7 @@ function startLiveVoice(isResume){
   // robotic TTS fallback) and its socket could stay alive (overlapping
   // voices). stop() fires the /close beacon that releases the hold.
   if (LIVE) {
+    VL('startLiveVoice: tearing down prior LIVE session');
     try { LIVE.stop('restart'); } catch (e) {}
     LIVE = null;
   }
@@ -3897,7 +3931,11 @@ function startLiveVoice(isResume){
       // closed tab never loses the interview record.
       try{ autoSave(); }catch(e){}
     },
-    onPartialAgent: function(t){ liveAppend('ai', t); },
+    // The model is reasoning before speaking. Keep the wait explained; the
+    // reasoning text itself is never rendered — it is not what it said.
+    onAgentThinking: function(){ if(LIVE_AWAITING_FIRST_AUDIO) setLivePreparing(); },
+    onAgentSpeaking: function(){ clearLivePreparing(); },
+    onPartialAgent: function(t){ clearLivePreparing(); liveAppend('ai', t); },
     onPartialUser:  function(t){ liveAppend('user', t); },
     // The badge names the voice the session actually opened with — the value
     // the SERVER resolved, not the one this page asked for. When those two
@@ -3914,16 +3952,30 @@ function startLiveVoice(isResume){
     onReady: function(g){
       LIVE_VOICE_IN_USE = (g && g.voice) || '';
       setVoiceBadge('live', LIVE_VOICE_IN_USE);
+      VL('app onReady', { voice: LIVE_VOICE_IN_USE, hasLIVE: !!LIVE,
+                          hasSession: !!(LIVE && LIVE.session), openingSent: !!(LIVE && LIVE._openingSent) });
       // v5.34.11: a freshly-ready session must be audible and must
       // deliver its opening exactly once. Clear any stale mute/paused
       // state, then open. Backed by the vyne-live.js send-queue.
       if(LIVE && !LIVE._openingSent){
-        LIVE._openingSent = true;
         // A freshly-ready session is never paused. Clear pause state
         // through the single authority so all three flags agree, then
         // open. (v5.34.12)
         try{ if(typeof setInterviewPaused === 'function' && IV_CLOCK.paused){ setInterviewPaused(false); } else { LIVE.setMuted(false); } }catch(e){}
-        try{ LIVE.open(_openingLine); }catch(e){}
+        /*
+         * v5.34.18: set _openingSent from what open() ACTUALLY DID.
+         *
+         * It used to be set to true on the line above this call, unconditionally.
+         * open() then returned early without sending (see vyne-live-interview.js),
+         * and the flag it had already set disarmed the .then() backstop below —
+         * the one place that runs late enough to have a session. One silent guard
+         * plus one optimistic flag is the whole auto-start bug: connected socket,
+         * no opening on the wire, nobody speaking.
+         */
+        var _sent = false;
+        try{ _sent = LIVE.open(_openingLine) !== false; }catch(e){ VL('app onReady: LIVE.open THREW', e && e.message); }
+        LIVE._openingSent = _sent;
+        VL('app onReady: opening dispatched?', { sent: _sent });
       }
     },
     onState: function(st){ if(st === 'live') setVoiceBadge('live', LIVE_VOICE_IN_USE); },
@@ -3938,13 +3990,24 @@ function startLiveVoice(isResume){
   try{ setStatus('thinking', 'Connecting to your interviewer…'); }catch(e){}
   return LIVE.start().then(function(){
     setVoiceBadge('live', LIVE_VOICE_IN_USE);
-    setStatus('ready','Listening...');
+    // NOT "Listening..." — the socket is up, but the model has not spoken yet
+    // and may not for another ten to twenty seconds. Saying we are listening
+    // here is precisely what made a normal wait read as a dead line.
+    if(LIVE_AWAITING_FIRST_AUDIO) setLivePreparing(); else setStatus('ready','Listening...');
     // v5.34.11: backstop — if onReady has not already sent the opening
     // (timing), send it here. _openingSent guards against a double open,
     // and the vyne-live.js queue handles a socket a beat behind.
+    // v5.34.18: this runs AFTER the promise chain, so LIVE.session is
+    // guaranteed attached here. It is the last line of defence for the
+    // opening and must only be skipped when one was genuinely sent.
+    VL('LIVE.start() resolved', { hasSession: !!(LIVE && LIVE.session),
+                                  openingSent: !!(LIVE && LIVE._openingSent) });
     if(LIVE && !LIVE._openingSent){
-      LIVE._openingSent = true;
-      try{ LIVE.open(_openingLine); }catch(e){}
+      VL('backstop: opening not yet sent — sending now');
+      var _sent2 = false;
+      try{ _sent2 = LIVE.open(_openingLine) !== false; }catch(e){ VL('backstop: LIVE.open THREW', e && e.message); }
+      LIVE._openingSent = _sent2;
+      VL('backstop: opening dispatched?', { sent: _sent2 });
     }
     return true;
   });
@@ -4053,6 +4116,25 @@ async function setInterviewPaused(paused){
   //   IV_CLOCK.paused (this fn)  ->  LIVE.setMuted()  ->  session.setMuted()
   // A live session is muted iff the interview is paused. Nothing else toggles it.
   paused = !!paused;
+  /*
+   * v5.34.19: record WHO paused, and from where.
+   *
+   * A trace showed setMuted(true) at +55.8s in the middle of the agent's answer,
+   * after which every following turn was discarded as "muted/paused". Nothing in
+   * this app mutes on a timer, on tab visibility, on focus loss, or on any model
+   * event — the only routes to here are togglePause() (the ⏸ button, or the
+   * interviewee banner's "Pause — continue later") and the unmute on a fresh
+   * session. So the question is not "what logic muted us" but "which control
+   * fired, if any", and only the stack can answer it.
+   */
+  VL('setInterviewPaused(' + paused + ')', {
+    wasPaused: !!IV_CLOCK.paused,
+    liveAlive: !!(typeof LIVE !== 'undefined' && LIVE && LIVE.isAlive()),
+    via: (function(){
+      try{ return String(new Error().stack||'').split('\n').slice(2,6).join(' | '); }
+      catch(e){ return 'unavailable'; }
+    })()
+  });
   IV_CLOCK.paused = paused;
 
   if(paused){
@@ -4097,6 +4179,7 @@ async function setInterviewPaused(paused){
 
 // Thin wrapper — the button just flips the single source of truth.
 async function togglePause(){
+  VL('CLICK: in-interview Pause/Resume button', { nowPaused: !IV_CLOCK.paused });
   await setInterviewPaused(!IV_CLOCK.paused);
 }
 /* ── INTERVIEWER IDENTITY (v5.32.47) ────────────────────────────────────
@@ -4256,9 +4339,12 @@ function launchInterviewScreen(isResume){
     var wentLive = false;
     if(S.voiceMode!=='text'){
       try{
+        VL('overlay tapped — going live', { isResume: !!isResume });
+        setLivePreparing();
         await startLiveVoice(isResume);
         wentLive = true;
       }catch(e){
+        VL('startLiveVoice REJECTED — falling back to text+TTS', { err: e && (e.code || e.message) });
         console.warn('[live voice] unavailable, using standard path:', e && e.message);
         setVoiceBadge('standard', liveReasonText(e && (e.code || e.message)));
       }
@@ -4902,6 +4988,7 @@ document.addEventListener('DOMContentLoaded', function(){
   document.body.style.paddingTop = '40px';
 
   document.getElementById('vyne-pause-btn').onclick = function(){
+    VL('CLICK: interviewee banner "Pause — continue later"');
     // v5.34.7: route the banner pause through the SAME logic as the in-interview
     // pause (togglePause), so a live session is actually silenced. Previously
     // this handler stopped only recognition + TTS audio and never called

@@ -49,6 +49,58 @@
 (function () {
   'use strict';
 
+  /* ── LIVE PATH TRACE (v5.34.18) ─────────────────────────────────────────────
+   *
+   * The opening turn crosses four files and two async boundaries before it
+   * reaches the socket, and every failure on that path is SILENT: a guard that
+   * returns early, a promise that has not settled, a frame the model never
+   * sends. None of them throw, so a broken start looks exactly like a working
+   * one until nobody speaks.
+   *
+   * So the path traces itself. Every log line carries milliseconds since the
+   * module loaded, which is the only way to see an ordering bug — the specific
+   * class of bug this exists for is "A ran before B, and B is what A needed".
+   *
+   * Off with `window.VYNE_LIVE_DEBUG = false`. In DevTools, `copy(vyneLiveLogDump())`
+   * gives a paste-ready transcript.
+   */
+  var _T0 = Date.now();
+  function vlog(tag, data) {
+    if (window.VYNE_LIVE_DEBUG === false) return;
+    var dt = Date.now() - _T0;
+    var stamp = '        ' + dt;
+    stamp = stamp.slice(stamp.length - 6);
+    try { console.log('[VL +' + stamp + 'ms] ' + tag, data === undefined ? '' : data); } catch (e) {}
+    try {
+      var buf = window.__vyneLiveLog || (window.__vyneLiveLog = []);
+      buf.push({ t: dt, tag: tag, data: data });
+      if (buf.length > 4000) buf.splice(0, buf.length - 4000);
+    } catch (e) {}
+  }
+  window.vyneLiveLog = vlog;
+  /** Paste-ready transcript of the whole trace. `copy(vyneLiveLogDump())`. */
+  window.vyneLiveLogDump = function () {
+    var buf = window.__vyneLiveLog || [];
+    return buf.map(function (e) {
+      var stamp = '        ' + e.t;
+      stamp = stamp.slice(stamp.length - 6);
+      var d = '';
+      if (e.data !== undefined) {
+        try { d = ' ' + JSON.stringify(e.data); } catch (x) { d = ' <unserialisable>'; }
+      }
+      return '[VL +' + stamp + 'ms] ' + e.tag + d;
+    }).join('\n');
+  };
+  /** Socket readyState as a word — '1' tells you nothing at 2am. */
+  function rs(ws) {
+    if (!ws) return 'no-socket';
+    return ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'][ws.readyState] || ('?' + ws.readyState);
+  }
+  function snip(s, n) {
+    s = String(s == null ? '' : s);
+    return s.length > (n || 80) ? s.slice(0, n || 80) + '…(' + s.length + ')' : s;
+  }
+
   /**
    * Protocol surface. These are the parts most likely to move: Google retires
    * preview endpoints and model ids, which is exactly how the batch TTS path
@@ -229,10 +281,27 @@
    * without a network, and so a shape change surfaces in one place.
    */
   function parseServerFrame(msg) {
-    var out = { audio: [], userText: '', agentText: '', interrupted: false, turnComplete: false, usage: null };
+    var out = { audio: [], userText: '', agentText: '', modelText: '', anyModelActivity: false,
+                interrupted: false, turnComplete: false, usage: null };
     if (!msg) return out;
     var sc = msg.serverContent;
     if (sc) {
+      /*
+       * v5.34.19: ANY serverContent means the model is working on our turn.
+       *
+       * This distinction cost fifteen seconds of every interview. On a long
+       * opening the native-audio model reasons IN TEXT first — modelTurn parts
+       * carrying text rather than inlineData audio — and this parser dropped
+       * those parts entirely. So the only two signals of life, `audio` and
+       * `agentText` (which is the output TRANSCRIPT, and only exists once
+       * speech starts), both stayed empty while the model was plainly busy.
+       *
+       * The opening retry read that as "the turn was dropped" and resent it —
+       * four times, at +24s, +27s, +30s, +33s — and each resend RESTARTED the
+       * model's reasoning ("Restarting the Introduction", "Re-initiating the
+       * Discussion"). The retry meant to rescue a silent start was extending it.
+       */
+      out.anyModelActivity = true;
       if (sc.interrupted) out.interrupted = true;
       if (sc.turnComplete) out.turnComplete = true;
       if (sc.inputTranscription && sc.inputTranscription.text) out.userText = sc.inputTranscription.text;
@@ -242,11 +311,81 @@
         for (var i = 0; i < parts.length; i++) {
           var d = parts[i].inlineData;
           if (d && d.data && String(d.mimeType || '').indexOf('audio') === 0) out.audio.push(d.data);
+          // The model's own text on an AUDIO session is its reasoning, not
+          // speech. Surfaced so the UI can say "preparing", and so the retry can
+          // tell a thinking model from a dropped turn — but deliberately NOT
+          // merged into agentText, which is the spoken transcript and feeds
+          // scoring, the on-screen bubbles and the client deliverable.
+          else if (parts[i].text) out.modelText += parts[i].text;
         }
       }
     }
     if (msg.usageMetadata) out.usage = msg.usageMetadata;
     return out;
+  }
+
+  /**
+   * Log EVERY server frame, classified.
+   *
+   * The distinction that matters most is audio-vs-text: a native-audio model
+   * answering an instructional turn in TEXT is a silent interview that looks,
+   * from every other angle, like a working session. The second is "no frames at
+   * all", which is what a dropped turn looks like and is invisible without this.
+   *
+   * Anything we do not recognise is logged by its top-level keys rather than
+   * dropped, because the frame shape is Google's to change and a new envelope
+   * would otherwise present as silence.
+   */
+  function _traceFrame(sess, msg) {
+    if (window.VYNE_LIVE_DEBUG === false) return;
+    if (!msg || typeof msg !== 'object') { vlog('frame <non-object>', msg); return; }
+    if (msg.setupComplete) { vlog('frame setupComplete'); return; }
+    var sc = msg.serverContent;
+    if (sc) {
+      var bits = [], detail = {};
+      var parts = (sc.modelTurn && sc.modelTurn.parts) || [];
+      var audioN = 0, audioBytes = 0, textParts = [];
+      for (var i = 0; i < parts.length; i++) {
+        var d = parts[i].inlineData;
+        if (d && d.data && String(d.mimeType || '').indexOf('audio') === 0) {
+          audioN++; audioBytes += d.data.length;
+        } else if (parts[i].text) {
+          textParts.push(parts[i].text);
+        } else if (d) {
+          bits.push('inlineData:' + (d.mimeType || '?'));
+        }
+      }
+      if (audioN) {
+        bits.push('AUDIO x' + audioN);
+        detail.b64Bytes = audioBytes;
+        if (!sess._firstAudioAt) {
+          sess._firstAudioAt = Date.now();
+          vlog('*** FIRST AUDIO FRAME — the agent is speaking ***',
+               { msSinceSetup: sess.startedAt ? (Date.now() - sess.startedAt) : null });
+        }
+      }
+      // A modelTurn carrying TEXT on an AUDIO-modality session is the
+      // fingerprint of the model answering an instruction instead of speaking.
+      if (textParts.length) { bits.push('MODEL-TEXT (not audio!)'); detail.text = snip(textParts.join(' '), 160); }
+      if (sc.outputTranscription && sc.outputTranscription.text) {
+        bits.push('agentTranscript'); detail.agent = snip(sc.outputTranscription.text, 60);
+      }
+      if (sc.inputTranscription && sc.inputTranscription.text) {
+        bits.push('userTranscript'); detail.user = snip(sc.inputTranscription.text, 60);
+      }
+      if (sc.interrupted) bits.push('INTERRUPTED');
+      if (sc.turnComplete) bits.push('turnComplete');
+      if (sc.generationComplete) bits.push('generationComplete');
+      if (!bits.length) bits.push('serverContent(empty) keys=' + Object.keys(sc).join(','));
+      vlog('frame ' + bits.join(' + '), Object.keys(detail).length ? detail : undefined);
+      return;
+    }
+    if (msg.usageMetadata) {
+      vlog('frame usageMetadata', { in: msg.usageMetadata.promptTokenCount, out: msg.usageMetadata.responseTokenCount });
+      return;
+    }
+    if (msg.goAway) { vlog('frame goAway (server is closing us)', msg.goAway); return; }
+    vlog('frame OTHER keys=' + Object.keys(msg).join(','), snip(JSON.stringify(msg), 200));
   }
 
   /**
@@ -264,6 +403,38 @@
     this.nextAt = 0;
   }
   PlaybackQueue.prototype.push = function (float32) {
+    /*
+     * v5.34.19: A SUSPENDED OUTPUT CONTEXT IS SILENT, AND SAYS NOTHING.
+     *
+     * The contexts are resumed exactly once, in _openAudio, and were never
+     * looked at again. A context the browser suspends later — Chrome does this
+     * to backgrounded or idle contexts, and a pause/resume cycle is precisely
+     * when a tab loses focus — keeps accepting scheduled buffers and plays none
+     * of them. No error, no exception, no state change anywhere else.
+     *
+     * That failure is indistinguishable, from the outside, from a healthy
+     * session: muted false, isAlive true, socket OPEN, frames arriving, and the
+     * MICROPHONE still streaming — because micCtx and outCtx are separate
+     * contexts and only one of them went to sleep.
+     *
+     * So check it here, where the audio actually lands, say so loudly, and try
+     * to bring it back. resume() on a running context is a no-op.
+     */
+    if (this.ctx.state !== 'running') {
+      var self0 = this;
+      if (!this._suspendedWarned) {
+        this._suspendedWarned = true;
+        vlog('!!! PLAYBACK CONTEXT NOT RUNNING — audio is arriving but cannot be heard', {
+          state: this.ctx.state, queued: this.sources.length
+        });
+      }
+      try {
+        this.ctx.resume().then(function () {
+          vlog('playback context resumed', { state: self0.ctx.state });
+          self0._suspendedWarned = false;
+        }).catch(function (e) { vlog('playback context resume FAILED', e && e.message); });
+      } catch (e) { vlog('playback context resume THREW', e && e.message); }
+    }
     var buf = this.ctx.createBuffer(1, float32.length, OUTPUT_RATE);
     buf.getChannelData(0).set(float32);
     var src = this.ctx.createBufferSource();
@@ -286,6 +457,11 @@
    *  queued ahead of the clock is speech the user has just talked over, and
    *  letting it finish is exactly what makes an agent feel deaf. */
   PlaybackQueue.prototype.flush = function () {
+    if (this.sources.length) {
+      vlog('playback flush — stopping scheduled audio', {
+        stopped: this.sources.length, ctxState: this.ctx && this.ctx.state
+      });
+    }
     for (var i = 0; i < this.sources.length; i++) {
       try { this.sources[i].stop(); } catch (e) { /* already ended */ }
     }
@@ -325,6 +501,7 @@
 
   VyneLiveSession.prototype.start = function () {
     var self = this;
+    vlog('session.start() called', { module: this.opts.module, voice: this.opts.voice, interviewer: this.opts.interviewerName });
     this._set('connecting');
 
     // 1. Ask OUR server for a grant. This is where the budget check, the
@@ -361,6 +538,8 @@
       return r.json();
     }).then(function (grant) {
       self.grant = grant;
+      vlog('grant minted', { model: grant.model, voice: grant.voice, pinned: grant.pinned,
+                             maxSeconds: grant.maxSeconds, sessionId: grant.sessionId });
       return self._openAudio();
     }).then(function () {
       // The token's shape decides the endpoint, but the mint fallback means we
@@ -372,12 +551,15 @@
       function attempt() {
         if (self.closed) return Promise.reject(new Error('cancelled'));
         var variant = WS_VARIANTS[i];
+        vlog('ws variant attempt ' + (i + 1) + '/' + WS_VARIANTS.length, variantLabel(variant));
         if (self.opts.onNote) { try { self.opts.onNote('trying ' + variantLabel(variant) + '…'); } catch (e) {} }
         return self._openSocket(variant, 8000).then(function (r) {
           self.variant = variantLabel(variant);
+          vlog('ws variant CONNECTED', self.variant);
           if (self.opts.onNote) { try { self.opts.onNote('connected via ' + self.variant); } catch (e) {} }
           return r;
         }).catch(function (err) {
+          vlog('ws variant failed', { variant: variantLabel(variant), err: err && err.message });
           try { if (self.ws) { self.ws.onclose = null; self.ws.onerror = null; self.ws.close(); } } catch (e) {}
           i++;
           if (i >= WS_VARIANTS.length || self.closed) throw err;
@@ -424,6 +606,8 @@
       // worth the explicit resume and the state check below.
       try { await self.micCtx.resume(); } catch (e) {}
       try { await self.outCtx.resume(); } catch (e) {}
+      vlog('audio contexts opened', { micState: self.micCtx.state, micRate: self.micCtx.sampleRate,
+                                      outState: self.outCtx.state, outRate: self.outCtx.sampleRate });
       if (self.micCtx.state !== 'running' || self.outCtx.state !== 'running') {
         // Surface it rather than producing a session that looks connected and
         // is deaf and mute.
@@ -435,6 +619,14 @@
       self.node = node;
       node.onaudioprocess = function (ev) {
         if (self.closed || self.muted || !self.ws || self.ws.readyState !== 1) return;
+        // Mic frames leave every ~128ms, so log the first and then sparsely.
+        // They matter here for one reason: uplink audio is what the model's
+        // activity detection can INTERRUPT a turn on, so a dropped opening
+        // needs to be readable against what the microphone was sending.
+        self._micFrames = (self._micFrames || 0) + 1;
+        if (self._micFrames === 1) vlog('mic: first frame sent to socket');
+        else if (self._micFrames % 40 === 0) vlog('mic: ' + self._micFrames + ' frames sent (~' +
+          Math.round(self._micFrames * FRAME_SAMPLES / INPUT_RATE) + 's of uplink audio)');
         var input = ev.inputBuffer.getChannelData(0);
         // Verified, not assumed — see the header note on Safari.
         var pcmF = self.micCtx.sampleRate === INPUT_RATE
@@ -481,6 +673,7 @@
         // the token. We still send a setup frame so a mismatch fails loudly, but
         // the instruction is only included when the server told us it could not
         // pin it.
+        vlog('ws OPEN — sending setup frame', { variant: variantLabel(variant), pinned: self.grant.pinned });
         ws.send(JSON.stringify(buildSetup(
           self.grant.model,
           self.grant.pinned ? null : self.grant.instruction,
@@ -493,7 +686,8 @@
         var msg;
         try {
           msg = JSON.parse(typeof ev.data === 'string' ? ev.data : new TextDecoder().decode(ev.data));
-        } catch (e) { return; }
+        } catch (e) { vlog('frame UNPARSEABLE', snip(ev.data, 120)); return; }
+        _traceFrame(self, msg);
 
         if (msg && msg.setupComplete && !sawSetup) {
           // Only NOW is the session real. Resolving on `onopen` reported success
@@ -503,8 +697,30 @@
           self._set('live');
           var maxMs = (self.grant.maxSeconds || 2700) * 1000;
           self.timer = setTimeout(function () { self.stop('max_duration'); }, maxMs);
+          vlog('setupComplete — session is live', { msSinceOpen: Date.now() - self.startedAt });
           if (!settled) { settled = true; resolve(self); }
-          if (self.opts.onReady) { try { self.opts.onReady(self.grant); } catch (e) {} }
+          /*
+           * v5.34.18 — PASS THE SESSION TO onReady. This is the auto-start bug.
+           *
+           * resolve() above only SCHEDULES the promise chain; onReady below runs
+           * synchronously, in this same message tick. So every `.then()` between
+           * here and the caller — including the one in LiveInterview._openSession
+           * that does `self.session = s` — has NOT run yet.
+           *
+           * The consequence was a mute interview on every clean start:
+           * LiveInterview.open() begins `if (!this.session) return;`, so the
+           * opening turn was never sent, `_gotAgentFrame` was never initialised,
+           * and the v5.34.15/16/17 warmup retries — all downstream of that guard
+           * — never armed. Meanwhile interview_agent.html had already set
+           * `_openingSent = true`, which disarmed the post-resolve backstop that
+           * would otherwise have covered it. Session connected, nobody spoke.
+           *
+           * Handing the session in as the second argument lets the listener
+           * attach it BEFORE it needs it, with no dependency on microtask order.
+           * The `.then()` assignment stays as-is; this makes it redundant rather
+           * than replacing it.
+           */
+          if (self.opts.onReady) { try { self.opts.onReady(self.grant, self); } catch (e) { vlog('onReady THREW', e && e.message); } }
           // v5.34.11: flush any text queued before the socket was OPEN.
           // v5.34.15: opening warmup retry. "setupComplete" does not mean the
           // model is ready to GENERATE — a turn sent in the instant after it can
@@ -513,6 +729,7 @@
           // NO response frame (audio or text) arrives within a few seconds,
           // resend it once. This self-heals the race regardless of warmup time.
           if (self._pendingText && self._pendingText.length) {
+            vlog('flushing queued text sent before socket was OPEN', { count: self._pendingText.length });
             var _q = self._pendingText; self._pendingText = null;
             self._openingTurn = _q[_q.length - 1];
             self._sawFirstResponse = false;
@@ -537,7 +754,36 @@
         // opening (warmup) and resend it — the opening goes through
         // sendText directly, not the _pendingText flush, so the retry must
         // live where the opening is actually sent (LiveInterview.open).
-        if (f.audio.length || f.agentText) { self._gotAgentFrame = true; }
+        /*
+         * Two DIFFERENT questions, deliberately kept apart (v5.34.19):
+         *
+         *   _gotAnyModelFrame — is the model working on our turn at all? Any
+         *     frame answers yes, including a text-reasoning frame. This is what
+         *     the opening retry must consult: resending while the model is
+         *     mid-thought restarts it, so a retry then makes the very silence
+         *     it was added to cure strictly worse.
+         *
+         *   _gotAgentFrame — has the model actually SPOKEN (or begun to)? Only
+         *     audio or an output transcript answers yes. This is what the UI
+         *     uses to drop the "preparing" indicator.
+         */
+        if (f.anyModelActivity && !self._gotAnyModelFrame) {
+          self._gotAnyModelFrame = true;
+          vlog('_gotAnyModelFrame -> true (model is working; opening retries stop here)');
+        }
+        if (f.audio.length || f.agentText) {
+          if (!self._gotAgentFrame) vlog('_gotAgentFrame -> true (agent is speaking)');
+          self._gotAgentFrame = true;
+        }
+        // The model is reasoning out loud in text. Tell the UI, so ~15 seconds
+        // of preparation reads as preparation rather than as a dead line.
+        if (f.modelText && !self._gotAgentFrame) {
+          if (!self._thinkingAnnounced) {
+            self._thinkingAnnounced = true;
+            vlog('model is THINKING (text frames, no audio yet)');
+          }
+          if (self.opts.onAgentThinking) { try { self.opts.onAgentThinking(f.modelText); } catch (e) {} }
+        }
 
         if (f.interrupted) {
           self.queue.flush();
@@ -553,7 +799,13 @@
         // only audio was gated on self.muted, so agentText/turnComplete still
         // fired and the transcript kept advancing and the interview appeared to
         // "keep going" while the UI showed Paused/Resume. Drop the entire turn.
-        if (self.muted) return;
+        if (self.muted) { if (f.audio.length || f.agentText) vlog('turn DISCARDED — session is muted/paused'); return; }
+        // First actual audio also ends any "preparing" state, even when the
+        // output transcript has not arrived yet.
+        if (f.audio.length && self.opts.onAgentSpeaking && !self._announcedSpeaking) {
+          self._announcedSpeaking = true;
+          try { self.opts.onAgentSpeaking(); } catch (e) {}
+        }
         for (var i = 0; i < f.audio.length; i++) {
           var bytes = base64ToBytes(f.audio[i]);
           var pcm = new Int16Array(bytes.buffer, bytes.byteOffset, Math.floor(bytes.byteLength / 2));
@@ -565,11 +817,14 @@
       };
 
       ws.onerror = function (e) {
+        vlog('ws ERROR', { variant: variantLabel(variant), settled: settled, sawSetup: sawSetup });
         if (!settled) { settled = true; reject(Object.assign(new Error('live_socket_error'), { closeCode: null })); return; }
         self._fail('live_socket_error', e);
       };
 
       ws.onclose = function (ev) {
+        vlog('ws CLOSE', { code: ev.code, reason: ev.reason, sawSetup: sawSetup,
+                           audioEverReceived: !!self._firstAudioAt });
         clearTimeout(setupTimer);
         // The close code and reason are the ONLY explanation the server gives
         // when it rejects a session after the handshake. Without them this
@@ -600,6 +855,7 @@
    */
   VyneLiveSession.prototype.setMuted = function (m) {
     var was = this.muted;
+    vlog('session.setMuted(' + !!m + ')', { was: !!was });
     this.muted = !!m;
     if (this.muted && !was) {
       // Entering pause: flush the playback queue. queue.flush() stops every
@@ -627,11 +883,14 @@
     // void — session alive but SILENT. Queue now, flush on setupComplete.
     if (!this.ws || this.ws.readyState !== 1) {
       if (this.ws && this.ws.readyState === 0) {
+        vlog('sendText QUEUED (socket CONNECTING)', { text: snip(text) });
         (this._pendingText || (this._pendingText = [])).push(String(text));
         return true;
       }
+      vlog('sendText DROPPED — socket not usable', { readyState: rs(this.ws), text: snip(text) });
       return false;
     }
+    vlog('sendText -> WIRE', { readyState: rs(this.ws), text: snip(text) });
     this.ws.send(JSON.stringify({
       clientContent: {
         turns: [{ role: 'user', parts: [{ text: String(text) }] }],
@@ -643,6 +902,9 @@
 
   VyneLiveSession.prototype.stop = function (reason) {
     if (this.closed) return;
+    vlog('session.stop(' + reason + ')', { audioEverReceived: !!this._firstAudioAt,
+                                           micFrames: this._micFrames || 0,
+                                           gotAgentFrame: !!this._gotAgentFrame });
     this.closed = true;
     if (this.timer) { clearTimeout(this.timer); this.timer = null; }
     if (this.queue) this.queue.flush();

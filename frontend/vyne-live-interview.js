@@ -38,6 +38,16 @@
 (function () {
   'use strict';
 
+  /** Shared trace (defined in vyne-live.js). A no-op if that file is absent or
+   *  stale-cached, so instrumentation can never itself break an interview. */
+  function vlog(tag, data) {
+    if (window.vyneLiveLog) { try { window.vyneLiveLog(tag, data); } catch (e) {} }
+  }
+  function rs(ws) {
+    if (!ws) return 'no-socket';
+    return ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'][ws.readyState] || ('?' + ws.readyState);
+  }
+
   /**
    * Scoring runs at most this often, no matter how fast turns arrive.
    *
@@ -264,7 +274,26 @@
       },
       onAgentText: function (t) {
         self.pendingAgent += t;
+        // Speech has begun: whatever "preparing" state the UI is showing is over.
+        if (!self._spoke) { self._spoke = true; if (self.opts.onAgentSpeaking) { try { self.opts.onAgentSpeaking(); } catch (e) {} } }
         if (self.opts.onPartialAgent) { try { self.opts.onPartialAgent(t); } catch (e) {} }
+      },
+      /*
+       * The model is reasoning in text before speaking (v5.34.19). This is
+       * NOT transcript — it never reaches turns[], the on-screen bubbles, or the
+       * scoring pass, all of which take agentText only. It exists so the page
+       * can say "your interviewer is preparing" instead of showing an idle
+       * screen for the ten to twenty seconds a native-audio model can spend
+       * composing an opening.
+       */
+      onAgentThinking: function (t) {
+        if (self.opts.onAgentThinking) { try { self.opts.onAgentThinking(t); } catch (e) {} }
+      },
+      /** Fired once, from whichever arrives first — audio or transcript. */
+      onAgentSpeaking: function () {
+        if (self._spoke) return;
+        self._spoke = true;
+        if (self.opts.onAgentSpeaking) { try { self.opts.onAgentSpeaking(); } catch (e) {} }
       },
       onTurnComplete: function () {
         self._flushPending();
@@ -280,7 +309,23 @@
       // with. v5.32.51: without this the only way to tell whether a voice
       // selection had taken effect was to listen to it and guess — which is
       // exactly how a silently-dropped voice survived several releases.
-      onReady: function (g) { if (self.opts.onReady) { try { self.opts.onReady(g); } catch (e) {} } },
+      /*
+       * v5.34.18: ATTACH THE SESSION HERE, not only in _openSession's .then().
+       *
+       * onReady is dispatched synchronously from the setupComplete frame, which
+       * is BEFORE the promise chain that assigns self.session has run. Callers
+       * legitimately open the interview from onReady — that is the earliest
+       * correct moment — and were finding `this.session === null`, so
+       * LiveInterview.open() bailed on its first line and the interview opened
+       * mute. Take the session from the argument so the ordering cannot matter.
+       */
+      onReady: function (g, sess) {
+        if (sess && self.session !== sess) {
+          vlog('LiveInterview: session attached from onReady (before promise chain)');
+          self.session = sess;
+        }
+        if (self.opts.onReady) { try { self.opts.onReady(g, sess); } catch (e) { vlog('app onReady THREW', e && e.message); } }
+      },
       onState: function (s) { if (self.opts.onState) { try { self.opts.onState(s); } catch (e) {} } },
       onError: function (r, e) { if (self.opts.onError) { try { self.opts.onError(r, e); } catch (x) {} } },
       onEnded: function (r) {
@@ -315,7 +360,11 @@
 
   LiveInterview.prototype._openSession = function () {
     var self = this;
+    vlog('LiveInterview._openSession() — starting vyneLive session');
     return window.vyneLive.start(this._sessionOpts()).then(function (s) {
+      // Normally already attached by onReady above; kept so the session is
+      // correct even if a future transport stops passing it to onReady.
+      vlog('_openSession resolved (promise chain ran)', { alreadyAttached: self.session === s });
       self.session = s;
       return self;
     });
@@ -345,28 +394,108 @@
     // can never loop or double-talk once the agent is responding. This makes the
     // opening timing-independent — it WILL land as soon as the model is ready.
     var self = this;
-    if (!this.session) return;
+    vlog('LiveInterview.open() called', { hasSession: !!this.session, line: String(line).slice(0, 60) });
+
+    /*
+     * v5.34.18: DO NOT SILENTLY RETURN WHEN THE SESSION IS NOT ATTACHED YET.
+     *
+     * This early return was the auto-start bug. open() is called from onReady,
+     * which vyne-live.js dispatches synchronously from the setupComplete frame —
+     * before the promise chain assigning self.session has run. So on every clean
+     * start the function returned here, having sent nothing, initialised no
+     * _gotAgentFrame and armed no retry, while the caller had already flipped
+     * _openingSent to true and disarmed its own backstop.
+     *
+     * The onReady handler above now attaches the session, so this should no
+     * longer be reachable on the normal path. It is kept as a genuine retry
+     * rather than a bail: a microtask is all the promise chain needs, and one
+     * bounded re-entry is cheaper than another mute interview.
+     */
+    if (!this.session) {
+      if (this._openDeferred) { vlog('open() BAILED — no session, and already deferred once'); return false; }
+      this._openDeferred = true;
+      vlog('open() DEFERRED — session not attached yet, retrying next microtask');
+      Promise.resolve().then(function () { self.open(line); });
+      return false;
+    }
+    this._openDeferred = false;
     this.session._gotAgentFrame = false;
+    this.session._gotAnyModelFrame = false;
     if (this._openRetry) { clearTimeout(this._openRetry); this._openRetry = null; }
     var attempts = 0;
-    var MAX_ATTEMPTS = 4;      // ~1 initial + 3 resends over ~12s
+    /*
+     * v5.34.19: ONE resend, and only into total silence.
+     *
+     * v5.34.17 resent every 3s until the agent produced a frame, capped at 4.
+     * Measured against a real session, that was actively harmful. The
+     * native-audio model reasons in TEXT for ten to twenty seconds before an
+     * opening — a real trace showed first audio at 15.5s — and the retry's
+     * liveness check ignored text frames, so it fired all four times, at +24s,
+     * +27s, +30s and +33s. Each resend arrives as a fresh user turn and the
+     * model starts over ("Restarting the Introduction", "Re-initiating the
+     * Discussion"). The retry added to cure a silent opening was prolonging it.
+     *
+     * The genuine failure it exists for — a turn dropped in the warmup instant,
+     * where NOTHING comes back at all — is distinguishable: zero frames of any
+     * kind. So wait long enough to clear a normal think, then resend at most
+     * once. If the model is thinking, _gotAnyModelFrame is already true and
+     * nothing is sent.
+     */
+    var MAX_ATTEMPTS = 2;        // the opening, plus one rescue for a dropped turn
+    // Comfortably past a normal 10-20s think. Overridable ONLY so tests can
+    // assert the retry policy without sleeping twelve seconds per case — the
+    // previous policy's tests passed partly because nothing they measured had
+    // time to happen.
+    var RETRY_AFTER_MS = Number(window.VYNE_OPEN_RETRY_MS) || 12000;
     function fire() {
       var s = self.session;
-      if (!s || s.closed || self._muted || !s.ws || s.ws.readyState !== 1) return;
-      if (s._gotAgentFrame) return;        // agent responded — stop.
-      if (attempts >= MAX_ATTEMPTS) return; // give up rather than loop.
+      // Log the guard values on EVERY attempt. When the opening does not land,
+      // which guard stopped it is the entire question, and all four are
+      // invisible from outside.
+      var g = { attempt: attempts + 1, of: MAX_ATTEMPTS,
+                hasSession: !!s, closed: !!(s && s.closed), muted: !!self._muted,
+                readyState: rs(s && s.ws), gotAgentFrame: !!(s && s._gotAgentFrame),
+                gotAnyModelFrame: !!(s && s._gotAnyModelFrame) };
+      if (!s || s.closed || self._muted || !s.ws || s.ws.readyState !== 1) {
+        vlog('open/fire STOPPED — session not sendable', g); return;
+      }
+      if (s._gotAgentFrame) { vlog('open/fire STOPPED — agent already speaking', g); return; }
+      // The one that matters: a thinking model is a working model. Resending
+      // here is what restarted it four times in the trace.
+      if (s._gotAnyModelFrame) { vlog('open/fire STOPPED — model is working (thinking), not dropped', g); return; }
+      if (attempts >= MAX_ATTEMPTS) { vlog('open/fire GAVE UP — attempt cap reached', g); return; }
       attempts++;
-      try { s.sendText(line); } catch (e) {}
-      self._openRetry = setTimeout(fire, 3000);
+      vlog(attempts === 1 ? 'open/fire SENDING opening' : 'open/fire RESENDING (total silence — turn looks dropped)', g);
+      try { s.sendText(line); } catch (e) { vlog('open/fire sendText THREW', e && e.message); }
+      self._openRetry = setTimeout(fire, RETRY_AFTER_MS);
     }
     fire();
+    return true;
   };
 
   LiveInterview.prototype.say = function (text) {
+    vlog('LiveInterview.say()', { hasSession: !!this.session, text: String(text).slice(0, 60) });
     if (this.session) this.session.sendText(text);
   };
 
   LiveInterview.prototype.setMuted = function (m) {
+    /*
+     * v5.34.19: capture WHO muted.
+     *
+     * A real trace showed setMuted(true) at +55.8s mid-answer, after which every
+     * subsequent turn was discarded. Nothing in the app mutes on a timer, on tab
+     * visibility, or on any model event — the only two paths are the in-interview
+     * Pause button and the interviewee banner's "Pause — continue later", both
+     * user clicks. So the useful thing is not another guard, it is a name: the
+     * stack says which control fired, and whether anything fired it at all.
+     */
+    vlog('LiveInterview.setMuted(' + !!m + ')', {
+      was: !!this._muted,
+      via: (function () {
+        try { return String(new Error().stack || '').split('\n').slice(2, 6).join(' | '); }
+        catch (e) { return 'unavailable'; }
+      })()
+    });
     // v5.34.8: remember pause state here, not just on the socket, so the
     // grant-expiry renewal below can tell a paused session from a live one.
     this._muted = !!m;

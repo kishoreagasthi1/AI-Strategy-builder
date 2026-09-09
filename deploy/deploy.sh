@@ -174,10 +174,22 @@ put_secrets() {
 # are simply omitted, so this stays safe to re-run.
 _extra_env() {
   local out=""
+  # v5.34.18: GEMINI_LIVE_MODEL/-VOICE added. The live model was carried ONLY
+  # as a hand-set value on a Cloud Run revision (HANDOFF_2026-09-08.md:
+  # "a fresh deploy does NOT restore this env var automatically"). --update-env-vars
+  # merges, so it survived redeploys by luck rather than design; anyone rebuilding
+  # the service from scratch got the code default and silent TTS fallback instead
+  # of live voice. Passing it through here makes it reproducible.
+  #
+  # GEMINI_PAID added because config.ts reads GEMINI_PAID, while this list only
+  # ever forwarded GEMINI_PAID_TIER — so a paid key was seen as free tier, and in
+  # production (blockFreeTier) that is a 503 live_free_tier_blocked. Both names
+  # are forwarded; see config.ts, which now accepts either.
   for v in FIREBASE_API_KEY FIREBASE_AUTH_DOMAIN SIGNUP_ACCESS_KEY \
            REQUIRE_MFA REQUIRE_VERIFIED_EMAIL SENTRY_DSN \
            STRIPE_SECRET_KEY STRIPE_WEBHOOK_SECRET STRIPE_ENFORCE_PAYWALL \
-           GEMINI_API_KEY GEMINI_PAID_TIER; do
+           GEMINI_API_KEY GEMINI_PAID_TIER GEMINI_PAID \
+           GEMINI_LIVE_MODEL GEMINI_LIVE_VOICE; do
     if [ -n "${!v:-}" ]; then out="${out},${v}=${!v}"; fi
   done
   printf '%s' "$out"

@@ -224,9 +224,64 @@ export function reserveTokensFor(seconds: number): { tokensIn: number; tokensOut
   };
 }
 
+/**
+ * Models this account actually exposes for bidiGenerateContent.
+ *
+ * Enumerated from the live account, not guessed — the same list
+ * test/liveSession.test.ts prices. It is a WARNING list, not an allowlist:
+ * Google adds Live models faster than we redeploy, and refusing an unknown id
+ * outright would take voice down the day we wanted to adopt one. What it buys
+ * is a loud line in the logs at boot, which is the thing that was missing.
+ */
+export const LIVE_CAPABLE_MODELS: readonly string[] = [
+  "gemini-2.5-flash-native-audio-latest",
+  "gemini-2.5-flash-native-audio-preview-09-2025",
+  "gemini-2.5-flash-native-audio-preview-12-2025",
+  "gemini-3.1-flash-live-preview",
+];
+
+/**
+ * The model a live session runs on when nothing overrides it.
+ *
+ * v5.34.18: was "gemini-live-2.5-flash-preview", which is NOT one of the models
+ * this account exposes for bidiGenerateContent. It MINTS a token perfectly
+ * happily — so every check on our side passes — and is then rejected by the
+ * WebSocket on every endpoint variant, because a name Google cannot resolve as
+ * a public model falls through to a project-scoped (tuned-model) lookup that an
+ * ephemeral token by construction cannot perform:
+ *
+ *   1007 — token-based requests cannot use project-scoped features such as
+ *          tuned models
+ *
+ * The client then falls back to text + TTS, which is a WORKING interview in a
+ * robotic voice — so nothing alerts, and the failure is only discoverable by
+ * listening. The correct value was carried solely as a hand-set Cloud Run env
+ * var (see HANDOFF_2026-09-08.md), documented as "a fresh deploy does NOT
+ * restore this automatically". That is one forgotten variable away from every
+ * interview silently losing its voice, and it is not a state the default should
+ * make reachable. The default is now the value production actually uses; the
+ * env var remains, for pinning a newer model without a redeploy.
+ */
+export const DEFAULT_LIVE_MODEL = "models/gemini-2.5-flash-native-audio-latest";
+
+/** Bare id, however the name was written — the price table is keyed bare. */
+function bareModelId(m: string): string {
+  return m.startsWith("models/") ? m.slice(7) : m;
+}
+
 export function makeLiveSession(opts: LiveSessionOptions) {
-  const model = opts.model ?? process.env.GEMINI_LIVE_MODEL ?? "gemini-live-2.5-flash-preview";
+  const model = opts.model ?? process.env.GEMINI_LIVE_MODEL ?? DEFAULT_LIVE_MODEL;
   const voice = opts.voice ?? process.env.GEMINI_LIVE_VOICE ?? "Aoede";
+  // Say so at boot rather than at the first interview. A model the Live socket
+  // refuses costs a real conversation to discover, and the symptom (a robotic
+  // voice) points at TTS rather than at this line.
+  if (!LIVE_CAPABLE_MODELS.includes(bareModelId(model))) {
+    console.warn(
+      `[liveSession] GEMINI_LIVE_MODEL="${model}" is not a known bidiGenerateContent model. ` +
+      `Live voice may mint tokens successfully and then be rejected by the WebSocket ` +
+      `(close 1007/1008), falling back to TTS silently. Known-good: ${LIVE_CAPABLE_MODELS.join(", ")}.`
+    );
+  }
   const fetchImpl = opts.fetchImpl ?? fetch;
   const baseUrl = opts.baseUrl ?? "https://generativelanguage.googleapis.com";
 

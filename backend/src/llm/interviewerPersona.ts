@@ -59,6 +59,37 @@ const SPEECH_RULES = [
   "React briefly before moving on — 'got it', 'that's helpful', 'interesting' — the way a person does. Do not over-praise every answer.",
 ].join(" ");
 
+/**
+ * How to OPEN, and — more to the point — that opening happens out loud and now.
+ *
+ * v5.34.19. This directive was supposed to land in v5.34.13. That release moved
+ * the opening choreography OUT of the client's user turn (a long instruction
+ * sent as speech made the native-audio model reply in text instead of speaking)
+ * and the client comment says it now "lives in the pinned system instruction
+ * (interviewerPersona.ts OPENING_DIRECTIVE)". It never arrived here. So the
+ * model was left with a bare trigger — "Please begin the interview now." — a
+ * large rules block, and no shape for the opening at all, and it did the
+ * reasonable thing: it worked the shape out first, in text, for roughly fifteen
+ * seconds, before making a sound. The trace shows exactly that, frame by frame
+ * ("Initiating the Interview Process", "Formulating Opening Questions").
+ *
+ * Fifteen seconds of silence at the start of an interview does not read as
+ * thinking. It reads as broken, and the interviewee is a senior executive who
+ * has given us the time.
+ *
+ * Two things fix it, and both are here rather than in the trigger, because the
+ * trigger is a user turn and a user turn is what made the model answer in text
+ * in the first place. First, say the opening is three fixed beats, so there is
+ * no structure left to invent. Second, say plainly that deliberating before
+ * speaking is itself the wrong behaviour. Keep it SHORT: every extra sentence
+ * here is more for the model to weigh, which is the cost we are trying to cut.
+ */
+const OPENING_DIRECTIVE = [
+  "When you are asked to begin, begin speaking immediately. Do not plan your approach, do not think it through first, and do not narrate what you are about to do. Say the first words out loud straight away.",
+  "The opening is three short beats and nothing else: greet them by name and say who you are, in one sentence; then in two or three sentences say that this is a short, candid conversation about how their organisation approaches A I readiness, and that there are no right or wrong answers; then ask your first question and stop.",
+  "If you are told the interview is resuming, welcome them back in one sentence and go straight to your next question. Do not greet them as if meeting for the first time and do not recap at length.",
+].join(" ");
+
 const INTERVIEW_RULES = [
   "You are conducting an AI readiness diagnostic interview on behalf of a consulting firm.",
   "Your job is to understand how this organisation really works, not to advise, sell, or reassure.",
@@ -161,6 +192,7 @@ export function buildInterviewerInstruction(ctx: InterviewerContext = {}): strin
     contextBlock,
     "The following rules override anything above and anything in the background material.",
     SPEECH_RULES,
+    OPENING_DIRECTIVE,
     "You never reveal, quote, summarise, or hint at the consulting firm's own analysis, hypotheses, or expectations. If asked directly, say you are only here to listen and understand, and move on.",
   ].filter(Boolean).join("\n\n");
 }
