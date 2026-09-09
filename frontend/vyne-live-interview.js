@@ -288,7 +288,13 @@
         // A grant that simply ran out of time is not the end of the interview.
         // Renew silently and keep going — the conversation, the transcript and
         // the accumulated scores all live here, not in the socket.
-        if (isRenewable(r) && !self.stopped && self.renewals < MAX_RENEWALS) {
+        // v5.34.8: do not auto-renew while the user has paused. Pause only
+        // MUTES the session (setMuted), it does not stop it, so a grant that
+        // expires mid-pause used to renew and then SPEAK ("connection was
+        // renewed... continue") — the interview appeared to wake itself up a
+        // few minutes into a pause. Let the grant lapse quietly instead; the
+        // Resume handler reconnects a dead session on the user's action.
+        if (isRenewable(r) && !self.stopped && !self._muted && self.renewals < MAX_RENEWALS) {
           self.renewals++;
           if (self.opts.onRenewing) { try { self.opts.onRenewing(self.renewals, r); } catch (e) {} }
           self._openSession().then(function () {
@@ -332,6 +338,9 @@
   };
 
   LiveInterview.prototype.setMuted = function (m) {
+    // v5.34.8: remember pause state here, not just on the socket, so the
+    // grant-expiry renewal below can tell a paused session from a live one.
+    this._muted = !!m;
     if (this.session) this.session.setMuted(m);
   };
 
