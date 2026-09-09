@@ -3919,8 +3919,10 @@ function startLiveVoice(isResume){
       // state, then open. Backed by the vyne-live.js send-queue.
       if(LIVE && !LIVE._openingSent){
         LIVE._openingSent = true;
-        try{ LIVE.setMuted(false); }catch(e){}
-        if(typeof IV_CLOCK !== 'undefined') IV_CLOCK.paused = false;
+        // A freshly-ready session is never paused. Clear pause state
+        // through the single authority so all three flags agree, then
+        // open. (v5.34.12)
+        try{ if(typeof setInterviewPaused === 'function' && IV_CLOCK.paused){ setInterviewPaused(false); } else { LIVE.setMuted(false); } }catch(e){}
         try{ LIVE.open(_openingLine); }catch(e){}
       }
     },
@@ -4020,7 +4022,8 @@ function renderClock(){
 function startClock(){
   if(IV_CLOCK.tick) return;
   IV_CLOCK.startedAt = Date.now();
-  IV_CLOCK.paused = false;
+  // v5.34.12: pause state is owned solely by setInterviewPaused(); startClock
+  // no longer writes IV_CLOCK.paused so there is one writer, not two.
   IV_CLOCK.tick = setInterval(renderClock, 1000);
   renderClock();
 }
@@ -4042,36 +4045,21 @@ function setPausedUI(paused){
   setStatus(paused ? 'thinking' : 'ready', paused ? 'Paused' : 'Listening...');
 }
 
-async function togglePause(){
-  if(IV_CLOCK.paused){
-    // ── RESUME ──────────────────────────────────────────────────────────────
-    IV_CLOCK.paused = false;
-    if(typeof LIVE !== 'undefined' && LIVE){
-      if(LIVE.isAlive()){
-        LIVE.setMuted(false);
-      }else{
-        // The grant has a hard wall-clock expiry, so a long pause can outlive
-        // the session. Start a fresh one rather than resuming into a dead
-        // socket and looking like the agent has stopped responding.
-        try{
-          await startLiveVoice(true);
-          showToast('Reconnected — the session had timed out while paused');
-        }catch(e){
-          setVoiceBadge('standard', 'reconnect failed after pause');
-        }
-      }
-    }else{
-      try{ if(recognition && S.voiceMode!=='text') recognition.start(); }catch(e){}
-    }
-    startClock();
-    setPausedUI(false);
-  }else{
-    // ── PAUSE ───────────────────────────────────────────────────────────────
-    IV_CLOCK.paused = true;
+async function setInterviewPaused(paused){
+  // SINGLE SOURCE OF TRUTH for pause/mute (v5.34.12). Every pause/resume in the
+  // app goes through here — no other code sets IV_CLOCK.paused or calls
+  // LIVE.setMuted directly. The mute chain is one-way and cascades:
+  //   IV_CLOCK.paused (this fn)  ->  LIVE.setMuted()  ->  session.setMuted()
+  // A live session is muted iff the interview is paused. Nothing else toggles it.
+  paused = !!paused;
+  IV_CLOCK.paused = paused;
+
+  if(paused){
     stopClock();
     if(typeof LIVE !== 'undefined' && LIVE && LIVE.isAlive()){
       LIVE.setMuted(true);
     }else{
+      // No live session (text/TTS path): stop those sources instead.
       try{ if(recognition) recognition.stop(); }catch(e){}
       try{ if(currentAudio && currentAudio.pause) currentAudio.pause(); }catch(e){}
       try{ if(window.speechSynthesis) window.speechSynthesis.cancel(); }catch(e){}
@@ -4079,9 +4067,37 @@ async function togglePause(){
     liveBreakTurn();
     setPausedUI(true);
     autoSave();
+  }else{
+    // RESUME. If the live session outlived its grant during a long pause it is
+    // dead — reconnect a fresh one. Either way we end UNMUTED: a resumed
+    // interview is, by definition, not paused. This is the ONLY unmute path.
+    if(typeof LIVE !== 'undefined' && LIVE){
+      if(LIVE.isAlive()){
+        LIVE.setMuted(false);
+      }else{
+        try{
+          await startLiveVoice(true);
+          showToast('Reconnected — the session had timed out while paused');
+        }catch(e){
+          setVoiceBadge('standard', 'reconnect failed after pause');
+        }
+      }
+      // Whatever path we took, guarantee the session is audible. setMuted is
+      // idempotent and cascades to the socket, so this is safe on a fresh or
+      // an existing session and is the single place resume clears mute.
+      try{ if(LIVE && LIVE.isAlive()) LIVE.setMuted(false); }catch(e){}
+    }else{
+      try{ if(recognition && S.voiceMode!=='text') recognition.start(); }catch(e){}
+    }
+    startClock();
+    setPausedUI(false);
   }
 }
 
+// Thin wrapper — the button just flips the single source of truth.
+async function togglePause(){
+  await setInterviewPaused(!IV_CLOCK.paused);
+}
 /* ── INTERVIEWER IDENTITY (v5.32.47) ────────────────────────────────────
  * This page no longer CHOOSES the interviewer's name or voice — it reads the
  * choice the consultant made in the Interview Tracker. Two reasons, and the
@@ -4891,14 +4907,9 @@ document.addEventListener('DOMContentLoaded', function(){
     // LIVE.setMuted, so on the realtime path the agent kept talking while the
     // UI said paused. togglePause() handles LIVE.setMuted/clock correctly; we
     // only invoke it if not already paused, then show the "saved" leave screen.
-    try{
-      if(typeof IV_CLOCK !== 'undefined' && !IV_CLOCK.paused && typeof togglePause === 'function'){
-        togglePause();
-      }else{
-        try{ if(recognition && recognition.stop) recognition.stop(); }catch(e){}
-        try{ if(currentAudio && currentAudio.pause) currentAudio.pause(); }catch(e){}
-      }
-    }catch(e){}
+    // v5.34.12: route through the single pause authority so the live
+    // session is muted exactly the same way as the in-interview Pause.
+    try{ if(typeof setInterviewPaused === 'function'){ setInterviewPaused(true); } }catch(e){}
     try{ if(typeof saveSession === 'function') saveSession(); }catch(e){}
     vyneStore.flush();
     renderPaused();
