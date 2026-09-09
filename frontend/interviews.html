@@ -1604,6 +1604,42 @@ function ivRenderControls(total, shown){
         ? '<button class="ghost iv-clear" onclick="ivClearFilters()">Clear filters</button>'
           + '<span class="iv-count">' + esc(String(shown)) + ' of ' + esc(String(total)) + '</span>'
         : '<span class="iv-count">' + esc(String(total)) + ' interview' + (total === 1 ? '' : 's') + '</span>');
+
+  // v5.34.13: loud active-filter banner. A saved filter persists across
+  // sessions and silently hid most interviews (a client filter left on
+  // 'Newell Brands' showed 10 of 64 and read as 'my interviews are gone').
+  // The subtle 'X of Y' count was too easy to miss. This states plainly
+  // what is filtered and how many rows are HIDDEN, with a one-click reset.
+  var banner = document.getElementById('iv-filter-banner');
+  if(!banner){
+    banner = document.createElement('div');
+    banner.id = 'iv-filter-banner';
+    banner.style.cssText = 'display:none;margin:0 0 10px;padding:9px 14px;border-radius:8px;'
+      + 'background:rgba(184,151,42,0.12);border:1px solid rgba(184,151,42,0.4);'
+      + 'color:#7A5C1E;font:600 12.5px \'Inter\',sans-serif;display:flex;align-items:center;gap:12px;flex-wrap:wrap';
+    host.parentNode.insertBefore(banner, host.nextSibling);
+  }
+  if(active){
+    // Built with safe DOM methods (textContent + createElement), NOT innerHTML,
+    // so filter values can never inject markup and no new XSS sink is added.
+    var parts = [];
+    if(ivPrefs.client) parts.push('client “' + ivPrefs.client + '”');
+    if(ivPrefs.round)  parts.push('round ' + ivPrefs.round);
+    if(ivPrefs.status) parts.push('status “' + ivPrefs.status + '”');
+    var hidden = total - shown;
+    banner.textContent = '⚠ Filtered to ' + parts.join(' · ')
+      + ' — showing ' + shown + ' of ' + total + ', ' + hidden + ' hidden  ';
+    var b = document.createElement('button');
+    b.className = 'ghost';
+    b.style.cssText = 'padding:3px 12px;font-weight:700;margin-left:4px';
+    b.textContent = 'Show all interviews';
+    b.onclick = ivClearFilters;
+    banner.appendChild(b);
+    banner.style.display = 'flex';
+  }else{
+    banner.textContent = '';
+    banner.style.display = 'none';
+  }
 }
 
 function ivRenderPager(matched, pages){
