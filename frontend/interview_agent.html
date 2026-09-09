@@ -3910,7 +3910,14 @@ function startLiveVoice(isResume){
     setStatus('ready','Listening...');
     LIVE.open(isResume
       ? 'The stakeholder has returned to continue. Welcome them back in one sentence, briefly recap where you left off, then ask your next question.'
-      : 'Begin the interview now. Introduce yourself in one short sentence and ask your first question.');
+      : 'Begin the interview now. First greet ' + (S.stakeholderName || 'the interviewee')
+        + ' warmly by name and introduce yourself in one sentence. Then, in two or three'
+        + ' sentences, set the stage: this is a short, conversational diagnostic about how '
+        + (S.client || 'their organisation') + ' approaches AI readiness'
+        + (S.industry ? ' in the ' + S.industry + ' industry' : '')
+        + '; you want their candid perspective and there are no right or wrong answers.'
+        + ' Then transition naturally into your first question. Keep the whole opening'
+        + ' brief — well under a minute of speech.');
     return true;
   });
 }
@@ -4139,7 +4146,12 @@ function launchInterviewScreen(isResume){
       // (v2.9 removed in-interview upload; the old prompt still told the agent
       //  to mention an "upload button" that no longer exists — fixed.)
       + (hasPreReadDocsOp ? 'You have already reviewed documents provided before this interview; you may reference their contents naturally, but do NOT mention uploading, buttons, or any on-screen controls. ' : '')
-      + 'Start the interview with a warm welcome and your first question. '
+      + 'Start the interview like this: greet the stakeholder warmly by name and'
+      + ' introduce yourself in one sentence, then in two or three sentences set the'
+      + ' stage — a short, conversational diagnostic about how their organisation'
+      + ' approaches AI readiness, that you want their candid perspective and there'
+      + ' are no right or wrong answers — then ask your first question. Keep the'
+      + ' opening brief. '
       + 'The stakeholder is '+(S.stakeholderName||'the interviewee')+', '+displayRole+', at '+S.client+' ('+S.industry+' industry).';
     // v5.32.41: only PREFETCH the text opening when realtime cannot take over.
     // Otherwise both would speak — the prefetched greeting from TTS and the live
