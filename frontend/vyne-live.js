@@ -1,5 +1,5 @@
 /**
- * vyne-live.js — realtime duplex voice for the Interview Agent (v5.32.33).
+ * vyne-live.js — realtime duplex voice for the Interview Agent (v5.34.22).
  *
  * Loaded alongside vyne-client.js. Exposes window.vyneLive.
  *
@@ -290,16 +290,49 @@
   }
 
   /**
+   * RMS and peak of one capture frame (v5.34.22).
+   *
+   * "mic: N frames sent" proved the uplink was FLOWING and nothing else. A
+   * frame counter climbs identically for a microphone carrying speech, a
+   * muted input device, a track the OS has silenced, and a capture graph
+   * wired to the wrong node — the four cases the S1 investigation could not
+   * tell apart. Level is the number that separates them, and it is the only
+   * client-side fact that says whether the model COULD have heard anything.
+   */
+  function frameStats(float32) {
+    var sum = 0, peak = 0, n = float32.length;
+    for (var i = 0; i < n; i++) {
+      var s = float32[i];
+      var a = s < 0 ? -s : s;
+      if (a > peak) peak = a;
+      sum += s * s;
+    }
+    return { rms: n ? Math.sqrt(sum / n) : 0, peak: peak };
+  }
+  /** Above this RMS a frame is treated as carrying speech-level audio. A
+   *  quiet room on a laptop mic with AGC sits around 0.001-0.005. */
+  var SPEECH_RMS = 0.01;
+  /** Below this for SILENT_WARN_MS while unmuted, the uplink is declared dead. */
+  var SILENT_RMS = 0.0005;
+  // Both overridable ONLY so tests can exercise the watchdogs without waiting
+  // out the real windows (the same reason VYNE_OPEN_RETRY_MS exists).
+  var SILENT_WARN_MS = Number(window.VYNE_MIC_SILENT_WARN_MS) || 8000;
+  /** No serverContent this long after the user's speech was transcribed is
+   *  the shape of a turn the model heard and never answered. */
+  var REPLY_WATCHDOG_MS = Number(window.VYNE_REPLY_WATCHDOG_MS) || 12000;
+
+  /**
    * Normalise one server frame into the few things the UI cares about.
    * Kept pure and separate from the socket so the protocol shape can be tested
    * without a network, and so a shape change surfaces in one place.
    */
   function parseServerFrame(msg) {
     var out = { audio: [], userText: '', agentText: '', modelText: '', anyModelActivity: false,
-                interrupted: false, turnComplete: false, usage: null };
+                interrupted: false, turnComplete: false, generationComplete: false, usage: null };
     if (!msg) return out;
     var sc = msg.serverContent;
     if (sc) {
+      if (sc.generationComplete) out.generationComplete = true;
       /*
        * v5.34.19: ANY serverContent means the model is working on our turn.
        *
@@ -495,8 +528,35 @@
     // A small floor keeps the first chunk from being scheduled in the past on
     // a context that has been running a while.
     var at = Math.max(now + 0.02, this.nextAt);
+    /*
+     * v5.34.22: S3 ("all kinds of distortions") was never instrumented. The
+     * two ways this queue can distort are (a) a chunk scheduled to START before
+     * the previous one ENDS — overlap, heard as garble — and (b) a run where
+     * nextAt drifts far ahead of the clock, heard as the agent continuing to
+     * talk long after it stopped generating. Neither can happen by
+     * construction here, which is exactly why they must be measured rather
+     * than assumed: if a trace shows distortion WITHOUT an overlap line, the
+     * cause is outside this queue (a second audio source, or the context's
+     * sample rate), and that is the whole diagnosis.
+     */
+    if (this._lastEnd && at < this._lastEnd - 0.001) {
+      vlog('!!! PLAYBACK OVERLAP — chunk starts before the previous one ends', {
+        startsAt: at, prevEnds: this._lastEnd, overlapMs: Math.round((this._lastEnd - at) * 1000)
+      });
+    }
+    if (!this._runPushes) {
+      this._runPushes = 0; this._runStartedAt = Date.now(); this._runFirstAt = at;
+      vlog('playback run starts', {
+        ctxState: this.ctx.state, ctxRate: this.ctx.sampleRate, bufRate: OUTPUT_RATE,
+        resampledByBrowser: this.ctx.sampleRate !== OUTPUT_RATE,
+        leadMs: Math.round((at - now) * 1000), samples: float32.length
+      });
+    }
+    this._runPushes++;
     src.start(at);
     this.nextAt = at + buf.duration;
+    this._lastEnd = this.nextAt;
+    this._aheadSec = this.nextAt - now;
     var self = this;
     src.onended = function () {
       var i = self.sources.indexOf(src);
@@ -510,7 +570,8 @@
   PlaybackQueue.prototype.flush = function () {
     if (this.sources.length) {
       vlog('playback flush — stopping scheduled audio', {
-        stopped: this.sources.length, ctxState: this.ctx && this.ctx.state
+        stopped: this.sources.length, ctxState: this.ctx && this.ctx.state,
+        unplayedMs: this.ctx ? Math.max(0, Math.round((this.nextAt - this.ctx.currentTime) * 1000)) : null
       });
     }
     for (var i = 0; i < this.sources.length; i++) {
@@ -518,6 +579,19 @@
     }
     this.sources = [];
     this.nextAt = 0;
+    this.endRun('flush');
+  };
+  /** Close the per-turn playback rollup (on turnComplete, flush, or stop). */
+  PlaybackQueue.prototype.endRun = function (why) {
+    if (!this._runPushes) return;
+    vlog('playback run ends (' + why + ')', {
+      chunks: this._runPushes,
+      audioSec: this._lastEnd && this._runFirstAt != null ? Math.round((this._lastEnd - this._runFirstAt) * 10) / 10 : null,
+      wallSec: Math.round((Date.now() - this._runStartedAt) / 100) / 10,
+      stillQueuedSec: this.ctx ? Math.max(0, Math.round((this._lastEnd - this.ctx.currentTime) * 10) / 10) : null,
+      ctxState: this.ctx && this.ctx.state
+    });
+    this._runPushes = 0; this._lastEnd = 0; this._runFirstAt = null;
   };
   PlaybackQueue.prototype.pending = function () { return this.sources.length; };
 
@@ -550,9 +624,137 @@
     this.stop(reason);
   };
 
+  /** The capture track's own account of itself — the OS can mute a track
+   *  (readyState 'live', muted true) and the graph keeps running on zeros. */
+  VyneLiveSession.prototype._trackInfo = function () {
+    try {
+      var t = this.stream && this.stream.getAudioTracks ? this.stream.getAudioTracks()[0] : null;
+      if (!t) return 'no-track';
+      var s = t.getSettings ? t.getSettings() : {};
+      return { readyState: t.readyState, muted: !!t.muted, enabled: t.enabled !== false,
+               label: snip(t.label, 40), rate: s.sampleRate, ec: s.echoCancellation, ns: s.noiseSuppression, agc: s.autoGainControl };
+    } catch (e) { return 'unavailable'; }
+  };
+
+  /**
+   * Fold one frame's level into the session's picture of the uplink (v5.34.22).
+   *
+   * Three outputs, each answering one question a trace could not before:
+   *   - `mic: SPEECH on uplink` once per utterance — did the interviewee's
+   *     voice reach the socket at all, and when (to line up against the
+   *     model's inputTranscription and any reply).
+   *   - `!!! mic uplink SILENT` once — frames are flowing but carry nothing.
+   *     That is a capture-chain fault (track muted by the OS, wrong device,
+   *     a context the browser would not resample into) and no amount of
+   *     turn-taking logic will fix it.
+   *   - onMicLevel(rms) at ~10 Hz for a visible meter, so a person can see
+   *     "the app hears me" without opening DevTools.
+   */
+  VyneLiveSession.prototype._observeMicLevel = function (st) {
+    var now = Date.now();
+    this.micRms = st.rms;
+    if (!this._micWinAt || now - this._micWinAt >= 5000) { this._micWinAt = now; this._micPeakWindow = 0; }
+    if (st.peak > (this._micPeakWindow || 0)) this._micPeakWindow = st.peak;
+    if (st.rms >= SPEECH_RMS) {
+      this._micSpeechFrames = (this._micSpeechFrames || 0) + 1;
+      this._micLastLoudAt = now;
+      if (!this._micInUtterance) {
+        this._micInUtterance = true;
+        this._utteranceStartedAt = now;
+        vlog('mic: SPEECH on uplink (utterance starts)', { rms: Math.round(st.rms * 1e4) / 1e4,
+          msSinceTurnComplete: this._lastTurnCompleteAt ? now - this._lastTurnCompleteAt : null,
+          agentPlaying: !!(this.queue && this.queue.pending()) });
+      }
+    } else if (this._micInUtterance && this._micLastLoudAt && now - this._micLastLoudAt > 1200) {
+      this._micInUtterance = false;
+      vlog('mic: utterance ends (~' + Math.round((this._micLastLoudAt - this._utteranceStartedAt) / 100) / 10 + 's of speech)');
+    }
+    if (st.rms > SILENT_RMS) { this._micLastNonSilentAt = now; this._micSilentWarned = false; }
+    else if (!this._micLastNonSilentAt) this._micLastNonSilentAt = now;
+    if (!this._micSilentWarned && now - this._micLastNonSilentAt > SILENT_WARN_MS) {
+      this._micSilentWarned = true;
+      vlog('!!! mic uplink SILENT for ' + Math.round(SILENT_WARN_MS / 1000) + 's while unmuted — frames flow but carry no audio; the model cannot hear', {
+        rms: st.rms, micCtx: this.micCtx && { state: this.micCtx.state, rate: this.micCtx.sampleRate }, track: this._trackInfo()
+      });
+      if (this.opts.onMicSilent) { try { this.opts.onMicSilent(this._trackInfo()); } catch (e) {} }
+    }
+    if (this.opts.onMicLevel && (!this._micLevelAt || now - this._micLevelAt >= 100)) {
+      this._micLevelAt = now;
+      try { this.opts.onMicLevel(st.rms, st.peak); } catch (e) {}
+    }
+  };
+  /** Latest capture-frame RMS (0..1); 0 before the first frame. */
+  VyneLiveSession.prototype.micLevel = function () { return this.micRms || 0; };
+
+  /**
+   * Per-turn reply tracking (v5.34.22). The trace could show every frame and
+   * still not answer "did the model reply to what was just said" — because
+   * it never related the model's frames to the USER's. This does:
+   *   inputTranscription  → the model heard something; arm a watchdog.
+   *   any modelTurn/turnComplete afterwards → disarm, log latency.
+   *   watchdog fires → the one line that pins S1 to the server side.
+   */
+  VyneLiveSession.prototype._noteUserTranscript = function (text) {
+    var self = this, now = Date.now();
+    this._lastUserTextAt = now;
+    if (!this._awaitingReply) {
+      this._awaitingReply = true;
+      this._userTurnStartedAt = now;
+      this._replyTurnNo = (this._replyTurnNo || 0) + 1;
+      vlog('USER TURN #' + this._replyTurnNo + ' — model transcribed the interviewee; awaiting its reply', {
+        text: snip(text, 60), agentPlaying: !!(this.queue && this.queue.pending()) });
+    }
+    if (this._replyWatchdog) clearTimeout(this._replyWatchdog);
+    this._replyWatchdog = setTimeout(function () {
+      self._replyWatchdog = null;
+      if (!self._awaitingReply || self.closed) return;
+      vlog('!!! NO MODEL ACTIVITY ' + Math.round(REPLY_WATCHDOG_MS / 1000) + 's after the interviewee was transcribed — the model heard a turn and did not answer it', {
+        turn: self._replyTurnNo, muted: !!self.muted, wsState: rs(self.ws),
+        micRms: Math.round((self.micRms || 0) * 1e4) / 1e4, micInUtterance: !!self._micInUtterance,
+        hint: 'VAD end-of-turn may not be firing (continuous noise/echo on the uplink keeps the turn open), or the server dropped the turn'
+      });
+      if (self.opts.onNoReply) { try { self.opts.onNoReply(self._replyTurnNo); } catch (e) {} }
+    }, REPLY_WATCHDOG_MS);
+  };
+  VyneLiveSession.prototype._noteModelActivity = function (f) {
+    var now = Date.now();
+    if (this._awaitingReply && (f.modelText || f.audio.length || f.agentText || f.turnComplete)) {
+      this._awaitingReply = false;
+      if (this._replyWatchdog) { clearTimeout(this._replyWatchdog); this._replyWatchdog = null; }
+      vlog('model ACTIVITY on user turn #' + this._replyTurnNo + ' (' + (now - this._userTurnStartedAt) + 'ms after transcript began; ' +
+           (now - this._lastUserTextAt) + 'ms after last fragment)', {
+        kind: f.audio.length ? 'audio' : (f.modelText ? 'thinking-text' : (f.agentText ? 'transcript' : 'turnComplete')) });
+    }
+    // Per-turn state for the UI: thinking → speaking → idle. Session-level
+    // _gotAgentFrame stays as it is (the opening retry depends on it).
+    if (f.modelText && !this._turnAudio && this._turnState !== 'thinking') this._setTurnState('thinking');
+    if (f.audio.length && !this._turnAudio) {
+      this._turnAudio = true;
+      this._turnFirstAudioAt = now;
+      if (this._replyTurnNo && this._userTurnStartedAt && !this._loggedTurnAudio) {
+        vlog('reply FIRST AUDIO for user turn #' + this._replyTurnNo, { msAfterUserTurn: now - this._userTurnStartedAt });
+      }
+      this._loggedTurnAudio = true;
+      this._setTurnState('speaking');
+    }
+    if (f.turnComplete) {
+      this._lastTurnCompleteAt = now;
+      vlog('model turn ENDS', { turnHadAudio: !!this._turnAudio, queuedPlaybackSec: this.queue ? Math.round((this.queue._aheadSec || 0) * 10) / 10 : null });
+      if (this.queue) this.queue.endRun('turnComplete');
+      this._turnAudio = false; this._loggedTurnAudio = false;
+      this._setTurnState('idle');
+    }
+  };
+  VyneLiveSession.prototype._setTurnState = function (s) {
+    if (this._turnState === s) return;
+    this._turnState = s;
+    if (this.opts.onTurnState) { try { this.opts.onTurnState(s); } catch (e) {} }
+  };
+
   VyneLiveSession.prototype.start = function () {
     var self = this;
     vlog('session.start() called', { module: this.opts.module, voice: this.opts.voice, interviewer: this.opts.interviewerName });
+    window.__vyneLiveCurrent = this;   // for vyneLiveMicCheck()
     this._set('connecting');
 
     // 1. Ask OUR server for a grant. This is where the budget check, the
@@ -596,7 +798,7 @@
     }).then(function (grant) {
       self.grant = grant;
       vlog('grant minted', { model: grant.model, voice: grant.voice, pinned: grant.pinned,
-                             maxSeconds: grant.maxSeconds, sessionId: grant.sessionId });
+                             thinkingBudget: grant.thinkingBudget, maxSeconds: grant.maxSeconds, sessionId: grant.sessionId });
       return self._openAudio();
     }).then(function () {
       // The token's shape decides the endpoint, but the mint fallback means we
@@ -697,15 +899,21 @@
           }
           return;
         }
+        var input = ev.inputBuffer.getChannelData(0);
+        // v5.34.22: LEVEL, not just count. See frameStats().
+        var st = frameStats(input);
+        self._observeMicLevel(st);
         // Mic frames leave every ~128ms, so log the first and then sparsely.
         // They matter here for one reason: uplink audio is what the model's
         // activity detection can INTERRUPT a turn on, so a dropped opening
         // needs to be readable against what the microphone was sending.
         self._micFrames = (self._micFrames || 0) + 1;
-        if (self._micFrames === 1) vlog('mic: first frame sent to socket');
+        if (self._micFrames === 1) vlog('mic: first frame sent to socket', { rms: st.rms, peak: st.peak, track: self._trackInfo() });
         else if (self._micFrames % 40 === 0) vlog('mic: ' + self._micFrames + ' frames sent (~' +
-          Math.round(self._micFrames * FRAME_SAMPLES / INPUT_RATE) + 's of uplink audio)');
-        var input = ev.inputBuffer.getChannelData(0);
+          Math.round(self._micFrames * FRAME_SAMPLES / INPUT_RATE) + 's of uplink audio)', {
+            rms: Math.round(st.rms * 1e4) / 1e4, peakLast5s: Math.round(self._micPeakWindow * 1e3) / 1e3,
+            speechFrames: self._micSpeechFrames || 0
+          });
         // Verified, not assumed — see the header note on Safari.
         var pcmF = self.micCtx.sampleRate === INPUT_RATE
           ? input
@@ -863,8 +1071,22 @@
           if (self.opts.onAgentThinking) { try { self.opts.onAgentThinking(f.modelText); } catch (e) {} }
         }
 
+        // v5.34.22: relate the model's frames to the interviewee's turn.
+        if (f.userText) self._noteUserTranscript(f.userText);
+        self._noteModelActivity(f);
+
         if (f.interrupted) {
+          // Who interrupted? If the uplink was quiet, the model heard its OWN
+          // playback (echo cancellation not holding) — that is a choppy,
+          // self-cancelling agent, and it reads as "distortion" (S3).
+          vlog('INTERRUPTED — barge-in', {
+            micRms: Math.round((self.micRms || 0) * 1e4) / 1e4, micInUtterance: !!self._micInUtterance,
+            queuedPlaybackSec: self.queue ? Math.round((self.queue._aheadSec || 0) * 10) / 10 : null,
+            likelySelfEcho: !self._micInUtterance
+          });
           self.queue.flush();
+          self._turnAudio = false; self._loggedTurnAudio = false;
+          self._setTurnState('idle');
           if (self.opts.onInterrupted) { try { self.opts.onInterrupted(); } catch (e) {} }
         }
         // Usage always counts — the tokens were spent regardless of pause state.
@@ -942,7 +1164,16 @@
     var was = this.muted;
     vlog('session.setMuted(' + !!m + ')', { was: !!was });
     this.muted = !!m;
-    if (!this.muted) { this._keepAliveLogged = false; this._lastKeepAlive = 0; }
+    if (!this.muted) {
+      this._keepAliveLogged = false; this._lastKeepAlive = 0;
+      // The silence clock did not run while muted; restart it so a long pause
+      // cannot masquerade as a dead uplink the instant the session resumes.
+      this._micLastNonSilentAt = Date.now(); this._micSilentWarned = false;
+      this._awaitingReply = false;
+      if (this._replyWatchdog) { clearTimeout(this._replyWatchdog); this._replyWatchdog = null; }
+      if (was) vlog('resumed — capture chain state', { micCtx: this.micCtx && { state: this.micCtx.state, rate: this.micCtx.sampleRate },
+        outCtx: this.outCtx && { state: this.outCtx.state, rate: this.outCtx.sampleRate }, track: this._trackInfo() });
+    }
     if (this.muted && !was) {
       // Entering pause: flush the playback queue. queue.flush() stops every
       // audio source already scheduled on the output context, so nothing keeps
@@ -1016,6 +1247,8 @@
     });
     this.closed = true;
     if (this.timer) { clearTimeout(this.timer); this.timer = null; }
+    if (this._replyWatchdog) { clearTimeout(this._replyWatchdog); this._replyWatchdog = null; }
+    if (this._openingRetryTimer) { clearTimeout(this._openingRetryTimer); this._openingRetryTimer = null; }
     if (this.queue) this.queue.flush();
     try { if (this.ws && this.ws.readyState <= 1) this.ws.close(); } catch (e) {}
     if (this.stream) {
@@ -1074,8 +1307,35 @@
       buildAudioFrame: buildAudioFrame,
       parseServerFrame: parseServerFrame,
       PlaybackQueue: PlaybackQueue,
+      frameStats: frameStats,
+      SPEECH_RMS: SPEECH_RMS,
+      SILENT_RMS: SILENT_RMS,
       INPUT_RATE: INPUT_RATE,
       OUTPUT_RATE: OUTPUT_RATE
     }
+  };
+
+  /**
+   * DevTools: `vyneLiveMicCheck()` — samples the CURRENT live session's uplink
+   * for three seconds and reports whether it carried speech-level audio. Say
+   * something after calling it. This is the one-line test for "can the model
+   * hear me at all", independent of everything downstream of the socket.
+   */
+  window.vyneLiveMicCheck = function (seconds) {
+    var s = window.__vyneLiveCurrent;
+    if (!s || s.closed) { console.warn('[vyneLiveMicCheck] no live session'); return Promise.resolve(null); }
+    var ms = (seconds || 3) * 1000, peak = 0, sum = 0, n = 0, t0 = Date.now();
+    return new Promise(function (resolve) {
+      var iv = setInterval(function () {
+        var r = s.micLevel(); if (r > peak) peak = r; sum += r; n++;
+        if (Date.now() - t0 >= ms) {
+          clearInterval(iv);
+          var out = { peakRms: peak, meanRms: n ? sum / n : 0, speechLevel: peak >= SPEECH_RMS,
+                      muted: !!s.muted, micCtx: s.micCtx && s.micCtx.state, track: s._trackInfo() };
+          vlog('vyneLiveMicCheck', out);
+          resolve(out);
+        }
+      }, 50);
+    });
   };
 })();
