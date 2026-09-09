@@ -337,17 +337,29 @@
    * session sets _gotAgentFrame on any response; we check that, not a
    * timer alone, so a session that DID answer is never double-prompted. */
   LiveInterview.prototype.open = function (line) {
+    // v5.34.17: RESILIENT warmup retry. setupComplete does not mean the model
+    // can generate yet, and the warmup window varies — a single retry at 3.5s
+    // still intermittently missed it, so the interview opened mute. Instead of
+    // one retry, poll: resend the opening every ~3s until the agent actually
+    // produces a frame (session._gotAgentFrame), capped at a few attempts so it
+    // can never loop or double-talk once the agent is responding. This makes the
+    // opening timing-independent — it WILL land as soon as the model is ready.
     var self = this;
     if (!this.session) return;
     this.session._gotAgentFrame = false;
-    this.session.sendText(line);
-    if (this._openRetry) { clearTimeout(this._openRetry); }
-    this._openRetry = setTimeout(function () {
+    if (this._openRetry) { clearTimeout(this._openRetry); this._openRetry = null; }
+    var attempts = 0;
+    var MAX_ATTEMPTS = 4;      // ~1 initial + 3 resends over ~12s
+    function fire() {
       var s = self.session;
-      if (s && !s.closed && !self._muted && s.ws && s.ws.readyState === 1 && !s._gotAgentFrame) {
-        try { s.sendText(line); } catch (e) {}
-      }
-    }, 3500);
+      if (!s || s.closed || self._muted || !s.ws || s.ws.readyState !== 1) return;
+      if (s._gotAgentFrame) return;        // agent responded — stop.
+      if (attempts >= MAX_ATTEMPTS) return; // give up rather than loop.
+      attempts++;
+      try { s.sendText(line); } catch (e) {}
+      self._openRetry = setTimeout(fire, 3000);
+    }
+    fire();
   };
 
   LiveInterview.prototype.say = function (text) {
