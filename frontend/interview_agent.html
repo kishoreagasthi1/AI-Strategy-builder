@@ -4848,9 +4848,21 @@ document.addEventListener('DOMContentLoaded', function(){
   document.body.style.paddingTop = '40px';
 
   document.getElementById('vyne-pause-btn').onclick = function(){
+    // v5.34.7: route the banner pause through the SAME logic as the in-interview
+    // pause (togglePause), so a live session is actually silenced. Previously
+    // this handler stopped only recognition + TTS audio and never called
+    // LIVE.setMuted, so on the realtime path the agent kept talking while the
+    // UI said paused. togglePause() handles LIVE.setMuted/clock correctly; we
+    // only invoke it if not already paused, then show the "saved" leave screen.
+    try{
+      if(typeof IV_CLOCK !== 'undefined' && !IV_CLOCK.paused && typeof togglePause === 'function'){
+        togglePause();
+      }else{
+        try{ if(recognition && recognition.stop) recognition.stop(); }catch(e){}
+        try{ if(currentAudio && currentAudio.pause) currentAudio.pause(); }catch(e){}
+      }
+    }catch(e){}
     try{ if(typeof saveSession === 'function') saveSession(); }catch(e){}
-    try{ if(recognition && recognition.stop) recognition.stop(); }catch(e){}
-    try{ if(currentAudio && currentAudio.pause) currentAudio.pause(); }catch(e){}
     vyneStore.flush();
     renderPaused();
   };
