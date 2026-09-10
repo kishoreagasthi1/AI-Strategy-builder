@@ -61,7 +61,7 @@
   // partial deploy (one side redeployed, the other not — see v5.27's
   // postmortem, where a stale frontend folder got redeployed silently) is
   // visible from inside the running app.
-  var VYNE_VERSION = "5.34.21";
+  var VYNE_VERSION = "5.34.22";
   window.VYNE_VERSION = VYNE_VERSION;
 
   // ── Client identity norm (v5.32.26) ─────────────────────────

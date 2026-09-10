@@ -1,5 +1,5 @@
 /**
- * vyne-live.js — realtime duplex voice for the Interview Agent (v5.34.22).
+ * vyne-live.js — realtime duplex voice for the Interview Agent (v5.34.23).
  *
  * Loaded alongside vyne-client.js. Exposes window.vyneLive.
  *
@@ -252,10 +252,16 @@
    * it survived five releases because the test harness's fake server accepted
    * any shape at all instead of modelling Google's.
    */
-  function buildSetup(model, unpinnedInstruction, voiceName) {
+  function buildSetup(model, unpinnedInstruction, voiceName, flags) {
     return {
       setup: {
         model: model.indexOf('models/') === 0 ? model : 'models/' + model,
+        // EXPERIMENT (manualVad): turn the server's VAD off and signal turns
+        // ourselves from the client-side utterance detector. Field path per
+        // the Live API docs: setup.realtimeInputConfig.automaticActivityDetection.
+        ...(flags && flags.manualVad
+          ? { realtimeInputConfig: { automaticActivityDetection: { disabled: true } } }
+          : {}),
         generationConfig: {
           responseModalities: ['AUDIO'],
           // NOT setup.speechConfig. See the note above.
@@ -313,13 +319,71 @@
    *  quiet room on a laptop mic with AGC sits around 0.001-0.005. */
   var SPEECH_RMS = 0.01;
   /** Below this for SILENT_WARN_MS while unmuted, the uplink is declared dead. */
-  var SILENT_RMS = 0.0005;
+  // v5.34.23: 0.0005 was too tight — Chrome's noise suppression parks a quiet
+  // room at 0.0002-0.0008 between sentences, which tripped this a few seconds
+  // after every answer. Genuine silence (a muted/wrong device) sits at 0.0001
+  // with a peak under 0.003 and stays there.
+  var SILENT_RMS = 0.0003;
+  var SILENT_PEAK = 0.005;
   // Both overridable ONLY so tests can exercise the watchdogs without waiting
   // out the real windows (the same reason VYNE_OPEN_RETRY_MS exists).
-  var SILENT_WARN_MS = Number(window.VYNE_MIC_SILENT_WARN_MS) || 8000;
+  var SILENT_WARN_MS = Number(window.VYNE_MIC_SILENT_WARN_MS) || 15000;
+  /** Uplink bytes queued in the browser above this many seconds of audio is a
+   *  conversation that has already stopped being live; say so, then shed. */
+  var BACKLOG_WARN_SEC = 1;
+  var BACKLOG_DROP_SEC = 3;
   /** No serverContent this long after the user's speech was transcribed is
    *  the shape of a turn the model heard and never answered. */
   var REPLY_WATCHDOG_MS = Number(window.VYNE_REPLY_WATCHDOG_MS) || 12000;
+  /** Client-side utterance (≥ this long) with no server reaction inside
+   *  IGNORED_WATCHDOG_MS → the server is not treating our audio as speech. */
+  var IGNORED_MIN_UTTERANCE_MS = 1000;
+  /** Quiet this long closes a client-side utterance. */
+  var UTTERANCE_GAP_MS = Number(window.VYNE_UTTERANCE_GAP_MS) || 1200;
+  var IGNORED_WATCHDOG_MS = Number(window.VYNE_IGNORED_WATCHDOG_MS) || 8000;
+  /** Uplink capture ring, seconds of 16 kHz PCM16 — "hear what the model hears". */
+  var CAPTURE_SECONDS = 30;
+
+  /*
+   * EXPERIMENT FLAGS (v5.34.23). A production trace showed 17 s of speech-level
+   * uplink audio and NOTHING back from the server — no inputTranscription, no
+   * model frame — then a reply a long time later. The three server-side
+   * explanations (uplink too quiet for its VAD; its VAD never closing the
+   * turn; a turn it only closes on an explicit signal) each have a cheap
+   * client-side test, and none of them can be run from the console without a
+   * hard reload — which forgets window.* — so the flags persist in
+   * localStorage. DevTools:
+   *     vyneLiveFlags()                              // show
+   *     vyneLiveFlags({ micGain: 3 })                // amplify the uplink ×3
+   *     vyneLiveFlags({ streamEnd: true })           // audioStreamEnd after each utterance
+   *     vyneLiveFlags({ manualVad: true })           // client sends activityStart/End
+   *     vyneLiveFlags(null)                          // clear
+   * All default OFF: with none set the wire is identical to 5.34.22.
+   */
+  var FLAGS_KEY = 'VYNE_LIVE_FLAGS';
+  function readFlags() {
+    var f = {};
+    try { var raw = window.localStorage && window.localStorage.getItem(FLAGS_KEY); if (raw) f = JSON.parse(raw) || {}; } catch (e) {}
+    try { var w = window.VYNE_LIVE_FLAGS; if (w && typeof w === 'object') for (var k in w) f[k] = w[k]; } catch (e) {}
+    return {
+      micGain: Number(f.micGain) > 0 ? Number(f.micGain) : 1,
+      streamEnd: !!f.streamEnd,
+      manualVad: !!f.manualVad
+    };
+  }
+  window.vyneLiveFlags = function (set) {
+    try {
+      if (set === null) window.localStorage.removeItem(FLAGS_KEY);
+      else if (set && typeof set === 'object') {
+        var cur = {}; try { cur = JSON.parse(window.localStorage.getItem(FLAGS_KEY) || '{}') || {}; } catch (e) {}
+        for (var k in set) cur[k] = set[k];
+        window.localStorage.setItem(FLAGS_KEY, JSON.stringify(cur));
+      }
+    } catch (e) {}
+    var f = readFlags();
+    try { console.log('[vyneLiveFlags] ' + JSON.stringify(f) + (set !== undefined ? ' — hard-reload (⌘⇧R) to apply' : '')); } catch (e) {}
+    return f;
+  };
 
   /**
    * Normalise one server frame into the few things the UI cares about.
@@ -661,17 +725,35 @@
       if (!this._micInUtterance) {
         this._micInUtterance = true;
         this._utteranceStartedAt = now;
+        this._uttSum = 0; this._uttN = 0; this._uttPeak = 0;
+        this._uttServerActivityBefore = this._lastServerActivityAt || 0;
+        if (this.flags && this.flags.manualVad) this._pendingActivityStart = true;
         vlog('mic: SPEECH on uplink (utterance starts)', { rms: Math.round(st.rms * 1e4) / 1e4,
           msSinceTurnComplete: this._lastTurnCompleteAt ? now - this._lastTurnCompleteAt : null,
-          agentPlaying: !!(this.queue && this.queue.pending()) });
+          agentPlaying: !!(this.queue && this.queue.pending()),
+          wsBuffered: (this.ws && this.ws.bufferedAmount) || 0 });
       }
-    } else if (this._micInUtterance && this._micLastLoudAt && now - this._micLastLoudAt > 1200) {
+      this._uttSum += st.rms; this._uttN++; if (st.peak > this._uttPeak) this._uttPeak = st.peak;
+    } else if (this._micInUtterance && this._micLastLoudAt && now - this._micLastLoudAt > UTTERANCE_GAP_MS) {
       this._micInUtterance = false;
-      vlog('mic: utterance ends (~' + Math.round((this._micLastLoudAt - this._utteranceStartedAt) / 100) / 10 + 's of speech)');
+      // Audio time, not wall time: loud frames × frame length. Identical in a
+      // browser, and it is what the ≥1 s threshold actually means.
+      var uttMs = (this._uttN || 0) * (FRAME_SAMPLES / INPUT_RATE) * 1000;
+      var uttStats = { speechSec: Math.round(uttMs / 100) / 10, meanRms: this._uttN ? Math.round(this._uttSum / this._uttN * 1e4) / 1e4 : 0,
+                       peak: Math.round((this._uttPeak || 0) * 1e3) / 1e3, gain: (this.flags && this.flags.micGain) || 1,
+                       wsBuffered: (this.ws && this.ws.bufferedAmount) || 0 };
+      vlog('mic: utterance ends (~' + uttStats.speechSec + 's of speech)', uttStats);
+      var fl = this.flags || {};
+      var pe = { activityEnd: !!(fl.manualVad && (this._activityOpen || this._pendingActivityStart)),
+                 streamEnd: !!(fl.streamEnd && uttMs >= IGNORED_MIN_UTTERANCE_MS) };
+      this._pendingActivityStart = false;
+      if (pe.activityEnd || pe.streamEnd) this._pendingUtteranceEnd = pe;
+      this._armIgnoredWatchdog(uttMs, uttStats);
     }
-    if (st.rms > SILENT_RMS) { this._micLastNonSilentAt = now; this._micSilentWarned = false; }
+    if (st.rms > SILENT_RMS || st.peak > SILENT_PEAK) { this._micLastNonSilentAt = now; this._micSilentWarned = false; }
     else if (!this._micLastNonSilentAt) this._micLastNonSilentAt = now;
-    if (!this._micSilentWarned && now - this._micLastNonSilentAt > SILENT_WARN_MS) {
+    var quietSince = Math.max(this._micLastNonSilentAt, this._micLastLoudAt || 0);
+    if (!this._micSilentWarned && now - quietSince > SILENT_WARN_MS) {
       this._micSilentWarned = true;
       vlog('!!! mic uplink SILENT for ' + Math.round(SILENT_WARN_MS / 1000) + 's while unmuted — frames flow but carry no audio; the model cannot hear', {
         rms: st.rms, micCtx: this.micCtx && { state: this.micCtx.state, rate: this.micCtx.sampleRate }, track: this._trackInfo()
@@ -685,6 +767,54 @@
   };
   /** Latest capture-frame RMS (0..1); 0 before the first frame. */
   VyneLiveSession.prototype.micLevel = function () { return this.micRms || 0; };
+
+  /** Keep the last CAPTURE_SECONDS of what actually went on the wire. */
+  VyneLiveSession.prototype._capture = function (pcm16) {
+    if (!this._cap) { this._cap = new Int16Array(INPUT_RATE * CAPTURE_SECONDS); this._capPos = 0; this._capFilled = 0; }
+    var n = pcm16.length, cap = this._cap, L = cap.length;
+    for (var i = 0; i < n; i++) { cap[this._capPos] = pcm16[i]; this._capPos = (this._capPos + 1) % L; }
+    this._capFilled = Math.min(L, this._capFilled + n);
+  };
+  /** The captured uplink, oldest first, as Int16Array (last `seconds`). */
+  VyneLiveSession.prototype.capturedUplink = function (seconds) {
+    if (!this._cap || !this._capFilled) return new Int16Array(0);
+    var want = Math.min(this._capFilled, Math.round((seconds || CAPTURE_SECONDS) * INPUT_RATE));
+    var out = new Int16Array(want), L = this._cap.length;
+    var start = (this._capPos - want + L) % L;
+    for (var i = 0; i < want; i++) out[i] = this._cap[(start + i) % L];
+    return out;
+  };
+
+  /**
+   * The line the 5.34.22 trace could not write (v5.34.23). It tracked "the
+   * model transcribed you and did not answer" — but the failing session never
+   * got as far as a transcription. This one starts from OUR side: an utterance
+   * of speech-level audio went up; did the server react AT ALL — transcription,
+   * thinking, audio, anything — within a few seconds of it ending? If not, the
+   * server is not treating what we send as speech, and the utterance stats
+   * say whether that is a level problem (meanRms well under 0.05) or not.
+   */
+  VyneLiveSession.prototype._armIgnoredWatchdog = function (uttMs, stats) {
+    var self = this;
+    if (uttMs < IGNORED_MIN_UTTERANCE_MS || this.muted) return;
+    var uttStartedAt = this._utteranceStartedAt;
+    if (this._ignoredWatchdog) clearTimeout(this._ignoredWatchdog);
+    this._ignoredWatchdog = setTimeout(function () {
+      self._ignoredWatchdog = null;
+      if (self.closed || self.muted) return;
+      var reacted = (self._lastServerActivityAt || 0) > uttStartedAt;
+      if (reacted) return;
+      vlog('!!! SERVER IGNORED ~' + stats.speechSec + 's of speech-level uplink — no transcription, no thinking, no audio ' +
+           Math.round(IGNORED_WATCHDOG_MS / 1000) + 's after it ended', {
+        utterance: stats,
+        verdict: stats.meanRms < 0.02 ? 'uplink is QUIET (meanRms < 0.02) — try vyneLiveFlags({micGain:3})'
+                                     : 'level is fine — server-side turn detection; try vyneLiveFlags({streamEnd:true}) then ({manualVad:true})',
+        flags: self.flags, micCtx: self.micCtx && { state: self.micCtx.state, rate: self.micCtx.sampleRate },
+        preSetupFramesDropped: self._preSetupFrames || 0, track: self._trackInfo()
+      });
+      if (self.opts.onUplinkIgnored) { try { self.opts.onUplinkIgnored(stats); } catch (e) {} }
+    }, IGNORED_WATCHDOG_MS);
+  };
 
   /**
    * Per-turn reply tracking (v5.34.22). The trace could show every frame and
@@ -739,7 +869,8 @@
     }
     if (f.turnComplete) {
       this._lastTurnCompleteAt = now;
-      vlog('model turn ENDS', { turnHadAudio: !!this._turnAudio, queuedPlaybackSec: this.queue ? Math.round((this.queue._aheadSec || 0) * 10) / 10 : null });
+      vlog('model turn ENDS', { turnHadAudio: !!this._turnAudio, playbackPending: this.queue ? this.queue.pending() : null,
+        msSinceLastUtteranceEnd: this._micLastLoudAt ? now - this._micLastLoudAt : null });
       if (this.queue) this.queue.endRun('turnComplete');
       this._turnAudio = false; this._loggedTurnAudio = false;
       this._setTurnState('idle');
@@ -755,6 +886,8 @@
     var self = this;
     vlog('session.start() called', { module: this.opts.module, voice: this.opts.voice, interviewer: this.opts.interviewerName });
     window.__vyneLiveCurrent = this;   // for vyneLiveMicCheck()
+    this.flags = readFlags();
+    if (this.flags.micGain !== 1 || this.flags.streamEnd || this.flags.manualVad) vlog('EXPERIMENT FLAGS ACTIVE', this.flags);
     this._set('connecting');
 
     // 1. Ask OUR server for a grant. This is where the budget check, the
@@ -878,6 +1011,16 @@
       self.node = node;
       node.onaudioprocess = function (ev) {
         if (self.closed || !self.ws || self.ws.readyState !== 1) return;
+        /*
+         * v5.34.23: nothing on the uplink before setupComplete. The contexts are
+         * opened BEFORE the socket, so this handler is already firing when the
+         * socket opens, and the first frame used to leave in the ~130 ms between
+         * our setup message and the server's setupComplete. Google's own client
+         * never sends realtime input until connect() resolves; a frame the
+         * server receives mid-setup is at best dropped and at worst the reason
+         * a session's realtime input is never treated as speech.
+         */
+        if (self.state !== 'live') { self._preSetupFrames = (self._preSetupFrames || 0) + 1; return; }
         // v5.34.21: keepalive while paused. A muted session used to send
         // NOTHING (return on self.muted), so the socket went idle and the
         // SERVER closed it — pause tore the whole session down, Resume had
@@ -900,6 +1043,17 @@
           return;
         }
         var input = ev.inputBuffer.getChannelData(0);
+        // EXPERIMENT (micGain): amplify before everything else, so the level
+        // trace, the capture ring and the wire all see the same audio.
+        var gain = (self.flags && self.flags.micGain) || 1;
+        if (gain !== 1) {
+          var amp = new Float32Array(input.length);
+          for (var gi = 0; gi < input.length; gi++) {
+            var gv = input[gi] * gain;
+            amp[gi] = gv > 1 ? 1 : (gv < -1 ? -1 : gv);
+          }
+          input = amp;
+        }
         // v5.34.22: LEVEL, not just count. See frameStats().
         var st = frameStats(input);
         self._observeMicLevel(st);
@@ -912,14 +1066,64 @@
         else if (self._micFrames % 40 === 0) vlog('mic: ' + self._micFrames + ' frames sent (~' +
           Math.round(self._micFrames * FRAME_SAMPLES / INPUT_RATE) + 's of uplink audio)', {
             rms: Math.round(st.rms * 1e4) / 1e4, peakLast5s: Math.round(self._micPeakWindow * 1e3) / 1e3,
-            speechFrames: self._micSpeechFrames || 0
+            speechFrames: self._micSpeechFrames || 0,
+            wsBuffered: self.ws.bufferedAmount || 0, backlogSec: Math.round((self._backlogSec || 0) * 10) / 10
           });
         // Verified, not assumed — see the header note on Safari.
         var pcmF = self.micCtx.sampleRate === INPUT_RATE
           ? input
           : resampleTo(input, self.micCtx.sampleRate, INPUT_RATE);
+        var pcm16 = floatTo16BitPCM(pcmF);
+        self._capture(pcm16);
+        /*
+         * v5.34.23: IS THE UPLINK ACTUALLY LEAVING THE BROWSER IN REAL TIME?
+         *
+         * A production trace (5.34.22) showed: a 7 s answer, then NOTHING from
+         * the server for 50 s, then an `interrupted` on a turn that never
+         * produced a frame, then a reply, then a second `interrupted` while our
+         * microphone was measurably silent. Every one of those is what a
+         * DELAYED uplink looks like from the client: the server hears each
+         * utterance late, replies late, and "interrupts" the model with speech
+         * that ended ten seconds earlier. ws.bufferedAmount is the bytes the
+         * browser has NOT yet handed to the network — the one number that
+         * separates "the network/server is not draining our audio" from
+         * "Google's pipeline is slow after it has our audio". And past a few
+         * seconds of backlog, a late frame is worse than a lost one: shed.
+         */
+        var buffered = self.ws.bufferedAmount || 0;
+        var bps = self._frameBytes ? self._frameBytes * (INPUT_RATE / FRAME_SAMPLES) : 0;
+        var backlogSec = bps ? buffered / bps : 0;
+        self._backlogSec = backlogSec;
+        if (backlogSec >= BACKLOG_WARN_SEC && !self._backlogWarned) {
+          self._backlogWarned = true;
+          vlog('!!! UPLINK BACKLOG — ' + (Math.round(backlogSec * 10) / 10) + 's of audio is queued in the browser, not yet on the network', {
+            bufferedBytes: buffered, frameBytes: self._frameBytes, hint: 'the server hears you late; replies and interruptions will all be late' });
+        } else if (backlogSec < BACKLOG_WARN_SEC / 2 && self._backlogWarned) {
+          self._backlogWarned = false;
+          vlog('uplink backlog drained', { droppedFrames: self._droppedFrames || 0 });
+        }
+        if (backlogSec >= BACKLOG_DROP_SEC) {
+          self._droppedFrames = (self._droppedFrames || 0) + 1;
+          if (self._droppedFrames === 1 || self._droppedFrames % 40 === 0) vlog('uplink SHEDDING frames (backlog ' + (Math.round(backlogSec * 10) / 10) + 's) — dropped ' + self._droppedFrames + ' so far');
+          return;
+        }
         try {
-          self.ws.send(JSON.stringify(buildAudioFrame(floatTo16BitPCM(pcmF))));
+          // EXPERIMENT (manualVad): the utterance detector decided a turn just
+          // began — say so BEFORE the frame that begins it.
+          if (self._pendingActivityStart) {
+            self._pendingActivityStart = false; self._activityOpen = true;
+            self.ws.send(JSON.stringify({ realtimeInput: { activityStart: {} } }));
+            vlog('EXPERIMENT: sent activityStart');
+          }
+          var wire = JSON.stringify(buildAudioFrame(pcm16));
+          self._frameBytes = wire.length;
+          self.ws.send(wire);
+          var pe = self._pendingUtteranceEnd;
+          if (pe) {
+            self._pendingUtteranceEnd = null;
+            if (pe.activityEnd) { self._activityOpen = false; self.ws.send(JSON.stringify({ realtimeInput: { activityEnd: {} } })); vlog('EXPERIMENT: sent activityEnd'); }
+            if (pe.streamEnd) { self.ws.send(JSON.stringify({ realtimeInput: { audioStreamEnd: true } })); vlog('EXPERIMENT: sent audioStreamEnd'); }
+          }
         } catch (e) { /* socket closing — the close handler will tidy up */ }
       };
       src.connect(node);
@@ -963,7 +1167,8 @@
         ws.send(JSON.stringify(buildSetup(
           self.grant.model,
           self.grant.pinned ? null : self.grant.instruction,
-          self.grant.voice
+          self.grant.voice,
+          self.flags
         )));
         self.startedAt = Date.now();
       };
@@ -983,7 +1188,7 @@
           self._set('live');
           var maxMs = (self.grant.maxSeconds || 2700) * 1000;
           self.timer = setTimeout(function () { self.stop('max_duration'); }, maxMs);
-          vlog('setupComplete — session is live', { msSinceOpen: Date.now() - self.startedAt });
+          vlog('setupComplete — session is live', { msSinceOpen: Date.now() - self.startedAt, micFramesHeldBeforeSetup: self._preSetupFrames || 0 });
           if (!settled) { settled = true; resolve(self); }
           /*
            * v5.34.18 — PASS THE SESSION TO onReady. This is the auto-start bug.
@@ -1072,6 +1277,7 @@
         }
 
         // v5.34.22: relate the model's frames to the interviewee's turn.
+        if (f.anyModelActivity) self._lastServerActivityAt = Date.now();
         if (f.userText) self._noteUserTranscript(f.userText);
         self._noteModelActivity(f);
 
@@ -1081,8 +1287,12 @@
           // self-cancelling agent, and it reads as "distortion" (S3).
           vlog('INTERRUPTED — barge-in', {
             micRms: Math.round((self.micRms || 0) * 1e4) / 1e4, micInUtterance: !!self._micInUtterance,
-            queuedPlaybackSec: self.queue ? Math.round((self.queue._aheadSec || 0) * 10) / 10 : null,
-            likelySelfEcho: !self._micInUtterance
+            msSinceLastUtteranceEnd: self._micLastLoudAt ? Date.now() - self._micLastLoudAt : null,
+            playbackPending: self.queue ? self.queue.pending() : null,
+            wsBuffered: (self.ws && self.ws.bufferedAmount) || 0,
+            // Quiet uplink NOW + an interruption = the server is reacting to
+            // audio we sent earlier (a lagging uplink), or to its own echo.
+            uplinkQuietNow: !self._micInUtterance
           });
           self.queue.flush();
           self._turnAudio = false; self._loggedTurnAudio = false;
@@ -1248,6 +1458,7 @@
     this.closed = true;
     if (this.timer) { clearTimeout(this.timer); this.timer = null; }
     if (this._replyWatchdog) { clearTimeout(this._replyWatchdog); this._replyWatchdog = null; }
+    if (this._ignoredWatchdog) { clearTimeout(this._ignoredWatchdog); this._ignoredWatchdog = null; }
     if (this._openingRetryTimer) { clearTimeout(this._openingRetryTimer); this._openingRetryTimer = null; }
     if (this.queue) this.queue.flush();
     try { if (this.ws && this.ws.readyState <= 1) this.ws.close(); } catch (e) {}
@@ -1308,6 +1519,8 @@
       parseServerFrame: parseServerFrame,
       PlaybackQueue: PlaybackQueue,
       frameStats: frameStats,
+      readFlags: readFlags,
+      pcm16ToWav: pcm16ToWav,
       SPEECH_RMS: SPEECH_RMS,
       SILENT_RMS: SILENT_RMS,
       INPUT_RATE: INPUT_RATE,
@@ -1321,6 +1534,48 @@
    * something after calling it. This is the one-line test for "can the model
    * hear me at all", independent of everything downstream of the socket.
    */
+  /** 16 kHz mono PCM16 → WAV bytes. */
+  function pcm16ToWav(pcm) {
+    var buf = new ArrayBuffer(44 + pcm.length * 2), v = new DataView(buf);
+    function w(o, str) { for (var i = 0; i < str.length; i++) v.setUint8(o + i, str.charCodeAt(i)); }
+    w(0, 'RIFF'); v.setUint32(4, 36 + pcm.length * 2, true); w(8, 'WAVE'); w(12, 'fmt ');
+    v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true); v.setUint32(24, INPUT_RATE, true);
+    v.setUint32(28, INPUT_RATE * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true); w(36, 'data');
+    v.setUint32(40, pcm.length * 2, true);
+    for (var i = 0; i < pcm.length; i++) v.setInt16(44 + i * 2, pcm[i], true);
+    return new Uint8Array(buf);
+  }
+  /**
+   * DevTools: `vyneLivePlayUplink(10)` — play the last 10 s of EXACTLY what
+   * went to Google, through the speakers. If you hear yourself, clear and at
+   * normal pitch, the capture chain is right and the problem is on the
+   * server's side of the socket. If it is faint, garbled, slow or silent, the
+   * problem is here. `vyneLiveDownloadUplink(30)` saves the same as a WAV.
+   */
+  window.vyneLivePlayUplink = function (seconds) {
+    var s = window.__vyneLiveCurrent;
+    if (!s) { console.warn('[vyneLivePlayUplink] no live session'); return null; }
+    var pcm = s.capturedUplink(seconds || 10);
+    if (!pcm.length) { console.warn('[vyneLivePlayUplink] nothing captured yet'); return null; }
+    var AC = window.AudioContext || window.webkitAudioContext, ctx = new AC({ sampleRate: INPUT_RATE });
+    var buf = ctx.createBuffer(1, pcm.length, INPUT_RATE); buf.getChannelData(0).set(int16ToFloat32(pcm));
+    var src = ctx.createBufferSource(); src.buffer = buf; src.connect(ctx.destination); src.start();
+    src.onended = function () { try { ctx.close(); } catch (e) {} };
+    var st = frameStats(int16ToFloat32(pcm));
+    vlog('vyneLivePlayUplink', { seconds: Math.round(pcm.length / INPUT_RATE * 10) / 10, rms: st.rms, peak: st.peak });
+    return { seconds: pcm.length / INPUT_RATE, rms: st.rms, peak: st.peak };
+  };
+  window.vyneLiveDownloadUplink = function (seconds) {
+    var s = window.__vyneLiveCurrent;
+    if (!s) { console.warn('[vyneLiveDownloadUplink] no live session'); return null; }
+    var wav = pcm16ToWav(s.capturedUplink(seconds || CAPTURE_SECONDS));
+    var url = URL.createObjectURL(new Blob([wav], { type: 'audio/wav' }));
+    var a = document.createElement('a'); a.href = url; a.download = 'vyne-uplink-' + Date.now() + '.wav';
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(function () { URL.revokeObjectURL(url); }, 5000);
+    return a.download;
+  };
+
   window.vyneLiveMicCheck = function (seconds) {
     var s = window.__vyneLiveCurrent;
     if (!s || s.closed) { console.warn('[vyneLiveMicCheck] no live session'); return Promise.resolve(null); }
