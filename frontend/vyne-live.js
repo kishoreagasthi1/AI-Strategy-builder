@@ -1,5 +1,5 @@
 /**
- * vyne-live.js — realtime duplex voice for the Interview Agent (v5.34.23).
+ * vyne-live.js — realtime duplex voice for the Interview Agent (v5.34.24).
  *
  * Loaded alongside vyne-client.js. Exposes window.vyneLive.
  *
@@ -284,15 +284,13 @@
     };
   }
 
-  function buildAudioFrame(pcm16) {
-    return {
-      realtimeInput: {
-        audio: {
-          data: bytesToBase64(new Uint8Array(pcm16.buffer, pcm16.byteOffset, pcm16.byteLength)),
-          mimeType: 'audio/pcm;rate=' + INPUT_RATE
-        }
-      }
+  function buildAudioFrame(pcm16, legacy) {
+    var blob = {
+      data: bytesToBase64(new Uint8Array(pcm16.buffer, pcm16.byteOffset, pcm16.byteLength)),
+      mimeType: 'audio/pcm;rate=' + INPUT_RATE
     };
+    // EXPERIMENT (legacyChunks): the pre-2025 field. See readFlags().
+    return { realtimeInput: legacy ? { mediaChunks: [blob] } : { audio: blob } };
   }
 
   /**
@@ -368,8 +366,26 @@
     return {
       micGain: Number(f.micGain) > 0 ? Number(f.micGain) : 1,
       streamEnd: !!f.streamEnd,
-      manualVad: !!f.manualVad
+      manualVad: !!f.manualVad,
+      // v5.34.24 — three more, each aimed at the server's TURN state, which the
+      // 5.34.23 trace pinned as the failure (level fine, backlog 0, no reaction):
+      //   legacyChunks:          send audio as realtimeInput.mediaChunks[] (the
+      //                          older field) instead of realtimeInput.audio —
+      //                          this endpoint IGNORES unknown fields silently
+      //                          (see the speechConfig note in buildSetup).
+      //   openingViaRealtime:    send text turns as realtimeInput.text instead
+      //                          of a clientContent turn, so the session never
+      //                          mixes the two input paths.
+      //   holdMicUntilFirstTurn: send no mic audio until the opening turn has
+      //                          completed — no realtime audio during a
+      //                          clientContent-driven generation.
+      legacyChunks: !!f.legacyChunks,
+      openingViaRealtime: !!f.openingViaRealtime,
+      holdMicUntilFirstTurn: !!f.holdMicUntilFirstTurn
     };
+  }
+  function anyFlag(f) {
+    return !!(f && (f.micGain !== 1 || f.streamEnd || f.manualVad || f.legacyChunks || f.openingViaRealtime || f.holdMicUntilFirstTurn));
   }
   window.vyneLiveFlags = function (set) {
     try {
@@ -887,7 +903,7 @@
     vlog('session.start() called', { module: this.opts.module, voice: this.opts.voice, interviewer: this.opts.interviewerName });
     window.__vyneLiveCurrent = this;   // for vyneLiveMicCheck()
     this.flags = readFlags();
-    if (this.flags.micGain !== 1 || this.flags.streamEnd || this.flags.manualVad) vlog('EXPERIMENT FLAGS ACTIVE', this.flags);
+    if (anyFlag(this.flags)) vlog('EXPERIMENT FLAGS ACTIVE', this.flags);
     this._set('connecting');
 
     // 1. Ask OUR server for a grant. This is where the budget check, the
@@ -907,7 +923,10 @@
         intervieweeRole: self.opts.intervieweeRole || undefined,
         industry: self.opts.industry || undefined,
         voice: self.opts.voice || undefined,
-        interviewerName: self.opts.interviewerName || undefined
+        interviewerName: self.opts.interviewerName || undefined,
+        // v5.34.24: the server pins this into the token (the client's own
+        // setup frame is not reliably honoured on the constrained endpoint).
+        manualVad: self.flags && self.flags.manualVad ? true : undefined
       })
     }).then(function (r) {
       if (!r.ok) {
@@ -931,7 +950,8 @@
     }).then(function (grant) {
       self.grant = grant;
       vlog('grant minted', { model: grant.model, voice: grant.voice, pinned: grant.pinned,
-                             thinkingBudget: grant.thinkingBudget, maxSeconds: grant.maxSeconds, sessionId: grant.sessionId });
+                             thinkingBudget: grant.thinkingBudget, pinnedExtras: grant.pinnedExtras,
+                             maxSeconds: grant.maxSeconds, sessionId: grant.sessionId });
       return self._openAudio();
     }).then(function () {
       // The token's shape decides the endpoint, but the mint fallback means we
@@ -1021,6 +1041,13 @@
          * a session's realtime input is never treated as speech.
          */
         if (self.state !== 'live') { self._preSetupFrames = (self._preSetupFrames || 0) + 1; return; }
+        // EXPERIMENT (holdMicUntilFirstTurn): no realtime audio while the
+        // opening (a clientContent turn) is still being generated/spoken.
+        if (self.flags && self.flags.holdMicUntilFirstTurn && !self._lastTurnCompleteAt) {
+          self._heldForFirstTurn = (self._heldForFirstTurn || 0) + 1;
+          if (self._heldForFirstTurn === 1) vlog('EXPERIMENT: holding mic audio until the first turn completes');
+          return;
+        }
         // v5.34.21: keepalive while paused. A muted session used to send
         // NOTHING (return on self.muted), so the socket went idle and the
         // SERVER closed it — pause tore the whole session down, Resume had
@@ -1036,7 +1063,7 @@
             self._lastKeepAlive = nowTs;
             try {
               var silent = new Int16Array(FRAME_SAMPLES); // zero-filled = silence
-              self.ws.send(JSON.stringify(buildAudioFrame(silent)));
+              self.ws.send(JSON.stringify(buildAudioFrame(silent, self.flags && self.flags.legacyChunks)));
               if (!self._keepAliveLogged) { self._keepAliveLogged = true; vlog('paused — sending silent keepalive frames to hold the socket'); }
             } catch (e) { /* socket closing — close handler tidies up */ }
           }
@@ -1115,7 +1142,7 @@
             self.ws.send(JSON.stringify({ realtimeInput: { activityStart: {} } }));
             vlog('EXPERIMENT: sent activityStart');
           }
-          var wire = JSON.stringify(buildAudioFrame(pcm16));
+          var wire = JSON.stringify(buildAudioFrame(pcm16, self.flags.legacyChunks));
           self._frameBytes = wire.length;
           self.ws.send(wire);
           var pe = self._pendingUtteranceEnd;
@@ -1416,6 +1443,12 @@
       }
       vlog('sendText DROPPED — socket not usable', { readyState: rs(this.ws), text: snip(text) });
       return false;
+    }
+    if (this.flags && this.flags.openingViaRealtime) {
+      // EXPERIMENT: text on the realtime path, never a clientContent turn.
+      vlog('sendText -> WIRE (realtimeInput.text)', { readyState: rs(this.ws), text: snip(text) });
+      this.ws.send(JSON.stringify({ realtimeInput: { text: String(text) } }));
+      return true;
     }
     vlog('sendText -> WIRE', { readyState: rs(this.ws), text: snip(text) });
     this.ws.send(JSON.stringify({
