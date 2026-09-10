@@ -1,5 +1,5 @@
 /**
- * vyne-live.js — realtime duplex voice for the Interview Agent (v5.34.24).
+ * vyne-live.js — realtime duplex voice for the Interview Agent (v5.34.25).
  *
  * Loaded alongside vyne-client.js. Exposes window.vyneLive.
  *
@@ -381,11 +381,27 @@
       //                          clientContent-driven generation.
       legacyChunks: !!f.legacyChunks,
       openingViaRealtime: !!f.openingViaRealtime,
-      holdMicUntilFirstTurn: !!f.holdMicUntilFirstTurn
+      holdMicUntilFirstTurn: !!f.holdMicUntilFirstTurn,
+      // v5.34.25 — v1alpha: connect the constrained service on v1alpha first.
+      // Google's own SDK routes EVERY ephemeral-token session to
+      // `v1alpha.GenerativeService.BidiGenerateContentConstrained` and warns
+      // that token support exists in v1alpha only; the token itself is minted
+      // at /v1alpha/auth_tokens. We connect on v1beta because it was the first
+      // variant that reached setupComplete — but "reaches setupComplete and
+      // speaks the opening" is not "treats realtime audio as a turn", which is
+      // exactly the half that has never worked, and v1alpha was never tried.
+      v1alpha: !!f.v1alpha
     };
   }
   function anyFlag(f) {
-    return !!(f && (f.micGain !== 1 || f.streamEnd || f.manualVad || f.legacyChunks || f.openingViaRealtime || f.holdMicUntilFirstTurn));
+    return !!(f && (f.micGain !== 1 || f.streamEnd || f.manualVad || f.legacyChunks || f.openingViaRealtime || f.holdMicUntilFirstTurn || f.v1alpha));
+  }
+  /** The variant sweep order for this session's flags. */
+  function variantOrder(flags) {
+    if (!flags || !flags.v1alpha) return WS_VARIANTS;
+    var a = [], b = [];
+    for (var i = 0; i < WS_VARIANTS.length; i++) (WS_VARIANTS[i].v === 'v1alpha' ? a : b).push(WS_VARIANTS[i]);
+    return a.concat(b);
   }
   window.vyneLiveFlags = function (set) {
     try {
@@ -960,10 +976,11 @@
       // Walk the candidates until one reaches setupComplete. Each attempt is
       // short so the whole sweep stays inside a few seconds of user patience.
       var i = 0;
+      var variants = variantOrder(self.flags);
       function attempt() {
         if (self.closed) return Promise.reject(new Error('cancelled'));
-        var variant = WS_VARIANTS[i];
-        vlog('ws variant attempt ' + (i + 1) + '/' + WS_VARIANTS.length, variantLabel(variant));
+        var variant = variants[i];
+        vlog('ws variant attempt ' + (i + 1) + '/' + variants.length, variantLabel(variant));
         if (self.opts.onNote) { try { self.opts.onNote('trying ' + variantLabel(variant) + '…'); } catch (e) {} }
         return self._openSocket(variant, 8000).then(function (r) {
           self.variant = variantLabel(variant);
@@ -974,7 +991,7 @@
           vlog('ws variant failed', { variant: variantLabel(variant), err: err && err.message });
           try { if (self.ws) { self.ws.onclose = null; self.ws.onerror = null; self.ws.close(); } } catch (e) {}
           i++;
-          if (i >= WS_VARIANTS.length || self.closed) throw err;
+          if (i >= variants.length || self.closed) throw err;
           return attempt();
         });
       }
@@ -1553,6 +1570,7 @@
       PlaybackQueue: PlaybackQueue,
       frameStats: frameStats,
       readFlags: readFlags,
+      variantOrder: variantOrder,
       pcm16ToWav: pcm16ToWav,
       SPEECH_RMS: SPEECH_RMS,
       SILENT_RMS: SILENT_RMS,
