@@ -1,5 +1,5 @@
 /**
- * vyne-live.js — realtime duplex voice for the Interview Agent (v5.34.27).
+ * vyne-live.js — realtime duplex voice for the Interview Agent (v5.34.28).
  *
  * Loaded alongside vyne-client.js. Exposes window.vyneLive.
  *
@@ -1376,7 +1376,16 @@
         // only audio was gated on self.muted, so agentText/turnComplete still
         // fired and the transcript kept advancing and the interview appeared to
         // "keep going" while the UI showed Paused/Resume. Drop the entire turn.
-        if (self.muted) { if (f.audio.length || f.agentText) vlog('turn DISCARDED — session is muted/paused'); return; }
+        if (self.muted) {
+          // v5.34.28: one line per discarded turn, not one per frame (a reply
+          // that lands mid-pause is ~200 frames; that buried the trace).
+          if (f.audio.length || f.agentText) {
+            self._discarded = (self._discarded || 0) + 1;
+            if (self._discarded === 1) vlog('turn DISCARDED — session is muted/paused (further frames of this turn rolled up)');
+          }
+          if (f.turnComplete && self._discarded) { vlog('discarded turn ends', { frames: self._discarded }); self._discarded = 0; }
+          return;
+        }
         // First actual audio also ends any "preparing" state, even when the
         // output transcript has not arrived yet.
         if (f.audio.length && self.opts.onAgentSpeaking && !self._announcedSpeaking) {
