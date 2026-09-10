@@ -1,5 +1,5 @@
 /**
- * vyne-live.js — realtime duplex voice for the Interview Agent (v5.34.25).
+ * vyne-live.js — realtime duplex voice for the Interview Agent (v5.34.27).
  *
  * Loaded alongside vyne-client.js. Exposes window.vyneLive.
  *
@@ -390,18 +390,32 @@
       // variant that reached setupComplete — but "reaches setupComplete and
       // speaks the opening" is not "treats realtime audio as a turn", which is
       // exactly the half that has never worked, and v1alpha was never tried.
-      v1alpha: !!f.v1alpha
+      v1alpha: !!f.v1alpha,
+      // v5.34.26: v1alpha is now the DEFAULT order (see variantOrder); this
+      // flag restores the 5.34.14–5.34.25 order (v1beta first) for comparison.
+      v1beta: !!f.v1beta
     };
   }
   function anyFlag(f) {
-    return !!(f && (f.micGain !== 1 || f.streamEnd || f.manualVad || f.legacyChunks || f.openingViaRealtime || f.holdMicUntilFirstTurn || f.v1alpha));
+    return !!(f && (f.micGain !== 1 || f.streamEnd || f.manualVad || f.legacyChunks || f.openingViaRealtime || f.holdMicUntilFirstTurn || f.v1alpha || f.v1beta));
   }
-  /** The variant sweep order for this session's flags. */
+  /**
+   * The variant sweep order for this session's flags.
+   *
+   * v5.34.26: v1alpha FIRST by default. Four production traces on v1beta show
+   * the same thing: the token-pinned session reaches setupComplete and answers a
+   * text turn, then treats 15-24 s of speech-level realtime audio as nothing and
+   * emits no transcription of its own speech. Google's SDK routes every
+   * ephemeral-token session to v1alpha and warns token support is v1alpha-only;
+   * the token is minted at /v1alpha/auth_tokens. v1beta was chosen in 5.34.14
+   * purely because it connected first. If v1alpha fails to connect, the sweep
+   * continues to v1beta exactly as before, at the cost of one attempt.
+   */
   function variantOrder(flags) {
-    if (!flags || !flags.v1alpha) return WS_VARIANTS;
+    var preferAlpha = !(flags && flags.v1beta);
     var a = [], b = [];
     for (var i = 0; i < WS_VARIANTS.length; i++) (WS_VARIANTS[i].v === 'v1alpha' ? a : b).push(WS_VARIANTS[i]);
-    return a.concat(b);
+    return preferAlpha ? a.concat(b) : b.concat(a);
   }
   window.vyneLiveFlags = function (set) {
     try {
@@ -967,7 +981,16 @@
       self.grant = grant;
       vlog('grant minted', { model: grant.model, voice: grant.voice, pinned: grant.pinned,
                              thinkingBudget: grant.thinkingBudget, pinnedExtras: grant.pinnedExtras,
-                             maxSeconds: grant.maxSeconds, sessionId: grant.sessionId });
+                             maxSeconds: grant.maxSeconds, sessionId: grant.sessionId,
+                             frontend: window.VYNE_VERSION || '?' });
+      // v5.34.26: a frontend deployed without its API is a silent half-build.
+      // The 5.34.24+ route always returns pinnedExtras; its absence means the
+      // API service is still on an older build and NONE of the token-side
+      // changes (transcription pin, manual VAD, thinking budget) are in effect.
+      if (grant.pinnedExtras === undefined) {
+        vlog('!!! API BUILD MISMATCH — the API service is older than 5.34.24: no pinnedExtras in the grant. Redeploy the API (deploy.sh api).');
+        if (self.opts.onApiMismatch) { try { self.opts.onApiMismatch(); } catch (e) {} }
+      }
       return self._openAudio();
     }).then(function () {
       // The token's shape decides the endpoint, but the mint fallback means we
@@ -1391,6 +1414,27 @@
         // when it rejects a session after the handshake. Without them this
         // failure is completely opaque, which is exactly how it presented.
         var why = 'code ' + ev.code + (ev.reason ? ' — ' + ev.reason : '');
+        /*
+         * v5.34.27: THE line. Five production traces of "the model ignores me"
+         * finally produced this close, twice in eight seconds:
+         *   1007 — The audio content type (CONTENT_TYPE_AUDIO) is not supported
+         *          for this model configuration.
+         * It arrives right after the model's thinking frames for a reply to a
+         * turn that contained the interviewee's AUDIO — i.e. Google HEARD the
+         * audio (the thinking quotes it) and then refused to generate against
+         * it. That is a server-side rejection of this model/config, not a
+         * client fault. Named here so it can never again be read as silence.
+         */
+        var audioRejected = ev.code === 1007 && /CONTENT_TYPE_AUDIO|audio content type/i.test(String(ev.reason || ''));
+        if (audioRejected) {
+          vlog('!!! GOOGLE REJECTED AN AUDIO TURN — 1007 CONTENT_TYPE_AUDIO. The server heard the interviewee and refused to generate a reply for this model configuration', {
+            model: self.grant && self.grant.model, variant: variantLabel(variant), pinned: !!(self.grant && self.grant.pinned),
+            thinkingBudget: self.grant && self.grant.thinkingBudget, pinnedExtras: self.grant && self.grant.pinnedExtras,
+            secondsSinceOpen: self.startedAt ? Math.round((Date.now() - self.startedAt) / 1000) : 0
+          });
+          self.audioRejected = true;
+          if (self.opts.onAudioRejected) { try { self.opts.onAudioRejected(ev.reason); } catch (e) {} }
+        }
         if (self.opts.onClose) { try { self.opts.onClose(ev.code, ev.reason, sawSetup); } catch (e) {} }
         if (!settled) {
           settled = true;
