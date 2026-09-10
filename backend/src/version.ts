@@ -21,4 +21,4 @@
  * fails if the two ever drift apart, so forgetting one is caught by the
  * same test run that gates every other release.
  */
-export const VERSION = "5.34.28";
+export const VERSION = "5.34.29";

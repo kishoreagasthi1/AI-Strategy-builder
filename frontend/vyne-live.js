@@ -1,5 +1,5 @@
 /**
- * vyne-live.js — realtime duplex voice for the Interview Agent (v5.34.29).
+ * vyne-live.js — realtime duplex voice for the Interview Agent (v5.34.30).
  *
  * Loaded alongside vyne-client.js. Exposes window.vyneLive.
  *
@@ -904,10 +904,21 @@
     }
     // Per-turn state for the UI: thinking → speaking → idle. Session-level
     // _gotAgentFrame stays as it is (the opening retry depends on it).
+    if (f.modelText && !this._turnAudio && !this._turnThinkingAt) this._turnThinkingAt = now;
     if (f.modelText && !this._turnAudio && this._turnState !== 'thinking') this._setTurnState('thinking');
     if (f.audio.length && !this._turnAudio) {
       this._turnAudio = true;
       this._turnFirstAudioAt = now;
+      // v5.34.30: one line per reply, readable at a glance across a whole
+      // interview: is the gap between "you stopped" and "he started" growing?
+      this._replyNo = (this._replyNo || 0) + 1;
+      vlog('REPLY #' + this._replyNo + ' audio begins', {
+        msSinceUtteranceEnd: this._micLastLoudAt ? now - this._micLastLoudAt : null,
+        msSinceSessionStart: this.startedAt ? now - this.startedAt : null,
+        thinkingMs: this._turnThinkingAt ? now - this._turnThinkingAt : 0,
+        resumptionUpdates: this._resumptionUpdates || 0
+      });
+      this._turnThinkingAt = 0;
       if (this._replyTurnNo && this._userTurnStartedAt && !this._loggedTurnAudio) {
         vlog('reply FIRST AUDIO for user turn #' + this._replyTurnNo, { msAfterUserTurn: now - this._userTurnStartedAt });
       }
@@ -991,7 +1002,12 @@
       // API service is still on an older build and NONE of the token-side
       // changes (transcription pin, manual VAD, thinking budget) are in effect.
       if (grant.pinnedExtras === undefined) {
-        vlog('!!! API BUILD MISMATCH — the API service is older than 5.34.24: no pinnedExtras in the grant. Redeploy the API (deploy.sh api).');
+        // v5.34.30: name the service that minted it. Voice can route to the
+        // optional vyne-llm service (window.VYNE_LLM_BASE); `deploy.sh api`
+        // does not touch that one — it needs `deploy.sh llm`.
+        var mintBase = (window.vyneLlmBase ? window.vyneLlmBase() : '') || (window.location && window.location.origin) || '(same-origin)';
+        vlog('!!! API BUILD MISMATCH — the service that minted this grant is older than 5.34.24 (no pinnedExtras). ' +
+             'Minted by: ' + mintBase + (window.VYNE_LLM_BASE ? ' (window.VYNE_LLM_BASE is set → this is the vyne-llm service: deploy with `deploy.sh llm`)' : ' (same origin → vyne-api: deploy with `deploy.sh api`)'));
         if (self.opts.onApiMismatch) { try { self.opts.onApiMismatch(); } catch (e) {} }
       }
       return self._openAudio();
@@ -1315,6 +1331,7 @@
          */
         if (msg && msg.sessionResumptionUpdate) {
           var u = msg.sessionResumptionUpdate;
+          self._resumptionUpdates = (self._resumptionUpdates || 0) + 1;
           if (u.resumable && u.newHandle) { self.resumeHandle = String(u.newHandle); self._resumeHandleAt = Date.now(); }
           if (self.opts.onResumeHandle) { try { self.opts.onResumeHandle(self.resumeHandle || null); } catch (e) {} }
         }
