@@ -1,5 +1,5 @@
 /**
- * vyne-live.js — realtime duplex voice for the Interview Agent (v5.34.28).
+ * vyne-live.js — realtime duplex voice for the Interview Agent (v5.34.29).
  *
  * Loaded alongside vyne-client.js. Exposes window.vyneLive.
  *
@@ -578,7 +578,8 @@
       vlog('frame usageMetadata', { in: msg.usageMetadata.promptTokenCount, out: msg.usageMetadata.responseTokenCount });
       return;
     }
-    if (msg.goAway) { vlog('frame goAway (server is closing us)', msg.goAway); return; }
+    if (msg.goAway) { vlog('frame goAway (server will close this connection)', msg.goAway); return; }
+    if (msg.sessionResumptionUpdate) { vlog('frame sessionResumptionUpdate', { resumable: !!msg.sessionResumptionUpdate.resumable, hasHandle: !!msg.sessionResumptionUpdate.newHandle }); return; }
     vlog('frame OTHER keys=' + Object.keys(msg).join(','), snip(JSON.stringify(msg), 200));
   }
 
@@ -956,7 +957,9 @@
         interviewerName: self.opts.interviewerName || undefined,
         // v5.34.24: the server pins this into the token (the client's own
         // setup frame is not reliably honoured on the constrained endpoint).
-        manualVad: self.flags && self.flags.manualVad ? true : undefined
+        manualVad: self.flags && self.flags.manualVad ? true : undefined,
+        // v5.34.29: resume the previous connection's conversation (see onmessage).
+        resumeHandle: self.opts.resumeHandle || undefined
       })
     }).then(function (r) {
       if (!r.ok) {
@@ -1301,6 +1304,26 @@
         }
 
         if (self.opts.onFrame) { try { self.opts.onFrame(msg); } catch (e) {} }
+        /*
+         * v5.34.29: session continuity.
+         *  - sessionResumptionUpdate: keep the newest resumable handle; the
+         *    bridge presents it when it mints the NEXT grant, so a renewal
+         *    resumes this conversation instead of starting a blank one.
+         *  - goAway: the server is about to close this connection (~10-minute
+         *    lifetime). Tell the bridge, with timeLeft, so it can renew at a
+         *    turn boundary instead of mid-sentence when the socket is cut.
+         */
+        if (msg && msg.sessionResumptionUpdate) {
+          var u = msg.sessionResumptionUpdate;
+          if (u.resumable && u.newHandle) { self.resumeHandle = String(u.newHandle); self._resumeHandleAt = Date.now(); }
+          if (self.opts.onResumeHandle) { try { self.opts.onResumeHandle(self.resumeHandle || null); } catch (e) {} }
+        }
+        if (msg && msg.goAway) {
+          var tl = msg.goAway.timeLeft;
+          var ms = typeof tl === 'string' && /^\d+(\.\d+)?s$/.test(tl) ? Math.round(parseFloat(tl) * 1000) : null;
+          self.goAwayAt = Date.now();
+          if (self.opts.onGoAway) { try { self.opts.onGoAway(ms); } catch (e) {} }
+        }
         var f = parseServerFrame(msg);
         // v5.34.15: first real response cancels the opening warmup retry.
         if (!self._sawFirstResponse && (f.audio.length || f.agentText)) {
