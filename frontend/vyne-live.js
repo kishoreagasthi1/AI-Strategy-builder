@@ -1,5 +1,5 @@
 /**
- * vyne-live.js — realtime duplex voice for the Interview Agent (v5.34.30).
+ * vyne-live.js — realtime duplex voice for the Interview Agent (v5.34.31).
  *
  * Loaded alongside vyne-client.js. Exposes window.vyneLive.
  *
