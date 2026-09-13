@@ -9,7 +9,11 @@ import rateLimit from "@fastify/rate-limit";
 import type { AppConfig } from "./config.js";
 import type { TokenVerifier } from "./auth/verify.js";
 import { makeAuthHook } from "./auth/middleware.js";
-import { LlmGateway, type Meter, type LimitCheck } from "./llm/gateway.js";
+import { LlmGateway, redactProviderDetail, type Meter, type LimitCheck } from "./llm/gateway.js";
+import { makeByokResolver } from "./llm/byok/resolve.js";
+import { makeByokLiveResolver } from "./llm/byok/resolveLive.js";
+import { deactivateKey, recordResolveError, clearResolveError } from "./llm/byok/byokRepo.js";
+import { routingFor } from "./llm/byok/clientRouting.js";
 import type { ProviderAdapter } from "./llm/types.js";
 import { DEV_POLICY, PROD_POLICY } from "./llm/router.js";
 import { healthRoutes } from "./routes/health.js";
@@ -24,6 +28,7 @@ import { voiceRoutes } from "./routes/voice.js";
 import { syntheticRoutes } from "./routes/synthetic.js";
 import { scorecardRoutes } from "./routes/scorecard.js";
 import { billingRoutes } from "./routes/billing.js";
+import { byokRoutes, byokPublicRoutes } from "./routes/byok.js";
 import { auditRoutes } from "./routes/audit.js";
 import { subscriptionRoutes, stripeWebhookRoutes } from "./routes/subscriptions.js";
 import { solutionDesignRoutes } from "./routes/solutionDesign.js";
@@ -291,6 +296,67 @@ export async function buildServer(deps: BuildDeps): Promise<FastifyInstance> {
       );
       captureError(err, { where: "safeMeter", tenantId: event.tenantId, task: event.task });
     },
+    /*
+     * BYOK slice 2 (v5.34.59). Wired only when a GCP project is configured,
+     * because without one there is no Secret Manager to read a client's key
+     * from — and an unconfigured resolver that throws on every call would turn
+     * a feature nobody is using into a tax on every generation.
+     *
+     * The models match the platform adapters' so a client's own key produces
+     * the same deliverable the firm's would; only the payer changes.
+     */
+    byok: config.gcpProject
+      ? makeByokResolver({
+          secretStore: { projectId: config.gcpProject },
+          geminiModel: process.env.GEMINI_MODEL,
+          geminiModel2: process.env.GEMINI_MODEL_2,
+          anthropicModel: process.env.ANTHROPIC_MODEL,
+          /*
+           * Record it on the row, not only in the log (v5.34.61).
+           *
+           * On 2026-09-13 this exact callback fired for several minutes while
+           * the keys screen said "active" and every call was silently billed to
+           * the firm. A log line nobody watches is not a signal.
+           */
+          onResolveError: ({ tenantId, provider, clientName, clientNorm, reason, err }) => {
+            app.log.error({ err, provider, clientName },
+              "byok: a client key is on file but could not be used — falling back to the platform credential");
+            if (clientNorm && reason) void recordResolveError(tenantId, clientNorm, provider, reason);
+          },
+          onResolveOk: ({ tenantId, provider, clientNorm }) => {
+            void clearResolveError(tenantId, clientNorm, provider);
+          },
+        })
+      : undefined,
+    /*
+     * A client's stated preference (v5.34.63). Same condition as byok above is
+     * NOT applied: this needs no Secret Manager, only the database, so it works
+     * for a firm that has no BYOK clients at all — a client can prefer Claude
+     * while still running on the firm's own credentials.
+     */
+    clientRouting: async ({ tenantId, clientName }) => {
+      try {
+        return (await routingFor(tenantId, clientName))?.textVendor ?? null;
+      } catch (err) {
+        app.log.error({ err, clientName }, "client routing preference could not be read — using firm policy");
+        return null;
+      }
+    },
+    onByokRejected: ({ tenantId, clientName, provider, detail }) => {
+      /*
+       * Mark the key failed so the Owner's screen stops saying "active", and
+       * so the next call does not pay for another round trip to discover the
+       * same refusal. Deliberately not awaited — the request has already
+       * fallen back and must not wait on bookkeeping — so the rejection is
+       * logged whether or not the write lands.
+       */
+      app.log.warn({ clientName, provider, detail: redactProviderDetail(detail) },
+        "byok: a client's key was refused by its vendor — marking it failed");
+      void deactivateKey(tenantId, clientName, provider, "failed", undefined,
+                         "refused by the provider during a call")
+        .catch((err) => app.log.error({ err, clientName, provider },
+          "byok: could not mark the refused key failed"));
+    },
   });
 
   const stripe = deps.stripe ?? null;
@@ -332,6 +398,25 @@ export async function buildServer(deps: BuildDeps): Promise<FastifyInstance> {
       keyGenerator: (req) => req.ip,
     });
     await firmEmailLookupRoutes(firmLookupScope);
+  });
+  /*
+   * v5.34.55 — the client's half of BYOK. Public on purpose: the client's
+   * administrator has no account here, and requiring one to hand over their own
+   * credential would be absurd. The trust boundary is the token — 32 random
+   * bytes, stored only as a hash, single-use, expiring — not the auth hook.
+   * Rate-limited by IP because it is an unauthenticated endpoint that does
+   * real work (a provider probe and a Secret Manager write).
+   */
+  await app.register(async (byokScope) => {
+    await byokScope.register(rateLimit, {
+      max: 10,
+      timeWindow: "1 minute",
+      keyGenerator: (req) => req.ip,
+    });
+    await byokPublicRoutes(byokScope, {
+      secretStore: { projectId: config.gcpProject ?? "" },
+      appBaseUrl: config.appBaseUrl,
+    });
   });
   await configRoutes(
     app,
@@ -456,6 +541,36 @@ export async function buildServer(deps: BuildDeps): Promise<FastifyInstance> {
         // existing text + TTS path rather than erroring.
         config.geminiApiKey
           ? makeLiveSession({ apiKey: config.geminiApiKey, paidTier: config.geminiPaidTier })
+          : undefined,
+        /*
+         * BYOK for realtime voice (v5.34.59) — the expensive path, and the one
+         * clients actually ask about. Same condition as the gateway resolver:
+         * no GCP project, no Secret Manager, no client keys.
+         */
+        config.gcpProject
+          ? {
+              forClient: makeByokLiveResolver({
+                secretStore: { projectId: config.gcpProject },
+                onResolveError: ({ tenantId, clientName, clientNorm, reason, err }) => {
+                  app.log.error({ err, clientName },
+                    "byok(live): a client key is on file but could not be used — the firm's key will pay for this session");
+                  if (clientNorm && reason) {
+                    void recordResolveError(tenantId, clientNorm, "gemini-aistudio", reason);
+                  }
+                },
+                onResolveOk: ({ tenantId, clientNorm }) => {
+                  void clearResolveError(tenantId, clientNorm, "gemini-aistudio");
+                },
+              }),
+              onRejected: ({ tenantId, clientName, detail }) => {
+                app.log.warn({ clientName, detail: redactProviderDetail(detail) },
+                  "byok(live): a client's key was refused by Google — marking it failed");
+                void deactivateKey(tenantId, clientName, "gemini-aistudio", "failed", undefined,
+                                   "refused by Google when minting a live session")
+                  .catch((err) => app.log.error({ err, clientName },
+                    "byok(live): could not mark the refused key failed"));
+              },
+            }
           : undefined
       );
     });
@@ -471,6 +586,10 @@ export async function buildServer(deps: BuildDeps): Promise<FastifyInstance> {
     await assignmentRoutes(protectedScope);
     await scorecardRoutes(protectedScope);
     await billingRoutes(protectedScope);
+    await byokRoutes(protectedScope, {
+      secretStore: { projectId: config.gcpProject ?? "" },
+      appBaseUrl: config.appBaseUrl,
+    });
     await auditRoutes(protectedScope);
     await subscriptionRoutes(protectedScope, { stripe, appBaseUrl: config.appBaseUrl });
   });

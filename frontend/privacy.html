@@ -129,13 +129,27 @@ enforced per tenant, so one firm's data is not queryable by another firm's appli
 event of an application-layer bug. Authentication is handled by Google Identity Platform, with a separate
 isolated user pool per tenant firm.</p>
 
-<h2>6. Data Retention</h2>
-<p>We retain Customer Data for as long as Customer maintains an active account, plus a limited period after
-termination to allow export (see the DPA). <span class="placeholder">[Vynora has not yet finalized an
-automatic deletion schedule for terminated tenants — this section needs a concrete retention/deletion
-commitment before publishing, e.g. "deleted within 30 days of termination unless a longer period is required
-by law."]</span> Audit logs are retained for security and compliance purposes for
-<span class="placeholder">[X months/years]</span>.</p>
+<h2>6. Data Retention and Deletion</h2>
+<p>We retain Customer Data for as long as Customer maintains an active account. <strong>The retention period
+after termination, and the retention period for audit logs, are agreed with each Customer and recorded in
+that Customer's Data Processing Agreement or Order Form</strong>, because different organizations operate
+under different regulatory and internal requirements. Where no period has been agreed, Customer Data is
+retained after termination only for as long as needed to allow Customer to export it, and audit logs are
+retained for the period stated in the DPA.
+<span class="placeholder">[Default periods pending legal review — confirm the fallback figures with
+counsel before relying on this paragraph in a signed agreement.]</span></p>
+
+<p>Deletion within an active account is immediate and permanent, not a flag. When a Customer deletes an
+interview, the interview record, the interviewee's saved session data, and the stored transcript — the
+verbatim conversation and any findings derived from it — are all removed from the live database in a single
+transaction. Where that interview was the interviewee's only one, their membership of the Customer's
+workspace and their authentication account are deleted with it.</p>
+
+<p>We keep a record <em>that</em> a deletion occurred — who performed it, for which client engagement and
+which interviewee, and when — in the audit log described in section 8. That record contains no part of the
+deleted conversation. Deletions are not reversible by us, and deleted content is not recoverable from the
+live system once the transaction has completed; backups are retained for the disaster-recovery period stated
+in the DPA and age out on their own schedule.</p>
 
 <h2>7. Your Rights</h2>
 <p>Depending on your jurisdiction, you may have rights to access, correct, delete, or export personal data

@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Provide your API key</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet"/>
+<!--
+  v5.34.55 — the page a CLIENT's administrator opens.
+
+  Deliberately standalone: no vyne-client.js, no auth, no session. The person
+  using this has no account here and should never need one to hand over their
+  own credential. The only thing that authorises them is the token in the URL.
+
+  The key is posted straight to the backend and is never rendered back, never
+  stored in this page, and never reaches the consulting firm — they see the
+  last four characters and whether it works.
+-->
+<style>
+:root{
+  --navy:#01203D;--ink:#132433;--paper:#F3F1EB;--panel:#FFFFFF;--panel-raised:#FAF8F3;
+  --line:#E8E3D8;--quiet:#6C7783;--gold:#A88553;--live:#2F7D4F;--live-bg:#E9F2EC;
+  --warn:#A9761C;--warn-bg:#F8EFDC;--danger:#B0324B;--danger-bg:#F7E7EB;
+  --r-sm:9px;--r-lg:14px;
+  --shadow:0 1px 2px rgba(16,33,47,.05),0 10px 30px rgba(16,33,47,.06);
+}
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:var(--paper);color:var(--ink);font-family:'Inter',system-ui,sans-serif;font-size:15px;line-height:1.6;-webkit-font-smoothing:antialiased}
+.wrap{max-width:620px;margin:0 auto;padding:48px 20px 80px}
+h1{font-family:'Space Grotesk','Inter',sans-serif;font-size:24px;margin-bottom:6px}
+.sub{font-size:13px;color:var(--quiet);margin-bottom:26px}
+.panel{background:var(--panel-raised);border:1px solid var(--line);border-radius:var(--r-lg);box-shadow:var(--shadow);padding:26px;margin-bottom:18px}
+label{display:block;font-size:12px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--gold);margin-bottom:7px}
+input[type=text],input[type=email],input[type=password]{background:rgba(1,32,61,.05);border:1px solid rgba(1,32,61,.15);border-radius:8px;padding:12px 14px;font-family:'Inter',sans-serif;font-size:15px;width:100%;outline:none}
+input:focus{border-color:#7A5C1E}
+.field{margin-bottom:20px}
+.hint{font-size:12.5px;color:var(--quiet);margin-top:6px}
+.attest{display:flex;gap:11px;align-items:flex-start;background:var(--warn-bg);border:1px solid rgba(169,118,28,.3);border-radius:var(--r-sm);padding:15px;font-size:13px;line-height:1.55}
+.attest input{margin-top:3px;width:17px;height:17px;flex:0 0 auto}
+button{background:var(--navy);color:#fff;border:0;border-radius:var(--r-sm);padding:13px 22px;font-family:'Inter',sans-serif;font-size:15px;font-weight:600;cursor:pointer;width:100%;margin-top:20px}
+button:disabled{opacity:.45;cursor:not-allowed}
+.note{font-size:12.5px;color:var(--quiet);margin-top:18px;padding-top:16px;border-top:1px solid var(--line)}
+.msg{border-radius:var(--r-sm);padding:15px;font-size:14px;margin-bottom:18px;display:none}
+.msg.err{background:var(--danger-bg);border:1px solid rgba(176,50,75,.3);color:#7C2334;display:block}
+.msg.ok{background:var(--live-bg);border:1px solid rgba(47,125,79,.3);color:#1E5A38;display:block}
+ol{margin:10px 0 0 20px;font-size:13.5px;color:var(--quiet)}
+ol li{margin-bottom:5px}
+code{background:rgba(1,32,61,.06);padding:1px 5px;border-radius:4px;font-size:12.5px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div id="loading" class="panel">Checking this link…</div>
+
+  <div id="dead" class="panel" style="display:none">
+    <h1>This link is no longer valid</h1>
+    <p class="sub" style="margin-bottom:0">It may have expired, or already been used. Links are
+    single-use and last 72 hours. Ask your contact to send a new one.</p>
+  </div>
+
+  <div id="done" class="panel" style="display:none">
+    <h1>Thank you — that's done</h1>
+    <p class="sub" style="margin-bottom:0">Your key has been stored securely. Work for
+    <strong id="done-client"></strong> will now run on your own account and be billed to you
+    directly. You can close this page.</p>
+  </div>
+
+  <form id="form" style="display:none" onsubmit="return submitKey(event)">
+    <h1>Provide your <span id="vendor">API</span> key</h1>
+    <p class="sub">for <strong id="client"></strong></p>
+
+    <div id="msg" class="msg"></div>
+
+    <div class="panel">
+      <div class="field">
+        <label for="key">API key</label>
+        <input type="password" id="key" autocomplete="off" spellcheck="false"
+               placeholder="Paste the key here"/>
+        <div class="hint" id="keyhint"></div>
+      </div>
+
+      <div class="field">
+        <label for="email">Your email</label>
+        <input type="email" id="email" autocomplete="off" placeholder="you@yourcompany.com"/>
+        <div class="hint">Recorded against the confirmation below, so there is a record of who
+        provided this key and when.</div>
+      </div>
+
+      <div class="attest">
+        <input type="checkbox" id="attest" onchange="sync()"/>
+        <label for="attest" style="text-transform:none;letter-spacing:0;font-weight:400;color:var(--ink);font-size:13px;margin:0;cursor:pointer">
+          <span id="attest-text"></span>
+        </label>
+      </div>
+
+      <button type="submit" id="go" disabled>Provide key</button>
+
+      <div class="note">
+        Your key is sent directly to the application and stored in Google Secret Manager. It is
+        never emailed, never shown to your consulting team, and never displayed again — they will
+        see only the last four characters and whether it works.
+      </div>
+    </div>
+  </form>
+</div>
+
+<script>
+var API_BASE = window.VYNE_API_BASE || "";
+var TOKEN = new URLSearchParams(location.search).get("t") || "";
+var PROVIDER = "";
+
+function $(id){ return document.getElementById(id); }
+function esc(s){ return String(s == null ? "" : s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
+
+function show(which){
+  ["loading","dead","done","form"].forEach(function(id){
+    $(id).style.display = id === which ? (id === "form" ? "block" : "block") : "none";
+  });
+}
+
+function sync(){
+  var ready = $("key").value.trim().length > 7 &&
+              /.+@.+\..+/.test($("email").value.trim()) &&
+              $("attest").checked;
+  $("go").disabled = !ready;
+}
+
+function fail(text){
+  var m = $("msg");
+  m.className = "msg err";
+  m.textContent = text;
+}
+
+async function load(){
+  if (!TOKEN) { show("dead"); return; }
+  try {
+    var r = await fetch(API_BASE + "/api/byok/redeem/" + encodeURIComponent(TOKEN));
+    if (!r.ok) { show("dead"); return; }
+    var d = await r.json();
+    PROVIDER = d.provider;
+    $("client").textContent = d.clientName;
+    $("done-client").textContent = d.clientName;
+    $("vendor").textContent = d.provider === "anthropic-api" ? "Anthropic" : "Google AI";
+    $("attest-text").textContent = d.attestationText;
+    $("keyhint").innerHTML = d.provider === "anthropic-api"
+      ? "From <code>console.anthropic.com</code> → API keys."
+      : "From <code>aistudio.google.com/apikey</code>, created in a project with billing enabled.";
+    document.title = "Provide your API key — " + d.clientName;
+    show("form");
+    ["key","email"].forEach(function(id){ $(id).addEventListener("input", sync); });
+  } catch (e) {
+    show("dead");
+  }
+}
+
+async function submitKey(ev){
+  ev.preventDefault();
+  $("go").disabled = true;
+  $("go").textContent = "Checking the key…";
+  $("msg").className = "msg";
+  try {
+    var r = await fetch(API_BASE + "/api/byok/redeem/" + encodeURIComponent(TOKEN), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        apiKey: $("key").value.trim(),
+        attestedByEmail: $("email").value.trim(),
+        paidTierAttested: true
+      })
+    });
+    var d = await r.json().catch(function(){ return {}; });
+    if (r.ok) {
+      // Clear it from the DOM the moment it is no longer needed.
+      $("key").value = "";
+      show("done");
+      return false;
+    }
+    if (d.error === "key_unusable") {
+      fail(d.detail || "That key did not work. Please check it and try again.");
+    } else if (r.status === 404) {
+      show("dead");
+      return false;
+    } else {
+      fail("Something went wrong (" + r.status + "). Please try again, or contact your VYNE team.");
+    }
+  } catch (e) {
+    fail("Could not reach the server. Please check your connection and try again.");
+  }
+  $("go").textContent = "Provide key";
+  sync();
+  return false;
+}
+
+load();
+</script>
+</body>
+</html>

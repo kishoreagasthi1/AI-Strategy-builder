@@ -84,7 +84,14 @@ describe("buildBillingStatement", () => {
 
   it("returns zeroed totals for no events", () => {
     const out = buildBillingStatement([]);
-    expect(out).toEqual({ lineItems: [], callCount: 0, totalTokensIn: 0, totalTokensOut: 0, totalCostUsd: 0 });
+    // clientPaidUsd joined the shape in v5.34.59 (BYOK slice 2): the amount a
+    // client already paid on their own key, kept out of totalCostUsd so it can
+    // never reach an invoice. Zero here, and zero for every firm with no BYOK
+    // clients — see byokBilling.test.ts for the split itself.
+    expect(out).toEqual({
+      lineItems: [], callCount: 0, totalTokensIn: 0, totalTokensOut: 0,
+      totalCostUsd: 0, clientPaidUsd: 0,
+    });
   });
 });
 

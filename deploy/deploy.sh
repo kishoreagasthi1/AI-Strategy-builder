@@ -144,6 +144,33 @@ create_service_account() {
   # or RCE in the API inherits access to that one string and nothing else.
   gcloud secrets add-iam-policy-binding vyne-database-url \
     --member="serviceAccount:$SA" --role="roles/secretmanager.secretAccessor"
+
+  # ── BYOK: the service stores CLIENTS' own API keys (v5.34.60) ──────────────
+  #
+  # Found in production on 2026-09-13, by the first client who ever actually
+  # supplied a key: redemption returned a bare 500. The grant above is bound to
+  # ONE secret (vyne-database-url), deliberately — but BYOK creates a NEW secret
+  # per (tenant, client, provider) and adds a version on every rotation, and
+  # nothing here ever granted that. Slice 1 shipped a write path with no write
+  # permission. No test caught it because they all stub Secret Manager, and no
+  # key had ever been redeemed successfully.
+  #
+  # A CUSTOM role rather than roles/secretmanager.admin: admin over the whole
+  # project would let an SSRF or RCE in the API read and destroy the database
+  # owner password sitting three secrets away. These four permissions are
+  # exactly what llm/byok/secretStore.ts calls and nothing else — create a
+  # secret, add a version, read a version back, disable one when a client's key
+  # is turned off.
+  #
+  # Project-scoped because the secret names are derived at runtime from the
+  # tenant and client, so there is no resource to bind to until it exists.
+  gcloud iam roles create vyneByokWriter --project="$PROJECT_ID" \
+    --title="VYNE BYOK secret writer" \
+    --description="Create/rotate/read/disable client-supplied API keys. Not admin: no delete, no destroy." \
+    --permissions=secretmanager.secrets.create,secretmanager.versions.add,secretmanager.versions.access,secretmanager.versions.disable \
+    2>/dev/null || echo ">> (vyneByokWriter role already exists — leaving it as is)"
+  gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+    --member="serviceAccount:$SA" --role="projects/${PROJECT_ID}/roles/vyneByokWriter"
 }
 
 # ── 4. ONE-TIME: Identity Platform ───────────────────────────────────────────
@@ -189,7 +216,11 @@ _extra_env() {
            REQUIRE_MFA REQUIRE_VERIFIED_EMAIL SENTRY_DSN \
            STRIPE_SECRET_KEY STRIPE_WEBHOOK_SECRET STRIPE_ENFORCE_PAYWALL \
            GEMINI_API_KEY GEMINI_PAID_TIER GEMINI_PAID \
-           GEMINI_LIVE_MODEL GEMINI_LIVE_VOICE; do
+           GEMINI_LIVE_MODEL GEMINI_LIVE_VOICE GEMINI_LIVE_THINKING_BUDGET \
+           GEMINI_LIVE_VAD_END_SENSITIVITY GEMINI_LIVE_VAD_START_SENSITIVITY \
+           GEMINI_LIVE_VAD_SILENCE_MS GEMINI_LIVE_VAD_PREFIX_MS \
+           GEMINI_LIVE_COMPRESS GEMINI_LIVE_COMPRESS_TRIGGER_TOKENS GEMINI_LIVE_COMPRESS_TARGET_TOKENS \
+           GEMINI_LIVE_RESUMPTION VYNE_LIVE_DEFAULT_SECONDS; do
     if [ -n "${!v:-}" ]; then out="${out},${v}=${!v}"; fi
   done
   printf '%s' "$out"
@@ -250,6 +281,9 @@ run_tests() {
     return 0
   fi
   echo ">> Release gate: running the backend test suite (npx vitest run) ..."
+  echo ">>   note: the browser suite SKIPS here unless Chromium is installed."
+  echo ">>   For the full gate — unit + Postgres + browser — run:"
+  echo ">>     bash deploy/run-ui-tests.sh"
   echo "   This is what catches source/test drift before it ships."
   ( cd "$(dirname "$0")/../backend" && npx vitest run )
   _TESTS_RAN=1
@@ -407,8 +441,9 @@ case "${1:-}" in
   all)       deploy_all ;;
   test)      : ;;  # handled by the pure-local short-circuit at the top (pre-gcloud)
   itest)     : ;;  # handled by the pure-local short-circuit at the top (pre-gcloud)
+  uitest)    exec bash "$(dirname "$0")/run-ui-tests.sh" all ;;
   sync-version) sync_version ;;
   verify)    verify_versions ;;
   rotate-db-password) rotate_app_password ;;
-  *) echo "usage: $0 {apis|sql|sa|secrets|api|llm|migrate|frontend|all|test|itest|sync-version|verify|rotate-db-password}"; exit 1 ;;
+  *) echo "usage: $0 {apis|sql|sa|secrets|api|llm|migrate|frontend|all|test|itest|uitest|sync-version|verify|rotate-db-password}"; exit 1 ;;
 esac

@@ -11,6 +11,14 @@
  */
 import type { GenerateRequest, GenerateResult, ProviderAdapter } from "./types.js";
 import { chainForTask, type RoutingPolicy } from "./router.js";
+import {
+  applyByokToChain,
+  isCredentialRejection,
+  type ByokCallContext,
+  type ResolvedByok,
+} from "./byok/resolve.js";
+import { applyClientVendorPreference } from "./byok/clientRouting.js";
+import type { ByokProvider } from "./byok/byokRepo.js";
 
 export interface MeterEvent {
   tenantId: string;
@@ -34,7 +42,26 @@ export interface MeterEvent {
    * behind it is partial. See migration 015 for what its absence permitted.
    */
   sessionId?: string;
+  /**
+   * WHO PAID for this call (v5.34.59, BYOK slice 2).
+   *
+   *   "platform"   — the firm's own credential. The cost is recoverable and
+   *                  belongs on the invoice the firm sends this client.
+   *   "client_key" — the client's own credential. Google or Anthropic billed
+   *                  them DIRECTLY. The row is still written, because the firm
+   *                  needs to see the volume and because a plan cap must count
+   *                  the work — but putting it on the invoice would charge the
+   *                  client a second time for something they have already paid.
+   *
+   * Absent means "platform": every row written before this field existed, and
+   * every path that never had a client credential to begin with.
+   */
+  payer?: Payer;
+  /** Last four characters of the client key that served it. Never the key. */
+  payerKeyHint?: string;
 }
+
+export type Payer = "platform" | "client_key";
 
 export type Meter = (event: MeterEvent) => Promise<void>;
 /**
@@ -76,6 +103,44 @@ export interface GatewayOptions {
    * transport concerns and so a test can assert the call was made.
    */
   onMeterError?: (err: unknown, event: MeterEvent) => void;
+  /**
+   * Resolve the CLIENT's own credentials for this call (v5.34.59, BYOK slice 2).
+   *
+   * Injected rather than imported so the gateway keeps knowing nothing about
+   * Secret Manager or the database, and so a test can hand it a fake without a
+   * network. Returns per-call adapters; see llm/byok/resolve.ts for why they
+   * must be per-call and never cached.
+   *
+   * Absent (every test that predates this, and any deployment without a GCP
+   * project) means the gateway behaves exactly as it did before: one chain, the
+   * platform's credentials, payer "platform".
+   */
+  byok?: (ctx: ByokCallContext) => Promise<ResolvedByok>;
+  /**
+   * A client's key was REFUSED by its vendor — wrong, revoked, or its project
+   * lost access. Called once per failed provider per call; the implementation
+   * is expected to mark the key failed so the Owner's screen stops claiming it
+   * is active. Never awaited into the request path: the call already fell back
+   * to the platform credential and must not also wait on a bookkeeping write.
+   */
+  onByokRejected?: (info: {
+    tenantId: string;
+    clientName: string;
+    provider: ByokProvider;
+    adapter: string;
+    detail: string;
+  }) => void;
+  /**
+   * The CLIENT's stated model preference, where they have one (v5.34.63).
+   *
+   * Applied to the chain BEFORE the BYOK substitution, and strictly as a
+   * reorder: see llm/byok/clientRouting.ts for why a preference may move
+   * vendors around inside the firm's policy but may never step outside it.
+   *
+   * Absent, or resolving to null, means the firm's policy stands — which is
+   * every client who has not asked for anything, i.e. almost all of them.
+   */
+  clientRouting?: (ctx: ByokCallContext) => Promise<ByokProvider | null>;
 }
 
 /** Capacity blips worth retrying: rate limits and "high demand" 503s. */
@@ -90,6 +155,10 @@ export interface GatewayCallContext {
   /** Client cost-recovery billing (v5.27) — see MeterEvent.clientName. */
   clientName?: string;
 }
+
+/** Shared empty maps — read-only by construction, so sharing them is safe. */
+const EMPTY_ADAPTERS: ResolvedByok["adapters"] = new Map();
+const EMPTY_BACKING: ResolvedByok["backing"] = new Map();
 
 export class LlmGateway {
   private byName = new Map<string, ProviderAdapter>();
@@ -134,9 +203,65 @@ export class LlmGateway {
   async generate(ctx: GatewayCallContext, req: GenerateRequest): Promise<GenerateResult> {
     await this.checkLimit(ctx.tenantId, ctx.userId);
 
-    const chain = chainForTask(this.opts.policy, req.task, {
-      defaultChain: this.opts.defaultChainOverride,
-    });
+    /*
+     * The client's own credentials, for THIS call only (v5.34.59).
+     *
+     * `byokAdapters` is a LOCAL — a fresh Map built by the resolver on every
+     * call and dropped when this function returns. It is deliberately not
+     * merged into `this.byName`, and no adapter here is ever cached: a shared
+     * adapter object is how one client's key ends up serving another client's
+     * interview, which is the whole failure this feature exists to prevent.
+     * See llm/byok/resolve.ts.
+     *
+     * A resolver failure is not a call failure. Falling back to the platform
+     * credential costs the firm money; failing the request costs them an
+     * interview.
+     */
+    let byokAdapters: ResolvedByok["adapters"] = EMPTY_ADAPTERS;
+    let byokBacking: ResolvedByok["backing"] = EMPTY_BACKING;
+    if (this.opts.byok) {
+      try {
+        const resolved = await this.opts.byok({ tenantId: ctx.tenantId, clientName: ctx.clientName });
+        byokAdapters = resolved.adapters;
+        byokBacking = resolved.backing;
+      } catch {
+        // Deliberately swallowed — the resolver reports its own failures
+        // through onResolveError, and this path must degrade, not throw.
+      }
+    }
+
+    /*
+     * The chain is built in three steps, and the order of them is the design:
+     *
+     *   1. the FIRM's policy for this task            (chainForTask)
+     *   2. the CLIENT's preference, as a reorder      (applyClientVendorPreference)
+     *   3. the CLIENT's own credentials, interleaved  (applyByokToChain)
+     *
+     * Step 2 can only permute what step 1 produced, so a client can say which
+     * of the firm's allowed vendors they would rather have and can never reach
+     * one the firm excluded. Step 3 then puts their credential ahead of the
+     * firm's for the same vendor. Preference decides WHICH vendor among those
+     * allowed; the key decides WHO PAYS. Neither decides the other.
+     */
+    let preferred: ByokProvider | null = null;
+    if (this.opts.clientRouting) {
+      try {
+        preferred = await this.opts.clientRouting({ tenantId: ctx.tenantId, clientName: ctx.clientName });
+      } catch {
+        // A preference lookup failing must not fail the call; the firm's
+        // policy is the correct thing to fall back to.
+      }
+    }
+
+    const baseChain = applyClientVendorPreference(
+      chainForTask(this.opts.policy, req.task, { defaultChain: this.opts.defaultChainOverride }),
+      preferred
+    );
+    const chain = byokAdapters.size
+      ? applyByokToChain(baseChain, new Set(byokAdapters.keys()))
+      : baseChain;
+    /** Providers whose credential the vendor has just refused — see below. */
+    const rejectedProviders = new Set<ByokProvider>();
     const now = this.opts.now ?? Date.now;
     const sleep = this.opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
     const maxAttempts = 1 + (this.opts.transientRetries ?? 1);
@@ -144,7 +269,22 @@ export class LlmGateway {
     let sawTransient = false;
 
     for (const name of chain) {
-      const adapter = this.byName.get(name);
+      /*
+       * The client's adapter wins over the platform singleton of the same name.
+       * `binding` is non-null exactly when this attempt spends the CLIENT's
+       * credential, which is what makes the payer on the metering row below a
+       * fact about this attempt rather than a guess about the chain.
+       */
+      const binding = byokBacking.get(name);
+      const adapter = byokAdapters.get(name) ?? this.byName.get(name);
+      const payer: Payer = binding ? "client_key" : "platform";
+      if (binding && rejectedProviders.has(binding.provider)) {
+        // The same credential was refused moments ago by a sibling adapter
+        // (gemini-aistudio-2 is the same key on a second model). Retrying it
+        // buys a second 403 and a second second of the caller's time.
+        errors.push(`${name}: client key already refused by ${binding.provider}`);
+        continue;
+      }
       if (!adapter) {
         errors.push(`${name}: unknown adapter`);
         continue;
@@ -176,6 +316,8 @@ export class LlmGateway {
             costEstUsd: out.usage.costEstUsd,
             latencyMs,
             ok: true,
+            payer,
+            payerKeyHint: binding?.keyHint || undefined,
           });
           return { ...out, provider: adapter.name, latencyMs };
         } catch (err) {
@@ -194,7 +336,32 @@ export class LlmGateway {
             costEstUsd: 0,
             latencyMs,
             ok: false,
+            payer,
+            payerKeyHint: binding?.keyHint || undefined,
           });
+          /*
+           * The client's key was REFUSED (not merely rate-limited). Report it
+           * so the Owner's screen stops saying "active", and stop trying this
+           * credential for the rest of the call. The request itself carries on
+           * down the chain to the platform credential — a lapsed client key
+           * must never be the reason an interview stops.
+           */
+          if (binding && isCredentialRejection(message)) {
+            rejectedProviders.add(binding.provider);
+            try {
+              this.opts.onByokRejected?.({
+                tenantId: ctx.tenantId,
+                clientName: binding.clientName,
+                provider: binding.provider,
+                adapter: name,
+                detail: message,
+              });
+            } catch {
+              // A bookkeeping reporter must not escalate into the call path.
+            }
+            errors.push(`${name}: client key refused (${binding.provider})`);
+            break; // next adapter — never retry a refused credential
+          }
           // Capacity blip (429/503): back off briefly and retry the SAME
           // adapter before falling through — free-tier "high demand" spikes
           // usually clear within a second or two.

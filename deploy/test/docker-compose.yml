@@ -1,0 +1,49 @@
+# Full regression: a real Postgres AND a real browser, in one command.
+#
+# Running both together is the point. The suite has three tiers and until now
+# only the first ran by default:
+#
+#   plain            ~1,100 tests, no dependencies
+#   RLS_TEST=1       ~200 more, need Postgres — row-level security, the
+#                    metering ledger, the BYOK schema constraints
+#   browser          the frontend, in Chromium
+#
+# A release gate that runs only the first tier is how a stranded <script> block
+# reaches a zip file.
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: vyne
+      POSTGRES_PASSWORD: vyne
+      POSTGRES_DB: vyne
+    # No published port: nothing outside this compose file should reach it, and
+    # binding 5432 on the host collides with a local Postgres more often than not.
+    # Creates the restricted vyne_app role BEFORE any migration runs. It used
+    # to be done by the test container with psql — which that image does not
+    # have, so it could never have worked. See initdb/01-app-role.sql.
+    volumes:
+      - ./initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vyne -d vyne"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  tests:
+    build:
+      context: ../..
+      dockerfile: deploy/test/Dockerfile
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      RLS_TEST: "1"
+      TEST_DATABASE_URL: postgres://vyne:vyne@db:5432/vyne
+      RLS_APP_URL: postgres://vyne_app:change-me-via-ops@db:5432/vyne
+      DATABASE_URL: postgres://vyne:vyne@db:5432/vyne
+    # No `command:` override. The Dockerfile's ENTRYPOINT is
+    # ["npx","vitest","run"], and a compose `command` is passed to an exec-form
+    # ENTRYPOINT as ARGUMENTS — so the previous shell one-liner would have run
+    # `npx vitest run sh -c "..."`, which is not a command anyone intended.
+    # The role it was creating now comes from the database's own init hook.

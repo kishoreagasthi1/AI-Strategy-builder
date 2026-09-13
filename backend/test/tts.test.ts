@@ -70,3 +70,106 @@ describe("TTS delivery (v5.32.33)", () => {
     expect(sent.trim().endsWith("We have three warehouses.")).toBe(true);
   });
 });
+
+describe("a model id that is not in this key's catalogue (v5.34.37)", () => {
+  /** ListModels shaped like the one that exposed this: no GA flash-tts. */
+  const CATALOGUE = {
+    models: [
+      { name: "models/gemini-2.5-flash", supportedGenerationMethods: ["generateContent"] },
+      { name: "models/gemini-2.5-flash-preview-tts", supportedGenerationMethods: ["generateContent"] },
+      { name: "models/gemini-2.5-pro-preview-tts", supportedGenerationMethods: ["generateContent"] },
+      { name: "models/gemini-3.1-flash-tts-preview", supportedGenerationMethods: ["generateContent"] },
+    ],
+  };
+  const audio = {
+    candidates: [{ content: { parts: [{ inlineData: { mimeType: "audio/L16;rate=24000", data: "AAAA" } }] } }],
+    usageMetadata: { promptTokenCount: 5, candidatesTokenCount: 7 },
+  };
+
+  it("recovers from a 404 by using a TTS model the key really has", async () => {
+    const calls: string[] = [];
+    const t = makeTts({
+      apiKey: "k",
+      fetchImpl: (async (url: string) => {
+        calls.push(String(url));
+        if (String(url).includes("/models?")) return { ok: true, status: 200, json: async () => CATALOGUE };
+        if (String(url).includes("gemini-2.5-flash-tts:")) {
+          return { ok: false, status: 404, text: async () => "not found for API version v1beta" };
+        }
+        return { ok: true, status: 200, json: async () => audio };
+      }) as any,
+    });
+
+    const r = await t.synthesize("hello");
+    // The audio came back, from a DIFFERENT model than the pinned default.
+    expect(r.mime).toBe("audio/wav");
+    expect(r.model).toBe("gemini-2.5-flash-preview-tts");
+    expect(t.effectiveModel()).toBe("gemini-2.5-flash-preview-tts");
+    // …and the sequence was: try the default, ask the catalogue, retry.
+    expect(calls.length).toBe(3);
+    expect(calls[0]).toContain("gemini-2.5-flash-tts:generateContent");
+    expect(calls[1]).toContain("/models?");
+    expect(calls[2]).toContain("gemini-2.5-flash-preview-tts:generateContent");
+  });
+
+  it("asks the catalogue ONCE — the second call goes straight to what worked", async () => {
+    let lists = 0;
+    const t = makeTts({
+      apiKey: "k",
+      fetchImpl: (async (url: string) => {
+        if (String(url).includes("/models?")) { lists++; return { ok: true, status: 200, json: async () => CATALOGUE }; }
+        if (String(url).includes("gemini-2.5-flash-tts:")) return { ok: false, status: 404, text: async () => "nope" };
+        return { ok: true, status: 200, json: async () => audio };
+      }) as any,
+    });
+    await t.synthesize("one");
+    await t.synthesize("two");
+    expect(lists).toBe(1);
+  });
+
+  it("a 404 with no usable TTS model in the catalogue still fails loudly", async () => {
+    const t = makeTts({
+      apiKey: "k",
+      fetchImpl: (async (url: string) => {
+        if (String(url).includes("/models?")) {
+          return { ok: true, status: 200, json: async () => ({ models: [{ name: "models/gemini-2.5-flash", supportedGenerationMethods: ["generateContent"] }] }) };
+        }
+        return { ok: false, status: 404, text: async () => "not found" };
+      }) as any,
+    });
+    await expect(t.synthesize("hello")).rejects.toThrow(/tts 404 \(gemini-2\.5-flash-tts\)/);
+  });
+
+  it("a non-404 failure is NOT treated as a wrong model name", async () => {
+    // A 429 or a 500 says nothing about the id; re-asking the catalogue would
+    // add a pointless round trip to every rate-limited call.
+    let lists = 0;
+    const t = makeTts({
+      apiKey: "k",
+      fetchImpl: (async (url: string) => {
+        if (String(url).includes("/models?")) { lists++; return { ok: true, status: 200, json: async () => CATALOGUE }; }
+        return { ok: false, status: 429, text: async () => "quota" };
+      }) as any,
+    });
+    await expect(t.synthesize("hello")).rejects.toThrow(/tts 429/);
+    expect(lists).toBe(0);
+  });
+
+  it("an explicit GEMINI_TTS_MODEL is used as-is, with no lookup", async () => {
+    const prev = process.env.GEMINI_TTS_MODEL;
+    process.env.GEMINI_TTS_MODEL = "gemini-3.1-flash-tts-preview";
+    try {
+      const calls: string[] = [];
+      const t = makeTts({
+        apiKey: "k",
+        fetchImpl: (async (url: string) => { calls.push(String(url)); return { ok: true, status: 200, json: async () => audio }; }) as any,
+      });
+      const r = await t.synthesize("hello");
+      expect(r.model).toBe("gemini-3.1-flash-tts-preview");
+      expect(calls.some((c) => c.includes("/models?"))).toBe(false);
+    } finally {
+      if (prev === undefined) delete process.env.GEMINI_TTS_MODEL;
+      else process.env.GEMINI_TTS_MODEL = prev;
+    }
+  });
+});

@@ -95,6 +95,7 @@ tr.unattributed td{color:var(--quiet-soft);font-style:italic}
 <div class="tabs">
   <div class="tab active" id="tab-btn-summary" onclick="switchTab('summary')">💳 Dashboard</div>
   <div class="tab" id="tab-btn-statement" onclick="switchTab('statement')">🧾 Statement / Export</div>
+  <div class="tab" id="tab-btn-keys" onclick="switchTab('keys')">🔑 Client API keys</div>
 </div>
 
 <div id="pane-summary">
@@ -137,6 +138,407 @@ tr.unattributed td{color:var(--quiet-soft);font-style:italic}
 
 </div><!-- /.page -->
 
+<div id="pane-keys" style="display:none">
+  <div class="panel">
+    <h2>Who pays for each client</h2>
+    <div class="hint" style="margin:0 0 16px">
+      By default every client's work runs on <strong>your</strong> API keys, is metered per client,
+      and appears on the statement you send them. A client can instead supply their own key — then
+      the charges land on their account directly and never touch your bill.
+      <br/><br/>
+      Keys are supplied by the client through a one-time link. You never see the key itself, only
+      the last four characters and whether it works — so nothing sensitive passes through your
+      inbox.
+    </div>
+    <div class="grid" style="grid-template-columns:2fr 1fr 1fr;margin-bottom:6px">
+      <input type="text" id="byok-client" placeholder="Client name (exactly as on the engagement)"/>
+      <select id="byok-provider">
+        <!--
+          v5.34.62. These labels used to read "Google AI — voice interviews"
+          and "Anthropic — decks & synthesis", which described a routing policy
+          this product does not have. Every task in PROD_POLICY — synthesis,
+          strategy decks, solution design, the Design Studio artifacts and all
+          ordinary text — tries Gemini FIRST, with Claude only as the fallback
+          when Gemini fails. So a client's Google key already pays for
+          essentially everything, and the screen was telling the Owner it paid
+          for voice alone.
+        -->
+        <option value="gemini-aistudio">Google AI (Gemini) — voice, synthesis, decks, documents</option>
+        <option value="anthropic-api">Anthropic (Claude) — fallback only, while Gemini leads every chain</option>
+      </select>
+      <button class="btn" onclick="makeInvite()">Create setup link</button>
+    </div>
+    <div id="byok-invite" style="display:none;margin-top:14px"></div>
+  </div>
+  <div class="panel">
+    <h2>Keys on file</h2>
+    <div id="byok-list"><div class="hint">Loading…</div></div>
+    <div id="byok-open-invites"></div>
+  </div>
+
+  <!--
+    v5.34.63 — a client's model preference, which is a different question from
+    whose key pays. Kept in its own panel for that reason: a client with no key
+    at all can still ask for Claude, and a client with a key has no obligation
+    to express a preference.
+  -->
+  <div class="panel">
+    <h2>Model preference by client</h2>
+    <p class="hint" style="margin-bottom:12px">
+      A client may ask for a particular model for their analysis, documents and decks.
+      This <strong>reorders the providers you already allow</strong> for those tasks — it cannot route their
+      work to a provider your policy excludes, and it never changes who pays. Voice interviews are not
+      listed because live audio runs on Gemini regardless; no other provider here supports it.
+    </p>
+    <div class="row" style="gap:10px;flex-wrap:wrap">
+      <input type="text" id="route-client" placeholder="Client name (exactly as on the engagement)"
+             style="flex:1;min-width:240px"/>
+      <select id="route-vendor">
+        <option value="gemini-aistudio">Prefer Google (Gemini)</option>
+        <option value="anthropic-api">Prefer Anthropic (Claude)</option>
+      </select>
+      <button class="btn" onclick="saveRouting()">Save preference</button>
+    </div>
+    <div id="route-msg" class="msg" style="margin-top:12px"></div>
+    <div id="route-list"></div>
+  </div>
+</div>
+
+<script>
+/* ── v5.34.55 — client-supplied API keys ──────────────────────────────────── */
+
+/**
+ * The Client API keys tab, all three panels.
+ *
+ * v5.34.63: this used to BE renderKeyList, and the two loaders below hung off
+ * the end of it — after an early `return` that fires when a firm has no keys on
+ * file. So the setup-links panel (v5.34.61) and the preference panel were
+ * invisible to precisely the firms that had not set a key up yet, which is the
+ * state everyone starts in. Caught by a browser test whose stub returned an
+ * empty key list; every earlier test had happened to seed one.
+ *
+ * They are independent panels and now load independently.
+ */
+async function loadKeys(){
+  await renderKeyList();
+  loadOpenInvites();
+  loadRouting();
+}
+
+async function renderKeyList(){
+  var box = document.getElementById("byok-list");
+  try{
+    var r = await fetch(API_BASE + "/api/byok/keys", { headers: hdrs() });
+    var d = await r.json();
+    if(!r.ok) throw new Error(d.error || ("HTTP " + r.status));
+    box.textContent = "";
+    if(!d.keys.length){
+      var empty = document.createElement("div");
+      empty.className = "hint";
+      empty.textContent = "No client is using their own key yet. Everything runs on your keys and goes on their statement.";
+      box.appendChild(empty);
+      return;
+    }
+    /*
+     * Built with DOM nodes rather than an innerHTML string, on purpose.
+     *
+     * The first version concatenated the client name into an inline onclick
+     * handler — a value from the database, inside a JS string, inside an HTML
+     * attribute, with three nested escaping contexts to get right. The repo's
+     * innerHTML ratchet (innerHtmlSinks.test.ts) caught it. textContent and a
+     * data attribute remove the class of bug rather than escaping around it.
+     */
+    var table = document.createElement("table");
+    var thead = document.createElement("thead");
+    var hrow = document.createElement("tr");
+    ["Client","Provider","Status","Key","Confirmed by",""].forEach(function(h){
+      var th = document.createElement("th"); th.textContent = h; hrow.appendChild(th);
+    });
+    thead.appendChild(hrow); table.appendChild(thead);
+
+    var tbody = document.createElement("tbody");
+    d.keys.forEach(function(k){
+      var live = k.status === "active";
+      var tr = document.createElement("tr");
+
+      function cell(text){ var td = document.createElement("td"); td.textContent = text; tr.appendChild(td); return td; }
+      cell(k.clientName);
+      cell(k.provider);
+
+      /*
+       * v5.34.61 — "active" now has to survive contact with reality.
+       *
+       * It used to mean only "a key was supplied and attested". On 2026-09-13
+       * this column read `active` for several minutes while every call for that
+       * client was silently falling back to the firm's own credentials, because
+       * the service account had lost permission to read the secret. Correct
+       * output, healthy-looking screen, and the cost quietly moved back onto
+       * the firm — which is precisely what BYOK exists to prevent.
+       *
+       * So a key that did not WORK on the last attempt says so here, in the
+       * column someone actually looks at, with the reason underneath.
+       */
+      var broken = live && k.lastError;
+      var st = cell(
+        broken ? "active — but not working"
+               : (live ? "active" : k.status + " — running on your key"));
+      st.style.color = broken ? "var(--danger)" : (live ? "var(--live)" : "var(--warn)");
+      if (broken) {
+        var why = document.createElement("div");
+        why.className = "hint";
+        why.style.marginTop = "3px";
+        why.textContent = k.lastError +
+          (k.lastErrorAt ? " (" + new Date(k.lastErrorAt).toLocaleString() + ")" : "") +
+          " — this client's work is running on your keys until it is fixed.";
+        st.appendChild(why);
+      }
+      st.style.fontWeight = "600";
+
+      cell(k.keyHint ? "\u2022\u2022\u2022\u2022" + k.keyHint : "\u2014");
+      cell(k.attestedByEmail || "\u2014");
+
+      var act = document.createElement("td");
+      if (live) {
+        var a = document.createElement("a");
+        a.href = "#";
+        a.textContent = "turn off";
+        a.dataset.client = k.clientName;      // never interpolated into markup
+        a.dataset.provider = k.provider;
+        a.addEventListener("click", function(ev){
+          ev.preventDefault();
+          disableKey(this.dataset.client, this.dataset.provider);
+        });
+        act.appendChild(a);
+      }
+      tr.appendChild(act);
+      tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+    box.appendChild(table);
+  }catch(e){
+    box.textContent = "";
+    var err = document.createElement("div");
+    err.className = "hint";
+    err.textContent = "Could not load: " + e.message;
+    box.appendChild(err);
+  }
+}
+
+/*
+ * Setup links that are still live. (v5.34.61)
+ *
+ * There was no way to SEE these, which is why there was no way to withdraw
+ * one: a link sent to the wrong address stayed usable for 72 hours and the
+ * Owner had nothing to act on. The link itself cannot be shown again — only
+ * the token's hash is stored, deliberately — so this lists what was issued,
+ * to whom, and until when, with a way to cancel it.
+ */
+async function loadOpenInvites(){
+  var box = document.getElementById("byok-open-invites");
+  if (!box) return;
+  box.textContent = "";
+  try{
+    var r = await fetch(API_BASE + "/api/byok/invites", { headers: hdrs() });
+    var d = await r.json();
+    if(!r.ok || !d.invites || !d.invites.length) return;
+
+    // <h2>, matching "Keys on file" above it — the page's own convention, and
+    // a class that actually exists in this stylesheet.
+    var h = document.createElement("h2");
+    h.style.marginTop = "26px";
+    h.textContent = "Setup links awaiting a key";
+    box.appendChild(h);
+
+    var note = document.createElement("div");
+    note.className = "hint";
+    note.style.marginBottom = "10px";
+    note.textContent = "Sent, not yet used. The link itself is never stored and cannot be shown again — "
+      + "cancel one and issue a new link if it went astray.";
+    box.appendChild(note);
+
+    var table = document.createElement("table");
+    var thead = document.createElement("thead");
+    var hrow = document.createElement("tr");
+    ["Client","Provider","Sent to","Expires",""].forEach(function(t){
+      var th = document.createElement("th"); th.textContent = t; hrow.appendChild(th);
+    });
+    thead.appendChild(hrow); table.appendChild(thead);
+
+    var tbody = document.createElement("tbody");
+    d.invites.forEach(function(iv){
+      var tr = document.createElement("tr");
+      function cell(text){ var td = document.createElement("td"); td.textContent = text; tr.appendChild(td); return td; }
+      cell(iv.clientName);
+      cell(iv.provider);
+      cell(iv.sentToEmail || "—");
+      cell(new Date(iv.expiresAt).toLocaleString());
+      var act = document.createElement("td");
+      var a = document.createElement("a");
+      a.href = "#";
+      a.textContent = "cancel";
+      a.dataset.id = iv.id;                    // never interpolated into markup
+      a.dataset.client = iv.clientName;
+      a.addEventListener("click", function(ev){
+        ev.preventDefault();
+        revokeInvite(this.dataset.id, this.dataset.client);
+      });
+      act.appendChild(a);
+      tr.appendChild(act);
+      tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+    box.appendChild(table);
+  }catch(e){ /* the keys list above is the page's job; this is supplementary */ }
+}
+
+/* ── v5.34.63 — a client's model preference ───────────────────────────────── */
+
+var VENDOR_LABEL = {
+  "gemini-aistudio": "Google (Gemini)",
+  "anthropic-api": "Anthropic (Claude)",
+};
+
+async function loadRouting(){
+  var box = document.getElementById("route-list");
+  if (!box) return;
+  box.textContent = "";
+  try{
+    var r = await fetch(API_BASE + "/api/client-routing", { headers: hdrs() });
+    var d = await r.json();
+    if(!r.ok) return;
+    if(!d.routing || !d.routing.length){
+      var none = document.createElement("div");
+      none.className = "hint";
+      none.textContent = "No client has asked for a particular model. Everyone follows your routing policy.";
+      box.appendChild(none);
+      return;
+    }
+    var table = document.createElement("table");
+    var thead = document.createElement("thead");
+    var hrow = document.createElement("tr");
+    ["Client","Prefers","Note","Set",""].forEach(function(t){
+      var th = document.createElement("th"); th.textContent = t; hrow.appendChild(th);
+    });
+    thead.appendChild(hrow); table.appendChild(thead);
+    var tbody = document.createElement("tbody");
+    d.routing.forEach(function(x){
+      var tr = document.createElement("tr");
+      function cell(text){ var td = document.createElement("td"); td.textContent = text; tr.appendChild(td); return td; }
+      cell(x.clientName);
+      cell(VENDOR_LABEL[x.textVendor] || x.textVendor);
+      cell(x.note || "—");
+      cell(x.updatedAt ? new Date(x.updatedAt).toLocaleDateString() : "—");
+      var act = document.createElement("td");
+      var a = document.createElement("a");
+      a.href = "#";
+      a.textContent = "remove";
+      a.dataset.client = x.clientName;     // never interpolated into markup
+      a.addEventListener("click", function(ev){
+        ev.preventDefault();
+        clearRouting(this.dataset.client);
+      });
+      act.appendChild(a);
+      tr.appendChild(act);
+      tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+    box.appendChild(table);
+  }catch(e){ /* supplementary to the keys list above */ }
+}
+
+async function saveRouting(){
+  var name = document.getElementById("route-client").value.trim();
+  var vendor = document.getElementById("route-vendor").value;
+  var msg = document.getElementById("route-msg");
+  if(!name){ msg.className = "msg err"; msg.textContent = "Enter the client name first."; return; }
+  try{
+    var r = await fetch(API_BASE + "/api/client-routing", {
+      method: "POST", headers: Object.assign({"content-type":"application/json"}, hdrs()),
+      body: JSON.stringify({ clientName: name, textVendor: vendor })
+    });
+    var d = await r.json().catch(function(){ return {}; });
+    if(!r.ok){ msg.className = "msg err"; msg.textContent = "Could not save: " + (d.error || r.status); return; }
+    msg.className = "msg ok";
+    msg.textContent = "Saved — " + name + " will prefer " + (VENDOR_LABEL[vendor] || vendor)
+      + " wherever your policy already allows it.";
+    document.getElementById("route-client").value = "";
+    loadRouting();
+  }catch(e){ msg.className = "msg err"; msg.textContent = "Could not save: " + e.message; }
+}
+
+async function clearRouting(clientName){
+  if(!confirm("Remove the model preference for " + clientName + "?\n\nTheir work goes back to your routing policy.")) return;
+  try{
+    await fetch(API_BASE + "/api/client-routing/clear", {
+      method: "POST", headers: Object.assign({"content-type":"application/json"}, hdrs()),
+      body: JSON.stringify({ clientName: clientName })
+    });
+    loadRouting();
+  }catch(e){ /* the list reload below is the feedback */ }
+}
+
+async function revokeInvite(id, clientName){
+  if(!confirm("Cancel the setup link for " + clientName + "?\n\nIt stops working immediately. "
+            + "You can issue a new one at any time.")) return;
+  try{
+    var r = await fetch(API_BASE + "/api/byok/invites/revoke", {
+      method: "POST", headers: Object.assign({"content-type":"application/json"}, hdrs()),
+      body: JSON.stringify({ id: id })
+    });
+    if(!r.ok){ var d = await r.json().catch(function(){ return {}; });
+               alert("Could not cancel that link (" + (d.error || r.status) + ")."); return; }
+    loadKeys();
+  }catch(e){ alert("Could not cancel that link: " + e.message); }
+}
+
+async function makeInvite(){
+  var name = document.getElementById("byok-client").value.trim();
+  var provider = document.getElementById("byok-provider").value;
+  var out = document.getElementById("byok-invite");
+  if(!name){ out.style.display="block"; out.textContent = "Enter the client name first."; out.className = "hint"; return; }
+  out.style.display = "block";
+  out.textContent = "Creating…";
+  try{
+    var r = await fetch(API_BASE + "/api/byok/invites", {
+      method: "POST", headers: hdrs({ "content-type": "application/json" }),
+      body: JSON.stringify({ clientName: name, provider: provider })
+    });
+    var d = await r.json();
+    if(!r.ok) throw new Error(d.error || ("HTTP " + r.status));
+    out.textContent = "";
+    var lead = document.createElement("div");
+    lead.className = "hint"; lead.style.marginBottom = "8px";
+    lead.textContent = "Send this to " + name + "'s administrator. It works once and expires in 72 hours.";
+    var field = document.createElement("input");
+    field.type = "text"; field.readOnly = true; field.value = d.url;
+    field.style.fontSize = "13px";
+    field.addEventListener("click", function(){ this.select(); });
+    var says = document.createElement("div");
+    says.className = "hint"; says.style.marginTop = "8px";
+    says.textContent = "They will be asked to confirm: \u201C" + d.attestationText + "\u201D";
+    out.appendChild(lead); out.appendChild(field); out.appendChild(says);
+  }catch(e){
+    out.textContent = "";
+    var oops = document.createElement("div");
+    oops.className = "hint";
+    oops.textContent = "Could not create the link: " + e.message;
+    out.appendChild(oops);
+  }
+}
+
+async function disableKey(clientName, provider){
+  if(!confirm("Stop using " + clientName + "'s own key for " + provider + "?\n\nTheir work will run on your keys again and appear on their statement.")) return false;
+  try{
+    await fetch(API_BASE + "/api/byok/keys/disable", {
+      method: "POST", headers: hdrs({ "content-type": "application/json" }),
+      body: JSON.stringify({ clientName: clientName, provider: provider })
+    });
+  }catch(e){}
+  loadKeys();
+  return false;
+}
+</script>
+
 <script>
 var API_BASE = window.VYNE_API_BASE || "";
 function hdrs(extra){
@@ -157,7 +559,26 @@ function esc(s){ /* v5.32.29 (audit H-3/M-2): escapes & < > " ' — the two quot
    the hand-rolled quote-stripping idiom, which a single backslash defeated. */
 function jsArg(v){ return esc(JSON.stringify(String(v==null?'':v))); }
 
-function money(n){ return "$" + (Number(n)||0).toFixed(4); }
+/*
+ * v5.34.60: a real cost that rounds to $0.0000 now says so, instead of
+ * displaying as nothing.
+ *
+ * Four decimal places suit the amounts that matter — a 90-minute voice
+ * interview is about $2 — but a single text call costs $0.0000099, and
+ * toFixed(4) rendered that as "$0.0000". Testing BYOK in production, a call
+ * that genuinely ran on a client's key showed a column of zeros, which reads
+ * as "nothing happened" rather than "a very small amount happened". This
+ * codebase has already been bitten twice by costs that were present in the
+ * data and invisible on the screen; that is the failure being closed.
+ *
+ * Exact zero still prints as $0.0000 — there IS nothing there, and "<$0.0001"
+ * would be a lie in the other direction.
+ */
+function money(n){
+  var v = Number(n) || 0;
+  if (v !== 0 && Math.abs(v) < 0.00005) return (v < 0 ? "-" : "") + "<$0.0001";
+  return "$" + v.toFixed(4);
+}
 function dateRangeQS(fromId, toId){
   var qs = [];
   var from = document.getElementById(fromId).value;
@@ -173,9 +594,14 @@ function dateRangeQS(fromId, toId){
   if (s && s.role === "interviewee") window.location.href = "interview_agent.html";
 })();
 
+
+
 function switchTab(name){
   document.getElementById("pane-summary").style.display = name === "summary" ? "block" : "none";
   document.getElementById("pane-statement").style.display = name === "statement" ? "block" : "none";
+  document.getElementById("pane-keys").style.display = name === "keys" ? "block" : "none";
+  document.getElementById("tab-btn-keys").classList.toggle("active", name === "keys");
+  if (name === "keys") loadKeys();
   document.getElementById("tab-btn-summary").classList.toggle("active", name === "summary");
   document.getElementById("tab-btn-statement").classList.toggle("active", name === "statement");
 }
@@ -194,6 +620,17 @@ async function loadSummary(){
       return;
     }
     var grandTotal = d.clients.reduce(function(s,c){ return s + c.costEstUsd; }, 0);
+    /*
+     * v5.34.59. A client running on their OWN key has already been charged by
+     * Google or Anthropic; the backend keeps that out of costEstUsd so it can
+     * never reach an invoice. It is shown separately rather than hidden — the
+     * work happened, and an Owner needs to see the engagement's real cost.
+     *
+     * The column appears only when there is something in it: most firms have
+     * no BYOK clients at all, and a permanently-$0.00 column is noise.
+     */
+    var clientPaidTotal = d.clients.reduce(function(s,c){ return s + (c.clientPaidUsd || 0); }, 0);
+    var showByok = clientPaidTotal > 0;
     var rows = d.clients.map(function(c){
       var isUnattr = c.clientNorm === "__unattributed__";
       return "<tr class='" + (isUnattr ? "unattributed" : "") + "'>" +
@@ -201,17 +638,24 @@ async function loadSummary(){
         "<td class='num'>" + c.callCount + "</td>" +
         "<td class='num'>" + (c.tokensIn + c.tokensOut).toLocaleString() + "</td>" +
         "<td class='num'>" + money(c.costEstUsd) + "</td>" +
+        (showByok ? "<td class='num'>" + ((c.clientPaidUsd || 0) > 0 ? money(c.clientPaidUsd) : "—") + "</td>" : "") +
         "<td>" + (c.lastActivity ? esc(new Date(c.lastActivity).toLocaleString()) : "—") + "</td>" +
         (isUnattr ? "<td></td>" : "<td><button class='ghost' style='padding:5px 10px' onclick=\"openStatementFor(" + jsArg(c.clientName) + ")\">View statement</button></td>") +
       "</tr>";
     }).join("");
     box.innerHTML =
       "<div class='total-row'>" +
-        "<div class='total-stat'><div class='total-num'>" + money(grandTotal) + "</div><div class='total-label'>Total AI cost</div></div>" +
+        "<div class='total-stat'><div class='total-num'>" + money(grandTotal) + "</div><div class='total-label'>Recoverable AI cost</div></div>" +
+        (showByok ? "<div class='total-stat'><div class='total-num'>" + money(clientPaidTotal) + "</div><div class='total-label'>On clients' own keys</div></div>" : "") +
         "<div class='total-stat'><div class='total-num'>" + d.clients.length + "</div><div class='total-label'>Clients with activity</div></div>" +
       "</div>" +
-      "<table><thead><tr><th>Client</th><th class='num'>Calls</th><th class='num'>Tokens</th><th class='num'>Cost (USD)</th><th>Last activity</th><th></th></tr></thead>" +
-      "<tbody>" + rows + "</tbody></table>";
+      "<table><thead><tr><th>Client</th><th class='num'>Calls</th><th class='num'>Tokens</th><th class='num'>Cost (USD)</th>" +
+      (showByok ? "<th class='num'>On their key</th>" : "") +
+      "<th>Last activity</th><th></th></tr></thead>" +
+      "<tbody>" + rows + "</tbody></table>" +
+      (showByok ? "<div class='hint' style='margin-top:12px'>“On their key” is work that ran on the client’s own API key. " +
+        "Google or Anthropic billed them for it directly, so it is deliberately excluded from the cost column and from every statement total — " +
+        "invoicing it would charge them twice.</div>" : "");
   }catch(e){ box.innerHTML = "<div class='msg err'>Failed to load: " + esc(e.message) + "</div>"; }
 }
 
@@ -247,13 +691,19 @@ async function loadStatement(){
       resultBox.innerHTML = "<div class='hint' style='margin-top:12px'>No billable AI usage for this client in this range.</div>";
       return;
     }
+    var stmtByok = (d.clientPaidUsd || 0) > 0;
     var rows = d.lineItems.map(function(li){
-      return "<tr><td>" + esc(new Date(li.createdAt).toLocaleString()) + "</td>" +
+      // A client-paid line stays visible — it is part of the record of the
+      // work — but its cost is muted and labelled, so nobody reads the column
+      // as a sum of what is owed.
+      return "<tr" + (li.clientPaid ? " style='color:var(--quiet)'" : "") + "><td>" + esc(new Date(li.createdAt).toLocaleString()) + "</td>" +
         "<td>" + esc(li.module) + "</td><td>" + esc(li.task) + "</td>" +
         "<td>" + esc(li.provider) + " / " + esc(li.model) + "</td>" +
         "<td class='num'>" + li.tokensIn.toLocaleString() + "</td>" +
         "<td class='num'>" + li.tokensOut.toLocaleString() + "</td>" +
-        "<td class='num'>" + money(li.costEstUsd) + "</td></tr>";
+        "<td class='num'>" + money(li.costEstUsd) + "</td>" +
+        (stmtByok ? "<td>" + (li.clientPaid ? "Their own key" : "Invoiced") + "</td>" : "") +
+        "</tr>";
     }).join("");
     resultBox.innerHTML =
       "<div id='stmt-actions' style='margin:14px 0'>" +
@@ -265,10 +715,14 @@ async function loadStatement(){
       "</div>" +
       "<div class='total-row'>" +
         "<div class='total-stat'><div class='total-num'>" + money(d.totalCostUsd) + "</div><div class='total-label'>Total due</div></div>" +
+        (stmtByok ? "<div class='total-stat'><div class='total-num'>" + money(d.clientPaidUsd) + "</div><div class='total-label'>Already paid on their key</div></div>" : "") +
         "<div class='total-stat'><div class='total-num'>" + (d.totalTokensIn + d.totalTokensOut).toLocaleString() + "</div><div class='total-label'>Total tokens</div></div>" +
         "<div class='total-stat'><div class='total-num'>" + d.callCount + "</div><div class='total-label'>Billable calls</div></div>" +
       "</div>" +
-      "<table style='margin-top:12px'><thead><tr><th>When</th><th>Module</th><th>Task</th><th>Provider / model</th><th class='num'>Tokens in</th><th class='num'>Tokens out</th><th class='num'>Cost (USD)</th></tr></thead>" +
+      (stmtByok ? "<div class='hint' style='margin-top:8px;margin-bottom:4px'>Total due covers only the work that ran on our keys. " +
+        "The rest ran on this client’s own API key and was billed to them directly by the provider — it is listed below for completeness and is not part of the amount due.</div>" : "") +
+      "<table style='margin-top:12px'><thead><tr><th>When</th><th>Module</th><th>Task</th><th>Provider / model</th><th class='num'>Tokens in</th><th class='num'>Tokens out</th><th class='num'>Cost (USD)</th>" +
+      (stmtByok ? "<th>Paid by</th>" : "") + "</tr></thead>" +
       "<tbody>" + rows + "</tbody></table>" +
       "<div class='hint' style='margin-top:14px'>Pass-through at cost, no markup applied. Figures are ESTIMATES: token counts are metered exactly, but the per-token rates are our recorded list prices for each model and some providers report no cost at all (free-tier calls bill as $0). Treat this as a close approximation, not a reconciled provider invoice. " +
       "Text-to-speech calls are included in call counts but always meter at $0 (pricing not yet wired in for that provider), so voice-heavy engagements may under-report true cost.</div>";
@@ -295,15 +749,23 @@ function csvEscape(v){
 function downloadStatementCsv(){
   if(!lastStatement) return;
   var d = lastStatement;
-  var lines = [["When","Module","Task","Provider","Model","Tokens In","Tokens Out","Cost (USD)"].join(",")];
+  // v5.34.59: "Paid by" is a COLUMN, not a footnote. This file is what gets
+  // attached to an invoice, and a row whose cost is not owed has to say so on
+  // the row — a reader summing the cost column must not arrive at a number the
+  // firm is asking for.
+  var lines = [["When","Module","Task","Provider","Model","Tokens In","Tokens Out","Cost (USD)","Paid By"].join(",")];
   d.lineItems.forEach(function(li){
     lines.push([
       csvEscape(li.createdAt), csvEscape(li.module), csvEscape(li.task), csvEscape(li.provider), csvEscape(li.model),
-      li.tokensIn, li.tokensOut, li.costEstUsd.toFixed(6)
+      li.tokensIn, li.tokensOut, li.costEstUsd.toFixed(6),
+      li.clientPaid ? "Client's own key" : "Invoiced"
     ].join(","));
   });
   lines.push("");
-  lines.push(["", "", "", "", "TOTAL", d.totalTokensIn, d.totalTokensOut, d.totalCostUsd.toFixed(6)].join(","));
+  lines.push(["", "", "", "", "TOTAL DUE", d.totalTokensIn, d.totalTokensOut, d.totalCostUsd.toFixed(6), "Invoiced"].join(","));
+  if ((d.clientPaidUsd || 0) > 0) {
+    lines.push(["", "", "", "", "ALREADY PAID ON CLIENT'S OWN KEY", "", "", d.clientPaidUsd.toFixed(6), "Not invoiced"].join(","));
+  }
   var blob = new Blob([lines.join("\n")], { type: "text/csv" });
   var a = document.createElement("a");
   a.href = URL.createObjectURL(blob);

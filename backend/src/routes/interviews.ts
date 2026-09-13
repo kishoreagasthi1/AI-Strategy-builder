@@ -874,13 +874,40 @@ export async function interviewRoutes(app: FastifyInstance): Promise<void> {
        * app role is. Counting inside withTenant() — where the tenant context
        * actually exists — is the only place this question can be answered.
        */
+      let transcriptsErased = 0;
+      let erasedContext: { clientName: string; interviewee: string } | null = null;
       const outcome = await withTenant(ctx.tenantId, async (c) => {
-        const iv = await c.query<{ state_module: string; interviewee_user_id: string | null; client_name: string }>(
-          `SELECT state_module, interviewee_user_id, client_name FROM interviews WHERE id = $1`, [id]);
+        const iv = await c.query<{
+          state_module: string; interviewee_user_id: string | null;
+          client_name: string; interviewee_name: string;
+        }>(
+          `SELECT state_module, interviewee_user_id, client_name, interviewee_name
+             FROM interviews WHERE id = $1`, [id]);
         if (!iv.rows[0]) return null;
         if (!clientAllowed(allowed, iv.rows[0].client_name)) return null;
+
+        /*
+         * v5.34.63 — the transcript goes with the interview.
+         *
+         * It did not, and could not: migration 024 restricted DELETE on
+         * interview_transcripts to synthetic rows, so "delete this interview"
+         * removed the row and the saved answers while the CONVERSATION — a
+         * named executive's verbatim words and the findings drawn from them —
+         * stayed in the database with no code path anywhere able to remove it.
+         * A firm asked to honour an erasure request had no way to honour it.
+         *
+         * The SET LOCAL is the permission, and it is deliberately loud: 034's
+         * policy refuses this DELETE without it, so the synthetic generator and
+         * every other path still cannot touch a real transcript. It expires
+         * with this transaction, so nothing inherits it on a pooled connection.
+         */
+        await c.query(`SET LOCAL app.erase_transcripts = 'on'`);
+        const erased = await c.query(
+          `DELETE FROM interview_transcripts WHERE interview_id = $1 RETURNING id`, [id]);
         await c.query(`DELETE FROM module_state WHERE module = $1`, [iv.rows[0].state_module]);
         await c.query(`DELETE FROM interviews WHERE id = $1`, [id]);
+        transcriptsErased = erased.rowCount ?? 0;
+        erasedContext = { clientName: iv.rows[0].client_name, interviewee: iv.rows[0].interviewee_name };
 
         const userId = iv.rows[0].interviewee_user_id;
         let stillHasInterviews = false;
@@ -938,7 +965,30 @@ export async function interviewRoutes(app: FastifyInstance): Promise<void> {
           }
         }
       }
-      return { ok: true };
+      /*
+       * The erasure is recorded even though the content is not (v5.34.63).
+       *
+       * A transcript is the most sensitive thing this product stores, and its
+       * destruction should leave a trace that survives it: who did it, for
+       * which client and which person, and when. The audit row carries the
+       * NAMES and the count — never a word of what was said — so it can answer
+       * "was this erasure performed, and by whom" without reconstituting any
+       * part of what was erased.
+       *
+       * Written after the transaction commits, like every other audit call
+       * here: a logging failure must not undo a deletion the caller has
+       * already been told about.
+       */
+      if (transcriptsErased > 0 && erasedContext) {
+        const ctxInfo: { clientName: string; interviewee: string } = erasedContext;
+        await auditLog(ctx.tenantId, ctx.userId, "transcript_erased", {
+          interviewId: id,
+          clientName: ctxInfo.clientName,
+          intervieweeName: ctxInfo.interviewee,
+          transcripts: transcriptsErased,
+        }).catch((err) => req.log.warn({ err }, "transcript erasure audit write failed"));
+      }
+      return { ok: true, transcriptsErased };
     }
   );
 

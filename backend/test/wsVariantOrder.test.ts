@@ -20,14 +20,19 @@ describe("realtime WS variant order", () => {
     expect(src).toMatch(/var WS_VARIANTS\s*=\s*\[/);
   });
 
-  it("tries the known-working variant FIRST (v1beta Constrained access_token)", () => {
-    // Extract the array body.
+  it("keeps the Constrained/access_token variants at the head of the list (both API versions)", () => {
+    // v5.34.26: the effective order comes from variantOrder() (v1alpha first
+    // by default, v1beta with the v1beta flag) — see liveTurnOwnership.test.ts.
+    // What this still pins is that the constrained access_token variants lead
+    // the static list, so the sweep never starts with a doomed key= socket.
     const m = src.match(/var WS_VARIANTS\s*=\s*\[([\s\S]*?)\];/);
     expect(m).toBeTruthy();
-    const body = m![1];
-    const firstEntry = body.split("},")[0]; // first object literal
-    expect(firstEntry).toContain("v1beta");
-    expect(firstEntry).toContain("BidiGenerateContentConstrained");
-    expect(firstEntry).toContain("access_token");
+    const entries = m![1].split("},").filter((e) => e.trim().length);
+    expect(entries[0]).toContain("BidiGenerateContentConstrained");
+    expect(entries[0]).toContain("access_token");
+    expect(entries[1]).toContain("BidiGenerateContentConstrained");
+    expect(entries[1]).toContain("access_token");
+    expect(entries[0] + entries[1]).toContain("v1beta");
+    expect(entries[0] + entries[1]).toContain("v1alpha");
   });
 });

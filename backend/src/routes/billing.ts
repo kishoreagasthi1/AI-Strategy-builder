@@ -46,6 +46,18 @@ export interface UsageEventLite {
   costEstUsd: number;
   ok: boolean;
   createdAt: string; // ISO
+  /**
+   * v5.34.59 — "client_key" means the CLIENT's own credential paid the vendor
+   * directly and this cost is NOT the firm's to recover. Absent/"platform" is
+   * every row written before BYOK spent anything, and every call on the firm's
+   * own keys.
+   */
+  payer?: string | null;
+}
+
+/** A cost the client has already paid on their own account. */
+function isClientPaid(e: UsageEventLite): boolean {
+  return e.payer === "client_key";
 }
 
 export interface BillingClientSummary {
@@ -56,7 +68,19 @@ export interface BillingClientSummary {
   callCount: number;
   tokensIn: number;
   tokensOut: number;
+  /**
+   * What the firm may invoice this client: the cost of work that ran on the
+   * FIRM's credentials. Work the client's own key paid for is excluded — see
+   * clientPaidUsd.
+   */
   costEstUsd: number;
+  /**
+   * What the client already paid their vendor directly, on their own key
+   * (v5.34.59). Shown so the engagement's true cost is visible, and kept out
+   * of costEstUsd so it can never reach an invoice. Zero for every client who
+   * has not supplied a key, which is most of them.
+   */
+  clientPaidUsd: number;
   lastActivity: string | null;
 }
 
@@ -64,6 +88,11 @@ export interface BillingClientSummary {
  * Pure aggregation — testable without the DB. Only successful calls (ok)
  * are billed: a failed attempt's cost is always metered as $0 (gateway.ts),
  * so including it would add a zero-cost line with nothing to show for it.
+ *
+ * v5.34.59: cost is now split by PAYER. A client running on their own key has
+ * already been charged by Google or Anthropic; adding that to the firm's
+ * invoice would bill them twice for the same tokens. The tokens still count in
+ * tokensIn/tokensOut, because the work happened and the firm needs to see it.
  */
 export function buildBillingSummary(events: UsageEventLite[]): BillingClientSummary[] {
   const byNorm = new Map<string, BillingClientSummary>();
@@ -79,6 +108,7 @@ export function buildBillingSummary(events: UsageEventLite[]): BillingClientSumm
         tokensIn: 0,
         tokensOut: 0,
         costEstUsd: 0,
+        clientPaidUsd: 0,
         lastActivity: null,
       };
       byNorm.set(key, entry);
@@ -86,7 +116,11 @@ export function buildBillingSummary(events: UsageEventLite[]): BillingClientSumm
     entry.callCount += 1;
     entry.tokensIn += e.tokensIn;
     entry.tokensOut += e.tokensOut;
-    entry.costEstUsd = round6(entry.costEstUsd + e.costEstUsd);
+    if (isClientPaid(e)) {
+      entry.clientPaidUsd = round6(entry.clientPaidUsd + e.costEstUsd);
+    } else {
+      entry.costEstUsd = round6(entry.costEstUsd + e.costEstUsd);
+    }
     if (!entry.lastActivity || e.createdAt > entry.lastActivity) entry.lastActivity = e.createdAt;
   }
   const out = [...byNorm.values()];
@@ -107,6 +141,13 @@ export interface BillingLineItem {
   tokensIn: number;
   tokensOut: number;
   costEstUsd: number;
+  /**
+   * True when this line ran on the CLIENT's own credential and is therefore
+   * NOT part of what the firm is invoicing (v5.34.59). Kept as a visible line
+   * rather than dropped: the client can see the work happened, and can
+   * reconcile it against their own Google or Anthropic bill.
+   */
+  clientPaid?: boolean;
 }
 
 export interface BillingStatement {
@@ -114,10 +155,20 @@ export interface BillingStatement {
   callCount: number;
   totalTokensIn: number;
   totalTokensOut: number;
+  /** The invoice total — firm-paid work only. */
   totalCostUsd: number;
+  /** Already paid by the client on their own key. Never part of the invoice. */
+  clientPaidUsd: number;
 }
 
-/** Pure aggregation for one client's exportable statement. */
+/**
+ * Pure aggregation for one client's exportable statement.
+ *
+ * v5.34.59: totalCostUsd is the amount to invoice and excludes anything the
+ * client's own key paid for. The excluded lines stay in lineItems, flagged, so
+ * the statement remains a complete record of the work rather than a partial one
+ * that quietly omits half an engagement.
+ */
 export function buildBillingStatement(events: UsageEventLite[]): BillingStatement {
   const lineItems = events
     .filter((e) => e.ok)
@@ -130,6 +181,7 @@ export function buildBillingStatement(events: UsageEventLite[]): BillingStatemen
       tokensIn: e.tokensIn,
       tokensOut: e.tokensOut,
       costEstUsd: e.costEstUsd,
+      ...(isClientPaid(e) ? { clientPaid: true } : {}),
     }))
     .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
   return {
@@ -137,7 +189,12 @@ export function buildBillingStatement(events: UsageEventLite[]): BillingStatemen
     callCount: lineItems.length,
     totalTokensIn: lineItems.reduce((s, i) => s + i.tokensIn, 0),
     totalTokensOut: lineItems.reduce((s, i) => s + i.tokensOut, 0),
-    totalCostUsd: round6(lineItems.reduce((s, i) => s + i.costEstUsd, 0)),
+    totalCostUsd: round6(
+      lineItems.filter((i) => !i.clientPaid).reduce((s, i) => s + i.costEstUsd, 0)
+    ),
+    clientPaidUsd: round6(
+      lineItems.filter((i) => i.clientPaid).reduce((s, i) => s + i.costEstUsd, 0)
+    ),
   };
 }
 
@@ -184,6 +241,7 @@ async function fetchUsageEvents(
       cost_est_usd: string;
       ok: boolean;
       created_at: string;
+      payer: string | null;
     }>(
       /*
        * v5.32.58 SCALE. `from`/`to` are optional, so with no query parameters
@@ -205,7 +263,7 @@ async function fetchUsageEvents(
        * still bounding the scan. A caller who wants more passes `from`.
        */
       `SELECT client_name, client_norm, module, task, provider, model,
-              tokens_in, tokens_out, cost_est_usd, ok, created_at
+              tokens_in, tokens_out, cost_est_usd, ok, created_at, payer
          FROM usage_events
         WHERE NOT (task = ANY($3::text[]))
           AND created_at >= COALESCE($1::timestamptz, now() - interval '13 months')
@@ -225,6 +283,7 @@ async function fetchUsageEvents(
       tokensOut: row.tokens_out,
       costEstUsd: Number(row.cost_est_usd),
       ok: row.ok,
+      payer: row.payer,
       // node-postgres parses `timestamptz` columns into a JS Date object by
       // default, NOT a string — despite this query's row type (and
       // UsageEventLite.createdAt) declaring it as `string`. That mismatch

@@ -110,6 +110,34 @@ describe("the required-column list is meaningful", () => {
     }
   });
 
+  it("guards whole TABLES too, not only columns", () => {
+    /*
+     * v5.34.59. The guard checked columns only, and a missing TABLE has no
+     * columns to miss — so when migrations 030/031 were never run against
+     * production, byok_keys simply did not exist, the Client API keys screen
+     * answered "Could not load: internal_error", and this guard said nothing
+     * at boot. Finding out cost a trip through information_schema to discover
+     * the database was two releases behind.
+     */
+    const tableBlock = poolSrc.slice(
+      poolSrc.indexOf("const REQUIRED_TABLES"),
+      poolSrc.indexOf("export async function assertSchemaCurrent")
+    );
+    expect(tableBlock).toContain(`table: "byok_keys"`);
+    expect(tableBlock).toContain(`table: "byok_invites"`);
+    const fn = poolSrc.slice(poolSrc.indexOf("export async function assertSchemaCurrent"));
+    expect(fn).toContain("REQUIRED_TABLES");
+    expect(fn).toContain("information_schema.tables");
+  });
+
+  it("covers usage_events.payer, whose absence would silently lose every billing row", () => {
+    // dbMeter's INSERT names it, and safeMeter swallows a metering failure by
+    // design — so a missing column here means money spent and nothing
+    // recording it, with the product looking perfectly healthy.
+    expect(block).toContain(`table: "usage_events", column: "payer"`);
+    expect(block).toContain(`table: "usage_events", column: "payer_key_hint"`);
+  });
+
   it("the error text tells the operator what to actually run", () => {
     const fn = poolSrc.slice(poolSrc.indexOf("export async function assertSchemaCurrent"));
     expect(fn).toContain("npm run migrate");
@@ -156,6 +184,55 @@ describe.skipIf(!ENABLED)("assertSchemaCurrent against real Postgres", () => {
       await expect(
         assertSchemaCurrent(fakePool as never, { strict: true })
       ).rejects.toThrow(/026_synthetic_flag_column\.sql/);
+    } finally {
+      await client.query("ROLLBACK");
+      await client.end();
+    }
+  });
+
+  it("REFUSES when a required TABLE is missing, and names the migration", async () => {
+    /*
+     * The negative control for v5.34.59's table check. Without it this whole
+     * mechanism could be present, well-commented, and never actually fire —
+     * which is indistinguishable from today, when it did not.
+     *
+     * Dropped inside a transaction that is always rolled back.
+     */
+    const pg = (await import("pg")).default;
+    const { assertSchemaCurrent } = await import("../src/db/pool.js");
+    const client = new pg.Client({ connectionString: process.env.TEST_DATABASE_URL });
+    await client.connect();
+    await client.query("BEGIN");
+    try {
+      await client.query("DROP TABLE IF EXISTS byok_keys");
+      const fakePool = { connect: async () => ({ query: client.query.bind(client), release() {} }) };
+      await expect(
+        assertSchemaCurrent(fakePool as never, { strict: true })
+      ).rejects.toThrow(/table byok_keys/);
+      await expect(
+        assertSchemaCurrent(fakePool as never, { strict: true })
+      ).rejects.toThrow(/031_byok_client_grain\.sql/);
+    } finally {
+      await client.query("ROLLBACK");
+      await client.end();
+    }
+  });
+
+  it("REFUSES when the payer column is missing — the silent-billing-loss case", async () => {
+    const pg = (await import("pg")).default;
+    const { assertSchemaCurrent } = await import("../src/db/pool.js");
+    const client = new pg.Client({ connectionString: process.env.TEST_DATABASE_URL });
+    await client.connect();
+    await client.query("BEGIN");
+    try {
+      await client.query("ALTER TABLE usage_events DROP COLUMN IF EXISTS payer");
+      const fakePool = { connect: async () => ({ query: client.query.bind(client), release() {} }) };
+      await expect(
+        assertSchemaCurrent(fakePool as never, { strict: true })
+      ).rejects.toThrow(/usage_events\.payer/);
+      await expect(
+        assertSchemaCurrent(fakePool as never, { strict: true })
+      ).rejects.toThrow(/032_usage_payer\.sql/);
     } finally {
       await client.query("ROLLBACK");
       await client.end();

@@ -84,6 +84,43 @@ describe.skipIf(!ENABLED)("interview identity: no interview may cross with anoth
       payload: { clientName: "Acme", intervieweeName: name, intervieweeRole: role, email, ...extra },
     });
 
+  /**
+   * Write a shadowing interview row straight into the table.
+   *
+   * The legacy state described above: a second interview on the same login,
+   * client and round, from before the v5.34.11 duplicate guard existed. Mirrors
+   * exactly what POST /api/interviews used to write — including the
+   * `iv_<uuid>` private state namespace, without which the row would not have a
+   * namespace to be kept out of, and the test below would pass vacuously.
+   *
+   * Returns a response-shaped object so the assertions read the same as they
+   * did when this went through the route.
+   */
+  async function seedShadowRow(p: {
+    name: string; role: string; email: string;
+    interviewerName?: string; interviewerVoice?: string; roundNumber?: number | null;
+  }): Promise<{ statusCode: number; json: () => { id: string } }> {
+    await admin.query("BEGIN");
+    await admin.query("SELECT set_config('app.tenant_id', $1, true)", [tenant]);
+    const u = await admin.query<{ id: string }>(
+      `INSERT INTO users (identity_platform_uid, email) VALUES ($1, $1)
+         ON CONFLICT (identity_platform_uid) DO UPDATE SET email = EXCLUDED.email RETURNING id`,
+      [p.email]);
+    const r = await admin.query<{ id: string }>(
+      `INSERT INTO interviews
+         (tenant_id, client_name, interviewee_name, interviewee_role,
+          interviewee_user_id, state_module, interviewer_name, interviewer_voice, round_number)
+       VALUES ($1, 'Acme', $2, $3, $4, 'pending', NULLIF($5,''), NULLIF($6,''), $7)
+       RETURNING id`,
+      [tenant, p.name, p.role, u.rows[0].id,
+       p.interviewerName ?? "", p.interviewerVoice ?? "", p.roundNumber ?? null]);
+    const id = r.rows[0].id;
+    await admin.query(`UPDATE interviews SET state_module = $1 WHERE id = $2`,
+      ["iv_" + id.replace(/-/g, ""), id]);
+    await admin.query("COMMIT");
+    return { statusCode: 201, json: () => ({ id }) };
+  }
+
   beforeAll(async () => {
     process.env.DEV_AUTH = "1";
     await migrate(ADMIN_URL);
@@ -143,8 +180,31 @@ describe.skipIf(!ENABLED)("interview identity: no interview may cross with anoth
       `UPDATE interviews SET created_at = now() - interval '1 hour' WHERE id = $1`, [firstId]);
     await admin.query("COMMIT");
 
-    const second = await invite("Second Person", "COO", "shared@client.com",
-      { interviewerName: "Bruno", interviewerVoice: "Orus" });
+    /*
+     * The second row is written DIRECTLY, not through POST /api/interviews.
+     *
+     * v5.34.11 added a duplicate guard that refuses a second interview for the
+     * same (person, client, round) with a 409 — correctly, and there is a test
+     * for it. So this collision can no longer be CREATED through the API, and
+     * the three tests below (which were written before that guard and asked the
+     * route for a 201) had been failing ever since.
+     *
+     * But the collision still EXISTS: every firm that used the product before
+     * v5.34.11 has these rows, and the bootstrap rule that resolves them —
+     * newest wins outright, loser stays visible to the consultant, loser's
+     * namespace stays untouched — is still the code that keeps two people's
+     * interviews from crossing. Deleting these tests would retire the only
+     * coverage of that rule; rewriting them to expect a 409 would test the
+     * guard twice and the resolution not at all.
+     *
+     * So the fixture creates the legacy state the way it now arises — in the
+     * table, not through the door that is closed — and everything below is
+     * unchanged.
+     */
+    const second = await seedShadowRow({
+      name: "Second Person", role: "COO", email: "shared@client.com",
+      interviewerName: "Bruno", interviewerVoice: "Orus",
+    });
     expect(second.statusCode).toBe(201);
 
     const boot = await app.inject({
@@ -196,8 +256,21 @@ describe.skipIf(!ENABLED)("interview identity: no interview may cross with anoth
   // ── Repeat rounds: same person, later round ───────────────────────────────
 
   it("a repeat invite for a later round routes the person to the NEW interview, not the old one", async () => {
+    /*
+     * Both invites now carry an explicit roundNumber.
+     *
+     * They did not, and both therefore had a NULL round — which, since the
+     * v5.34.11 duplicate guard, is the definition of the SAME interview
+     * (`round_number IS NOT DISTINCT FROM`), so the second invite was refused
+     * with a 409 and this test failed at its first line.
+     *
+     * A re-diagnostic next quarter is precisely what round_number exists for
+     * (migration 016), and a different round is deliberately not a duplicate.
+     * So the fixture now says what the scenario always meant, and the guard and
+     * this test stop contradicting each other.
+     */
     const r1 = await invite("Repeat Exec", "CEO", "repeat@client.com",
-      { interviewerName: "Alice", interviewerVoice: "Kore" });
+      { interviewerName: "Alice", interviewerVoice: "Kore", roundNumber: 1 });
     expect(r1.statusCode).toBe(201);
     const r1Id = r1.json().id;
 
@@ -215,7 +288,7 @@ describe.skipIf(!ENABLED)("interview identity: no interview may cross with anoth
 
     // Next quarter: same executive, same login, new interview, new voice.
     const r2 = await invite("Repeat Exec", "CEO", "repeat@client.com",
-      { interviewerName: "Bruno", interviewerVoice: "Charon" });
+      { interviewerName: "Bruno", interviewerVoice: "Charon", roundNumber: 2 });
     expect(r2.statusCode).toBe(201);
 
     const boot = await app.inject({

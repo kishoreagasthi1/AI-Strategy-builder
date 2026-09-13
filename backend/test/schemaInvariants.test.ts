@@ -42,6 +42,27 @@ const NO_RLS_BY_DESIGN: Record<string, string> = {
   memberships: "The tenant-resolution join itself; read via withoutTenant() before any tenant context exists.",
   subscription_plans: "Global reference data (the plan catalog), identical for every firm.",
   schema_migrations: "Migration bookkeeping, written by the owner role only.",
+  /*
+   * byok_invites (migration 031) — the one deliberate exception in the schema,
+   * and the reason this list needs a long entry rather than a short one.
+   *
+   * The row is looked up BEFORE any tenant is known. A client's administrator
+   * has no account here and never will: the whole point of the setup link is
+   * that supplying their own API key must not require being onboarded into
+   * someone else's consulting platform. So the redemption route resolves the
+   * token first and sets app.tenant_id FROM the row it finds — under RLS that
+   * lookup would match nothing and the feature could not exist.
+   *
+   * What guards it instead is not weaker, it is different: the token is 32
+   * random bytes, only its SHA-256 hash is stored (a database reader cannot
+   * mint a working link), it expires in 72 hours, and it is single-use. The
+   * route must set the tenant from the row and never from anything the caller
+   * sent — byokRoutes.test.ts is where that is held to account.
+   *
+   * Listed here rather than silently tolerated: an unexplained table without
+   * RLS is how the next one gets added.
+   */
+  byok_invites: "Looked up by token hash before any tenant is known — see migration 031.",
 };
 
 describe.skipIf(!ENABLED)("schema invariants (live catalog introspection)", () => {

@@ -6,7 +6,8 @@ import { withTenant } from "../db/pool.js";
 import { normClient } from "../auth/clients.js";
 import { NON_BILLABLE_TASKS, MAX_SESSION_SECONDS, TASK_HOLD, TASK_HOLD_RELEASE, reserveTokensFor } from "./liveSession.js";
 import { estimateCost } from "./types.js";
-import type { Meter, MeterEvent, LimitCheck } from "./gateway.js";
+import { sweepStaleHolds } from "./sweepStaleHolds.js";
+import type { Meter, MeterEvent, LimitCheck, Payer } from "./gateway.js";
 
 /** The slice of a pg client these helpers need — keeps them usable with any
  *  connection the caller already has open inside a transaction. */
@@ -18,8 +19,8 @@ export const dbMeter: Meter = async (e: MeterEvent) => {
       `INSERT INTO usage_events
          (tenant_id, user_id, module, task, provider, model,
           tokens_in, tokens_out, cost_est_usd, latency_ms, ok,
-          client_name, client_norm, session_id)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+          client_name, client_norm, session_id, payer, payer_key_hint)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
       [
         e.tenantId,
         e.userId ?? null,
@@ -35,6 +36,12 @@ export const dbMeter: Meter = async (e: MeterEvent) => {
         e.clientName ?? null,
         e.clientName ? normClient(e.clientName) : null,
         e.sessionId ?? null,
+        // v5.34.59. Defaulted here as well as in the column default, so a
+        // caller that forgets the field writes the safe value (the firm's own
+        // cost, recoverable) rather than NULL — a NULL payer would be excluded
+        // from BOTH totals in routes/billing.ts and the cost would vanish.
+        e.payer ?? "platform",
+        e.payerKeyHint ?? null,
       ]
     );
   });
@@ -313,9 +320,69 @@ export async function admitLiveSession(args: {
   tenantId: string; userId: string; module: string; model: string;
   clientName?: string; sessionId: string; maxSeconds: number;
   maxConcurrent: number; openWindowSeconds: number;
-}): Promise<{ allowed: boolean; reason?: string }> {
+  /**
+   * v5.34.33 — the sessionId this grant CONTINUES, if any.
+   *
+   * Google ends a Live connection about every ten minutes, so one interview
+   * needs a fresh grant per ten minutes of conversation: twelve for a
+   * two-hour deep dive. Each of those looked like a brand-new session to the
+   * concurrency guard, so a long interview raced its own cap and died
+   * mid-sentence at the handover — the guard refusing the continuation of the
+   * very session it had just admitted. That is not a runaway tab, which is
+   * the only thing this guard exists to stop.
+   *
+   * A continuation is therefore exempt from the CONCURRENCY check only, and
+   * only when the caller can name a hold this same user genuinely holds:
+   * spend control (capsCheck) and the reservation below are untouched, so the
+   * exemption cannot buy budget — it can only stop a live interview being cut
+   * off by a nuisance counter. Naming someone else's session, or one outside
+   * the window, is not a renewal and falls back to the normal check.
+   */
+  renewalOf?: string;
+  /**
+   * v5.34.59 — whose credential will mint this session's token.
+   *
+   * The HOLD is a reservation against the firm's budget, and it must carry the
+   * same payer as the actual-usage row that later replaces it. If the hold said
+   * "platform" and the actual said "client_key", the statement would show a
+   * positive reservation the firm can invoice and a negative release it cannot,
+   * and every client-paid interview would leave a phantom charge behind — the
+   * same shape of ledger fault v5.34.48 spent a release fixing.
+   */
+  payer?: Payer;
+  payerKeyHint?: string;
+}): Promise<{ allowed: boolean; reason?: string; renewal?: boolean }> {
   return withTenant(args.tenantId, async (c) => {
     await takeBudgetLock(c, args.tenantId);
+
+    /*
+     * v5.34.48 — clear holds whose /close never arrived, BEFORE anything reads
+     * this table.
+     *
+     * The release of a reservation depends on the browser POSTing
+     * /api/voice/live-session/close, which it does fire-and-forget:
+     * `keepalive: true` and a `.catch(function () {})` that swallows every
+     * failure. A killed tab, a network drop at the wrong instant, or any
+     * server-side refusal therefore strands the hold permanently.
+     *
+     * Measured on production 2026-09-12: 36 stranded holds carrying $6.62,
+     * against $0.34 of metered actual consumption — a client statement
+     * overstating voice roughly twentyfold. Both reads below are affected too,
+     * since a phantom hold counts against the concurrency guard and spends the
+     * firm's monthly budget. Sweeping here fixes all three at once.
+     *
+     * Best-effort by construction (SAVEPOINT inside), so tidy-up can never be
+     * the reason a consultant cannot start an interview.
+     */
+    const sweep = await sweepStaleHolds(c);
+    if (sweep.swept) {
+      console.info(
+        `[metering] released ${sweep.swept} stale live-session hold(s) worth ` +
+          `$${sweep.releasedUsd.toFixed(2)} for tenant ${args.tenantId}`
+      );
+    } else if (sweep.failed) {
+      console.warn(`[metering] stale-hold sweep failed (admission continues): ${sweep.failed}`);
+    }
 
     // Concurrency: holds issued inside the window, minus their releases.
     const g = await c.query<{ n: string }>(
@@ -329,7 +396,20 @@ export async function admitLiveSession(args: {
     );
     const row = g.rows[0] as unknown as { n: string; released: string };
     const open = Math.max(0, Number(row?.n ?? 0) - Number(row?.released ?? 0));
-    if (open >= args.maxConcurrent) {
+
+    let renewal = false;
+    if (args.renewalOf && args.renewalOf !== args.sessionId) {
+      const prior = await c.query(
+        `SELECT 1 FROM usage_events
+          WHERE user_id = $1 AND session_id = $2 AND task = $3
+            AND created_at > now() - make_interval(secs => $4)
+          LIMIT 1`,
+        [args.userId, args.renewalOf, TASK_HOLD, Math.max(args.openWindowSeconds, MAX_SESSION_SECONDS)]
+      );
+      renewal = prior.rowCount === 1;
+    }
+
+    if (!renewal && open >= args.maxConcurrent) {
       return { allowed: false, reason: "too_many_live_sessions" };
     }
 
@@ -341,16 +421,18 @@ export async function admitLiveSession(args: {
       `INSERT INTO usage_events
          (tenant_id, user_id, module, task, provider, model,
           tokens_in, tokens_out, cost_est_usd, latency_ms, ok,
-          client_name, client_norm, session_id)
-       VALUES ($1,$2,$3,$4,'gemini-live',$5,$6,$7,$8,0,true,$9,$10,$11)`,
+          client_name, client_norm, session_id, payer, payer_key_hint)
+       VALUES ($1,$2,$3,$4,'gemini-live',$5,$6,$7,$8,0,true,$9,$10,$11,$12,$13)`,
       [
         args.tenantId, args.userId, args.module, TASK_HOLD, args.model,
         tokensIn, tokensOut, estimateCost(args.model, tokensIn, tokensOut),
         args.clientName ?? null,
         args.clientName ? normClient(args.clientName) : null,
         args.sessionId,
+        args.payer ?? "platform",
+        args.payerKeyHint ?? null,
       ]
     );
-    return { allowed: true };
+    return { allowed: true, renewal };
   });
 }

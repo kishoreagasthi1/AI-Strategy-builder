@@ -61,7 +61,7 @@
   // partial deploy (one side redeployed, the other not — see v5.27's
   // postmortem, where a stale frontend folder got redeployed silently) is
   // visible from inside the running app.
-  var VYNE_VERSION = "5.34.29";
+  var VYNE_VERSION = "5.34.63";
   window.VYNE_VERSION = VYNE_VERSION;
 
   // ── Client identity norm (v5.32.26) ─────────────────────────
@@ -299,9 +299,61 @@
   var SESSION_ABS_MS = 12 * 60 * 60 * 1000;
   var SESSION_IDLE_MS = 30 * 60 * 1000;
 
+  /*
+   * v5.34.33 — never navigate out of a live interview.
+   *
+   * Both ends of the session policy finish by replacing the document
+   * (`location.href = "index.html?expired=1"`), and until now they did that
+   * whatever else the page was doing. Mid voice-interview that is the worst
+   * possible moment: the realtime socket talks to Google directly with an
+   * ephemeral token and needs nothing from our API, so the interview was still
+   * working when the page was taken away — and it took the whole diagnostic
+   * trace with it, which is why a ten-minute failure could not be read.
+   *
+   * So while a live session owns the page (vyne-live.js sets the flag in its
+   * state machine), the sign-out is REMEMBERED rather than performed: the local
+   * session is dropped immediately, so no further API call goes out on a dead
+   * token, and the redirect happens the moment live goes idle — or after a hard
+   * cap, in case the flag is never cleared. This defers a redirect, it does not
+   * extend any grant: the token is already gone from storage.
+   */
+  var EXPIRY_DEFER_CAP_MS = 20 * 60 * 1000;
+  var _expiryPending = null;
+
+  function liveOwnsPage() {
+    try { return !!window.__vyneLiveActive; } catch (e) { return false; }
+  }
+
+  function runPendingExpiry() {
+    var go = _expiryPending;
+    if (!go) return;
+    _expiryPending = null;
+    try { if (typeof window.vyneLiveLogFlush === "function") window.vyneLiveLogFlush(); } catch (e) {}
+    go();
+  }
+
+  /** True when the redirect was deferred; the caller must then do nothing. */
+  function deferWhileLive(navigate) {
+    if (!liveOwnsPage()) return false;
+    if (_expiryPending) return true;
+    _expiryPending = navigate;
+    try {
+      if (typeof window.vyneLiveLog === "function") {
+        window.vyneLiveLog("!!! app session ended mid-interview — sign-out DEFERRED until live ends " +
+                           "(v5.34.33; the realtime socket needs nothing from our API)");
+      }
+    } catch (e) {}
+    window.__vyneOnLiveIdle = runPendingExpiry;
+    setTimeout(runPendingExpiry, EXPIRY_DEFER_CAP_MS);
+    return true;
+  }
+
   function expireSession() {
     try { sessionStorage.removeItem("vyne_session"); } catch (e) {}
-    if (MODULE !== "shell") { window.location.href = "index.html?expired=1"; }
+    if (MODULE === "shell") return;
+    var navigate = function () { window.location.href = "index.html?expired=1"; };
+    if (deferWhileLive(navigate)) return;
+    navigate();
   }
 
   function readSession() {
@@ -332,6 +384,14 @@
   ["click", "keydown", "mousemove", "touchstart"].forEach(function (ev) {
     window.addEventListener(ev, touchSession, { passive: true });
   });
+  /*
+   * v5.34.33: the four events above are all hand-driven, so a hands-free voice
+   * interview looks idle however long the interviewee talks — and the sweep
+   * below signed them out mid-sentence at the 30-minute mark. vyne-live.js
+   * calls this on each utterance and each agent turn: the same policy, now
+   * counting the modality the product actually runs on.
+   */
+  window.vyneTouchSession = touchSession;
   setInterval(readSession, 60000); // readSession redirects when expired
 
   var session = readSession();
@@ -364,7 +424,11 @@
 
   function onAuthFailure() {
     try { sessionStorage.removeItem("vyne_session"); } catch (e) {}
-    window.location.href = "index.html?expired=1";
+    var navigate = function () { window.location.href = "index.html?expired=1"; };
+    // v5.34.33: a 401 on a background call (the per-turn scoring pass, a state
+    // flush) used to replace the page mid-interview. Same policy, later moment.
+    if (deferWhileLive(navigate)) return;
+    navigate();
   }
 
   // ── vyneStore: synchronous store facade over /api/module-state ────────────

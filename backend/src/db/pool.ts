@@ -169,6 +169,59 @@ const REQUIRED_COLUMNS: { table: string; column: string; migration: string }[] =
   { table: "interviews",            column: "synthetic", migration: "026_synthetic_flag_column.sql" },
   { table: "interview_transcripts", column: "synthetic", migration: "026_synthetic_flag_column.sql" },
   { table: "interviews",            column: "depth",     migration: "028_interview_depth_column.sql" },
+  /*
+   * v5.34.59. Without these the damage is worse than a broken screen:
+   * admitLiveSession's INSERT names `payer`, so every live voice session fails
+   * to open; dbMeter's INSERT names it too, and safeMeter SWALLOWS that failure
+   * by design — so every usage row in the firm would be silently lost while the
+   * product looked fine. Money spent and nothing recording it is the one
+   * outcome this file exists to make impossible.
+   */
+  { table: "usage_events", column: "payer",          migration: "032_usage_payer.sql" },
+  { table: "usage_events", column: "payer_key_hint", migration: "032_usage_payer.sql" },
+  // v5.34.61. The keys screen reads last_error to say whether a key ACTUALLY
+  // worked; findInvite reads revoked_at before honouring a setup link. Without
+  // the latter a withdrawn link would still be redeemable, which is the whole
+  // point of the column.
+  { table: "byok_keys",    column: "last_error",     migration: "033_byok_key_health.sql" },
+  { table: "byok_invites", column: "revoked_at",     migration: "033_byok_key_health.sql" },
+];
+
+/**
+ * Whole TABLES the code requires, not just columns.
+ *
+ * v5.34.59, from a live failure this morning. Migrations 030 and 031 added
+ * byok_keys and byok_invites; `deploy.sh all` does not run migrations, and
+ * nothing noticed. The Client API keys screen answered "Could not load:
+ * internal_error" and the boot guard above stayed silent, because it only ever
+ * looked at COLUMNS and a missing table has none to miss.
+ *
+ * Diagnosing that cost a round trip through information_schema to discover
+ * production was two releases behind on schema. The guard should have said so
+ * at boot, in the deploy, naming the file.
+ */
+const REQUIRED_TABLES: { table: string; migration: string }[] = [
+  { table: "byok_keys",      migration: "031_byok_client_grain.sql" },
+  { table: "byok_invites",   migration: "031_byok_client_grain.sql" },
+  { table: "client_routing", migration: "035_client_routing.sql" },
+];
+
+/**
+ * RLS POLICIES the code depends on, not just tables and columns.
+ *
+ * v5.34.63, and this one is here because of how it fails. Migration 034 adds a
+ * policy that lets the interview-delete path remove a real transcript. Without
+ * it the DELETE is not an error — row-level security simply filters every row
+ * out, the statement reports zero rows affected, and the route happily returns
+ * `{ ok: true, transcriptsErased: 0 }`.
+ *
+ * So an unmigrated database would tell a firm it had erased an interviewee's
+ * transcript when it had done nothing of the kind. A missing column throws
+ * somewhere; a missing policy quietly answers "nothing to do", which is worse,
+ * and is exactly the class of silent wrongness this guard exists to catch.
+ */
+const REQUIRED_POLICIES: { table: string; policy: string; migration: string }[] = [
+  { table: "interview_transcripts", policy: "tenant_delete_erasure", migration: "034_transcript_erasure.sql" },
 ];
 
 export async function assertSchemaCurrent(
@@ -188,12 +241,29 @@ export async function assertSchemaCurrent(
     );
     const present = new Set(res.rows.map((r) => `${r.table_name}.${r.column_name}`));
     const missing = REQUIRED_COLUMNS.filter((r) => !present.has(`${r.table}.${r.column}`));
-    if (!missing.length) return;
 
-    const files = [...new Set(missing.map((m) => m.migration))];
+    const tables = await client.query<{ table_name: string }>(
+      `SELECT table_name FROM information_schema.tables
+        WHERE table_schema = 'public' AND table_name = ANY($1::text[])`,
+      [REQUIRED_TABLES.map((t) => t.table)]
+    );
+    const haveTables = new Set(tables.rows.map((r) => r.table_name));
+    const missingTables = REQUIRED_TABLES.filter((t) => !haveTables.has(t.table));
+
+    const policies = await client.query<{ tablename: string; policyname: string }>(
+      `SELECT tablename, policyname FROM pg_policies WHERE schemaname = 'public'`
+    );
+    const havePolicies = new Set(policies.rows.map((r) => `${r.tablename}.${r.policyname}`));
+    const missingPolicies = REQUIRED_POLICIES.filter((p) => !havePolicies.has(`${p.table}.${p.policy}`));
+
+    if (!missing.length && !missingTables.length && !missingPolicies.length) return;
+
+    const files = [...new Set([...missing, ...missingTables, ...missingPolicies].map((m) => m.migration))];
     const msg =
       `DATABASE SCHEMA IS BEHIND THIS BUILD. Missing: ` +
-      missing.map((m) => `${m.table}.${m.column}`).join(", ") + `. ` +
+      [...missing.map((m) => `${m.table}.${m.column}`),
+       ...missingTables.map((t) => `table ${t.table}`),
+       ...missingPolicies.map((p) => `policy ${p.table}.${p.policy}`)].join(", ") + `. ` +
       `This code reads and writes those columns, so the affected features will ` +
       `fail with a generic 500 ("internal_error") that names nothing. ` +
       `Run the migration(s) that create them — ${files.join(", ")} — against THIS ` +

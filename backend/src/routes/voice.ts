@@ -26,6 +26,9 @@ import {
   type LiveSession,
 } from "../llm/liveSession.js";
 import { buildInterviewerInstruction, MAX_CONTEXT_CHARS } from "../llm/interviewerPersona.js";
+import { isCredentialRejection } from "../llm/byok/resolve.js";
+import type { ByokLiveBinding } from "../llm/byok/resolveLive.js";
+import type { Payer } from "../llm/gateway.js";
 
 /**
  * One user should not hold many live grants at once — see route.
@@ -85,6 +88,22 @@ const LiveSessionBody = z.object({
   /** What the interviewer calls itself. Spoken aloud, so it is bounded and
    *  stripped of anything that would be read out as punctuation noise. */
   interviewerName: z.string().max(40).optional(),
+  // v5.34.24: experiment — pin manual turn signalling into the token (the
+  // client's own setup frame is not reliably honoured on the constrained
+  // endpoint; see liveSession.ts "extras"). Boolean only; nothing else from
+  // the browser reaches the setup.
+  manualVad: z.boolean().optional(),
+  // v5.34.29: a sessionResumption handle from the PREVIOUS connection, so the
+  // renewed session keeps the conversation. Opaque server-issued string; only
+  // its length is bounded here — it goes into the token, never into a prompt.
+  resumeHandle: z.string().max(2048).optional(),
+  /**
+   * v5.34.33: the sessionId this grant continues (a ~10-minute Live handover
+   * inside one interview). Verified against the caller's OWN recent holds in
+   * admitLiveSession; exempts the continuation from the concurrency guard
+   * only, never from spend caps. See that function for why.
+   */
+  renewalOf: z.string().max(200).optional(),
 });
 
 const LiveCloseBody = z.object({
@@ -119,7 +138,21 @@ export async function voiceRoutes(
   meter: Meter,
   /** Optional: when absent, the realtime routes are not registered at all and
    *  the client falls back to the existing text + TTS path. */
-  live?: LiveSession
+  live?: LiveSession,
+  /**
+   * BYOK for realtime voice (v5.34.59).
+   *
+   * `forClient` returns the live session a CLIENT's own Google key should mint,
+   * or null for "use the platform's". `onRejected` is called when that key is
+   * refused by Google, so the Owner's screen stops claiming it works.
+   *
+   * Optional: without it this route behaves exactly as it did before — one
+   * credential, payer "platform".
+   */
+  byokLive?: {
+    forClient: (tenantId: string, clientName: string | undefined) => Promise<ByokLiveBinding | null>;
+    onRejected?: (info: { tenantId: string; clientName: string; detail: string }) => void;
+  }
 ): Promise<void> {
   app.post("/api/voice/tts", async (req, reply) => {
     const ctx = req.ctx!;
@@ -207,9 +240,28 @@ export async function voiceRoutes(
       if (!parsed.success) { reply.code(400).send({ error: "invalid_input" }); return; }
 
       if (!live.isConfigured()) { reply.code(503).send({ error: "live_not_configured" }); return; }
+
+      /*
+       * Whose credential mints this session (v5.34.59, BYOK slice 2).
+       *
+       * Resolved BEFORE the free-tier gate on purpose. The gate below asks
+       * whether THE KEY THAT WILL BE USED may run confidential work, and once a
+       * client has supplied their own attested, billed key that is a different
+       * key from the platform's. Leaving the gate above this would refuse a
+       * client's paid session because the firm's own fallback key happens to be
+       * free-tier — the client would have handed over a credential that is
+       * never used, and kept paying the firm for it.
+       *
+       * A null binding is the ordinary case and means "the platform pays".
+       */
+      const billTo = await resolveBillingClient(ctx, parsed.data.clientName);
+      const byokBinding = byokLive ? await byokLive.forClient(ctx.tenantId, billTo) : null;
+      const effectiveLive: LiveSession = byokBinding?.live ?? live;
+      const payer: Payer = byokBinding ? "client_key" : "platform";
+
       // Same free-tier lockdown as TTS: a free-tier key may be training-eligible,
       // and an interview transcript is the most confidential thing here.
-      if (gateway.blockFreeTier && live.freeTier) {
+      if (gateway.blockFreeTier && effectiveLive.freeTier) {
         reply.code(503).send({
           error: "live_free_tier_blocked",
           detail: "Realtime voice is configured on a free-tier key, which is disabled in this environment.",
@@ -236,7 +288,7 @@ export async function voiceRoutes(
         throw err;
       }
 
-      const billTo = await resolveBillingClient(ctx, parsed.data.clientName);
+      // billTo was resolved above, with the credential decision that depends on it.
       const sessionId = randomUUID();
       const maxSeconds = Math.min(parsed.data.maxSeconds ?? DEFAULT_SESSION_SECONDS, MAX_SESSION_SECONDS);
 
@@ -255,9 +307,13 @@ export async function voiceRoutes(
        * in, and the refund below corrects it immediately. */
       const admit = await admitLiveSession({
         tenantId: ctx.tenantId, userId: ctx.userId, module: parsed.data.module,
-        model: live.model, clientName: billTo, sessionId, maxSeconds,
+        model: effectiveLive.model, clientName: billTo, sessionId, maxSeconds,
         maxConcurrent: MAX_CONCURRENT_SESSIONS_PER_USER,
         openWindowSeconds: OPEN_SESSION_WINDOW_SECONDS,
+        renewalOf: parsed.data.renewalOf,
+        // The hold carries the payer its release and its actual-usage row will
+        // later have to match — see admitLiveSession's own note.
+        payer, payerKeyHint: byokBinding?.keyHint,
       });
       if (!admit.allowed) {
         reply.code(admit.reason === "too_many_live_sessions" ? 429 : 402)
@@ -278,7 +334,8 @@ export async function voiceRoutes(
           intervieweeRole: parsed.data.intervieweeRole,
           context: parsed.data.context,
         });
-        const grant = await live.mint(sessionId, maxSeconds, instruction, parsed.data.voice);
+        const grant = await effectiveLive.mint(sessionId, maxSeconds, instruction, parsed.data.voice,
+          { manualVad: !!parsed.data.manualVad, resumeHandle: parsed.data.resumeHandle });
         if (!grant.pinned) {
           // Degraded but functional. The persona could not be frozen into the
           // token, so the browser has to send it — which means an interviewee
@@ -291,16 +348,102 @@ export async function voiceRoutes(
           token: grant.token, model: grant.model, voice: grant.voice,
           maxSeconds: grant.maxSeconds, expiresAt: grant.expiresAt, sessionId: grant.sessionId,
           pinned: grant.pinned,
+          // v5.34.22: present only when a thinking budget was pinned, so the
+          // browser trace ("grant minted") shows what the session runs with.
+          thinkingBudget: grant.thinkingBudget,
+          pinnedExtras: grant.pinnedExtras,
           // Only sent when we could not pin it — never round-tripped otherwise.
           instruction: grant.pinned ? undefined : instruction,
+          /*
+           * Whose account this session bills to (v5.34.59). Echoed so the
+           * consultant's trace — and deploy/voice-record.mjs — can prove a
+           * client's key is actually in use rather than inferring it from a
+           * database row. It says WHICH account, never anything about the key.
+           */
+          payer,
         };
       } catch (err) {
-        // Give the whole reservation back — the session never existed.
+        // Give the whole reservation back — the session never existed. The
+        // payer must match the hold, or the release cancels nothing and the
+        // reservation stays on the statement forever.
         await reconcileSession(meter, {
           tenantId: ctx.tenantId, userId: ctx.userId, module: parsed.data.module,
-          model: live.model, clientName: billTo, sessionId, maxSeconds,
+          model: effectiveLive.model, clientName: billTo, sessionId, maxSeconds,
           actualTokensIn: 0, actualTokensOut: 0, actualSeconds: 0,
+          payer, payerKeyHint: byokBinding?.keyHint,
         }).catch(() => {});
+
+        /*
+         * The CLIENT's key was refused — wrong, revoked, or its project lost
+         * Live API access. Their interview must still happen.
+         *
+         * One retry on the platform credential, with a FRESH sessionId. Fresh
+         * because the first session's hold has just been released and migration
+         * 015's unique index allows one release per session: reusing the id
+         * would make the second hold unreleasable, stranding the whole
+         * reservation — the $6.62-of-phantom-charges failure v5.34.48 fixed.
+         *
+         * Only on a credential rejection. A 429 or a 503 is Google being busy,
+         * and retrying that on the firm's key would quietly migrate a client's
+         * costs onto the firm every time Google had a bad minute.
+         */
+        const message = (err as Error)?.message ?? "";
+        if (byokBinding && isCredentialRejection(message)) {
+          try {
+            byokLive?.onRejected?.({
+              tenantId: ctx.tenantId, clientName: byokBinding.clientName, detail: message,
+            });
+          } catch { /* bookkeeping must not escalate */ }
+          req.log.warn({ clientName: byokBinding.clientName },
+            "live session: client's own key was refused — falling back to the platform credential");
+
+          const retryId = randomUUID();
+          const retryAdmit = await admitLiveSession({
+            tenantId: ctx.tenantId, userId: ctx.userId, module: parsed.data.module,
+            model: live.model, clientName: billTo, sessionId: retryId, maxSeconds,
+            maxConcurrent: MAX_CONCURRENT_SESSIONS_PER_USER,
+            openWindowSeconds: OPEN_SESSION_WINDOW_SECONDS,
+            // The released session counts as the one being continued, so the
+            // concurrency guard does not refuse the retry on the strength of a
+            // hold it has just cancelled.
+            renewalOf: sessionId,
+            payer: "platform",
+          });
+          if (retryAdmit.allowed) {
+            try {
+              if (gateway.blockFreeTier && live.freeTier) {
+                throw new Error("platform live key is free-tier and blocked in this environment");
+              }
+              const instruction2 = buildInterviewerInstruction({
+                interviewerName: (parsed.data.interviewerName || "").replace(/[^\p{L}\p{N} '\-]/gu, "").trim() || undefined,
+                clientName: billTo ?? parsed.data.clientName,
+                industry: parsed.data.industry,
+                intervieweeName: parsed.data.intervieweeName,
+                intervieweeRole: parsed.data.intervieweeRole,
+                context: parsed.data.context,
+              });
+              const grant2 = await live.mint(retryId, maxSeconds, instruction2, parsed.data.voice,
+                { manualVad: !!parsed.data.manualVad, resumeHandle: parsed.data.resumeHandle });
+              return {
+                token: grant2.token, model: grant2.model, voice: grant2.voice,
+                maxSeconds: grant2.maxSeconds, expiresAt: grant2.expiresAt,
+                sessionId: grant2.sessionId, pinned: grant2.pinned,
+                thinkingBudget: grant2.thinkingBudget, pinnedExtras: grant2.pinnedExtras,
+                instruction: grant2.pinned ? undefined : instruction2,
+                payer: "platform",
+              };
+            } catch (err2) {
+              await reconcileSession(meter, {
+                tenantId: ctx.tenantId, userId: ctx.userId, module: parsed.data.module,
+                model: live.model, clientName: billTo, sessionId: retryId, maxSeconds,
+                actualTokensIn: 0, actualTokensOut: 0, actualSeconds: 0,
+                payer: "platform",
+              }).catch(() => {});
+              req.log.warn({ err: err2 }, "live session mint failed on the platform fallback too");
+            }
+          }
+        }
+
         req.log.warn({ err }, "live session mint failed");
         reply.code(502).send({ error: "live_session_failed" });
       }
@@ -364,6 +507,14 @@ export async function voiceRoutes(
         maxSeconds: Math.min(parsed.data.maxSeconds, MAX_SESSION_SECONDS),
         // The ledger's numbers, not the browser's. This is the fix.
         reservedOverride: held,
+        /*
+         * And the ledger's PAYER (v5.34.59), for exactly the same reason. The
+         * browser never gets a say in whose account a session lands on: if it
+         * did, an interviewee's laptop could move the cost of their own
+         * interview between their employer and the consulting firm.
+         */
+        payer: held.payer,
+        payerKeyHint: held.payerKeyHint,
         actualTokensIn: parsed.data.tokensIn,
         actualTokensOut: parsed.data.tokensOut,
         actualSeconds: parsed.data.seconds,

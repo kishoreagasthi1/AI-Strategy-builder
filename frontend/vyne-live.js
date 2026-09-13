@@ -81,9 +81,91 @@
       // interview's worth of events. Overridable for a very long session.
       var cap = Number(window.VYNE_LIVE_LOG_MAX) || 20000;
       if (buf.length > cap) buf.splice(0, buf.length - cap);
+      _traceDirty = true;
+      _traceMaybeFlush();
     } catch (e) {}
   }
   window.vyneLiveLog = vlog;
+
+  /*
+   * v5.34.33 — the trace must outlive the page.
+   *
+   * The ring above lives in `window`, so ANY navigation destroys it: a reload,
+   * a tab close, and — the case that actually cost a diagnosis — the session
+   * layer's `location.href = "index.html?expired=1"` on a 401 or an idle
+   * expiry. The one failure worth reading is precisely the one that also
+   * navigates, and the evidence went with it.
+   *
+   * So the tail is mirrored into localStorage: cheaply (a dirty flag, a slow
+   * timer) and definitely (a flush on pagehide, which fires on exactly the
+   * redirect that used to lose it). On load, whatever the previous page
+   * instance left behind is moved aside, so the current session writes to a
+   * clean key and the dead session is still readable with
+   * `copy(vyneLiveLogDumpPrev())`.
+   */
+  var TRACE_KEY = 'vyne_live_trace';
+  var TRACE_PREV_KEY = 'vyne_live_trace_prev';
+  var TRACE_MAX_LINES = 4000;     // tail depth kept across a navigation
+  var TRACE_MAX_CHARS = 600000;   // well inside the ~5MB localStorage budget
+  var TRACE_FLUSH_MS = 10000;
+  var _traceDirty = false;
+  var _traceFlushedAt = 0;
+  var _tracePrev = '';
+
+  function _traceFormat(entries) {
+    return entries.map(function (e) {
+      var stamp = '        ' + e.t;
+      stamp = stamp.slice(stamp.length - 6);
+      var d = '';
+      if (e.data !== undefined) {
+        try { d = ' ' + JSON.stringify(e.data); } catch (x) { d = ' <unserialisable>'; }
+      }
+      return '[VL +' + stamp + 'ms] ' + e.tag + d;
+    }).join('\n');
+  }
+
+  /* Piggybacked on vlog rather than run on an interval: a timer that exists
+   * only to write a debug copy is a timer that outlives the page it belongs
+   * to, and this file is loaded in test harnesses too. */
+  function _traceMaybeFlush() {
+    var now = Date.now();
+    if (_traceDirty && now - _traceFlushedAt >= TRACE_FLUSH_MS) { _traceFlushedAt = now; _traceFlush(); }
+  }
+
+  function _traceFlush() {
+    if (!_traceDirty) return;
+    _traceDirty = false;
+    _traceFlushedAt = Date.now();
+    try {
+      var buf = window.__vyneLiveLog || [];
+      var text = _traceFormat(buf.slice(-TRACE_MAX_LINES));
+      if (text.length > TRACE_MAX_CHARS) text = text.slice(text.length - TRACE_MAX_CHARS);
+      localStorage.setItem(TRACE_KEY, text);
+    } catch (e) {
+      /* Quota or a private-mode throw must never break a live interview. The
+       * in-memory ring is unaffected; only the across-navigation copy is lost. */
+    }
+  }
+
+  try {
+    _tracePrev = localStorage.getItem(TRACE_KEY) || '';
+    if (_tracePrev) localStorage.setItem(TRACE_PREV_KEY, _tracePrev);
+    else _tracePrev = localStorage.getItem(TRACE_PREV_KEY) || '';
+    localStorage.removeItem(TRACE_KEY);
+  } catch (e) { _tracePrev = ''; }
+
+  try { window.addEventListener('pagehide', _traceFlush); } catch (e) {}
+  try {
+    document.addEventListener('visibilitychange', function () {
+      if (document.visibilityState === 'hidden') _traceFlush();
+    });
+  } catch (e) {}
+
+  /** The trace the PREVIOUS page instance left behind — what a mid-interview
+   *  logout or reload used to throw away. `copy(vyneLiveLogDumpPrev())`. */
+  window.vyneLiveLogDumpPrev = function () { return _tracePrev || '(no previous trace stored)'; };
+  /** Force the across-navigation copy to disk now. */
+  window.vyneLiveLogFlush = function () { _traceDirty = true; _traceFlush(); return 'flushed'; };
   /** Start a clean capture — call right before the thing you want to see. */
   window.vyneLiveLogClear = function (note) {
     window.__vyneLiveLog = [];
@@ -94,17 +176,12 @@
   window.vyneLiveMark = function (label) { vlog('>>> MARK: ' + String(label)); return 'marked'; };
   /** Paste-ready transcript of the whole trace. `copy(vyneLiveLogDump())`. */
   window.vyneLiveLogDump = function () {
-    var buf = window.__vyneLiveLog || [];
-    return buf.map(function (e) {
-      var stamp = '        ' + e.t;
-      stamp = stamp.slice(stamp.length - 6);
-      var d = '';
-      if (e.data !== undefined) {
-        try { d = ' ' + JSON.stringify(e.data); } catch (x) { d = ' <unserialisable>'; }
-      }
-      return '[VL +' + stamp + 'ms] ' + e.tag + d;
-    }).join('\n');
+    return _traceFormat(window.__vyneLiveLog || []);
   };
+  if (_tracePrev) {
+    vlog('a trace from the previous page instance was preserved — copy(vyneLiveLogDumpPrev())',
+         { chars: _tracePrev.length });
+  }
   /** Socket readyState as a word — '1' tells you nothing at 2am. */
   function rs(ws) {
     if (!ws) return 'no-socket';
@@ -366,6 +443,26 @@
     return {
       micGain: Number(f.micGain) > 0 ? Number(f.micGain) : 1,
       streamEnd: !!f.streamEnd,
+      /*
+       * v5.34.41 — SPEAKING a mute reply is now opt-in, and off by default.
+       *
+       * 5.34.40 added it on by default to rescue the "reply arrived as text,
+       * never as voice" case the soak found. In a real interview it made the
+       * primary path WORSE: the agent choked, stop-go-stop-go, every couple of
+       * seconds. The mechanism is in this file's own INTERRUPTED handler — a
+       * barge-in resets _turnAudio, which re-armed the mute timer mid-turn, the
+       * fallback spoke, the microphone picked up that speech, Google read it as
+       * another barge-in and flushed its playback. A self-sustaining loop, and
+       * exactly the self-cancelling-agent signature (S3) this project spent its
+       * first week on.
+       *
+       * A mitigation for an occasional text-only reply must never degrade the
+       * voice path it is meant to protect. So: keep DETECTING it (the trace
+       * line is the valuable half and costs nothing), and only speak it when
+       * someone deliberately turns it on with
+       * `vyneLiveFlags({ speakMuteReplies: true })`.
+       */
+      speakMuteReplies: !!f.speakMuteReplies,
       manualVad: !!f.manualVad,
       // v5.34.24 — three more, each aimed at the server's TURN state, which the
       // 5.34.23 trace pinned as the failure (level fine, backlog 0, no reaction):
@@ -552,6 +649,19 @@
       if (sc.interrupted) bits.push('INTERRUPTED');
       if (sc.turnComplete) bits.push('turnComplete');
       if (sc.generationComplete) bits.push('generationComplete');
+      /*
+       * v5.34.52 — usage rides along on frames that carry other things, and
+       * this classifier returns before the standalone usageMetadata branch
+       * below. So a whole session's usage frames were invisible in the trace
+       * except the rare one that arrived alone — which is why it could not be
+       * established whether the field is per-turn or cumulative, and why the
+       * accumulator stayed wrong through two releases. Surface it here.
+       */
+      if (msg.usageMetadata) {
+        bits.push('usage');
+        detail.usageIn = msg.usageMetadata.promptTokenCount;
+        detail.usageOut = msg.usageMetadata.responseTokenCount;
+      }
       if (!bits.length) bits.push('serverContent(empty) keys=' + Object.keys(sc).join(','));
 
       // An AUDIO-ONLY frame carries no information the previous one did not.
@@ -575,7 +685,14 @@
     }
     _flushAudioRun(sess);
     if (msg.usageMetadata) {
-      vlog('frame usageMetadata', { in: msg.usageMetadata.promptTokenCount, out: msg.usageMetadata.responseTokenCount });
+      // v5.34.49: the details arrays too. Logging only the two scalars is how
+      // an output figure at 1.6% of input went unnoticed across 42 sessions.
+      vlog('frame usageMetadata', {
+        in: msg.usageMetadata.promptTokenCount,
+        out: msg.usageMetadata.responseTokenCount,
+        inDetails: msg.usageMetadata.promptTokensDetails,
+        outDetails: msg.usageMetadata.responseTokensDetails
+      });
       return;
     }
     if (msg.goAway) { vlog('frame goAway (server will close this connection)', msg.goAway); return; }
@@ -724,9 +841,139 @@
     this.closed = false;
   }
 
+  /**
+   * v5.34.49 — record what a session actually used, for the client's invoice.
+   *
+   * This replaced:
+   *
+   *   self.usage.tokensIn  = f.usage.promptTokenCount   || self.usage.tokensIn;
+   *   self.usage.tokensOut = f.usage.responseTokenCount || self.usage.tokensOut;
+   *
+   * Two problems with that, both of which undercount a bill.
+   *
+   * 1. It reads ONLY the two scalar fields. Gemini's usageMetadata also
+   *    carries promptTokensDetails[] and responseTokensDetails[], each entry
+   *    {modality, tokenCount}. For a native-audio session the audio tokens —
+   *    which ARE the cost, output audio being the expensive direction — may be
+   *    reported only there.
+   *
+   *    Measured on production, 42 sessions: 150,620 input tokens against 9,399
+   *    output. Both directions are audio and an interviewer speaks about as
+   *    much as an interviewee, so those should be the same order of magnitude.
+   *    Output at 1.6% of input is the shape of a number that is counting the
+   *    text transcript and not the speech.
+   *
+   *    Taking the MAX of the scalar and the details sum is deliberate rather
+   *    than adding them: if the scalar is already the aggregate, max returns
+   *    it unchanged and nothing is double-counted; if the scalar excludes the
+   *    audio, max picks up the larger, truer figure. It can never report more
+   *    than Google itself reported in one field or the other.
+   *
+   * 2. Plain assignment takes the LAST frame's value. Whether usageMetadata is
+   *    cumulative for the session or scoped to a turn is not something this
+   *    code should assume — and it is the difference between a correct invoice
+   *    and one an order of magnitude light. Monotonic max is right under
+   *    either reading: cumulative, the last frame is the largest anyway; per
+   *    turn, a late small frame can no longer erase a large earlier one.
+   *
+   * The raw object is kept on `lastUsage` and traced in full, because the
+   * field set above is inferred from a token ratio, not from a captured frame.
+   * The next real interview settles it — see vyneLiveLogDump().
+   */
+  function detailSum(details) {
+    if (!details || !details.length) return 0;
+    var n = 0;
+    for (var i = 0; i < details.length; i++) n += Number(details[i].tokenCount) || 0;
+    return n;
+  }
+
+  VyneLiveSession.prototype._recordUsage = function (u) {
+    if (!u) return;
+    /*
+     * v5.34.52 — usageMetadata is PER TURN, so it is ACCUMULATED at the turn
+     * boundary, not maxed across the session.
+     *
+     * .49 replaced "take the last frame" with "take the largest frame", on the
+     * reasoning that monotonic max was right whether the field was cumulative
+     * or per-turn. It is not: for a per-turn field, max records the single
+     * biggest turn and calls it the session.
+     *
+     * Measured on a real interview (session 55111401, 2026-09-12):
+     *
+     *   session_secs   590
+     *   tokens_out     367     ~= 15 seconds of speech, in a 10-minute segment
+     *   tokens_in    9,705     the PEAK context size of one turn, not consumption
+     *   usd         0.0170     against roughly $0.20 of honest usage
+     *
+     * About a thirteenfold undercount, on the most expensive call the product
+     * makes. The first captured frame shows why the shape misleads:
+     *
+     *   promptTokenCount 2230  details TEXT 1946 + AUDIO 259
+     *   responseTokenCount 249 details AUDIO 249
+     *
+     * The scalar already IS the aggregate — so .49's max(scalar, detailsSum)
+     * was a harmless no-op and never the fix. The real error was the
+     * accumulator.
+     *
+     * ── Why the value is banked at turnComplete rather than added per frame ──
+     *
+     * Whether Google emits usageMetadata once per turn, or repeatedly within a
+     * turn carrying a running total, is not established — one frame cannot
+     * tell us, and the old trace hid the rest (see the frame logger below).
+     * Summing every frame would double-count under the second reading.
+     *
+     * Holding the LARGEST value seen during a turn and banking it once at
+     * turnComplete is correct under BOTH: one frame per turn banks that frame;
+     * several frames carrying running totals bank the final, largest one. No
+     * assumption required, and a stray small frame cannot walk the turn
+     * backwards.
+     */
+    var inNow = Math.max(Number(u.promptTokenCount) || 0, detailSum(u.promptTokensDetails));
+    var outNow = Math.max(Number(u.responseTokenCount) || 0, detailSum(u.responseTokensDetails));
+    // MAX within the turn, SUM across turns. Under the running-total reading
+    // max and latest agree; under any other, max is the one that cannot be
+    // walked backwards by a stray small frame.
+    var t = this._turnUsage || { tokensIn: 0, tokensOut: 0 };
+    this._turnUsage = {
+      tokensIn: Math.max(t.tokensIn, inNow),
+      tokensOut: Math.max(t.tokensOut, outNow)
+    };
+    this.lastUsage = u;
+    // Trace the WHOLE object once per session. Two scalars were all the old
+    // trace carried, which is why the field set has to be inferred at all.
+    if (!this._usageLogged) {
+      this._usageLogged = true;
+      vlog('usageMetadata (full shape, first frame of this session)', u);
+    }
+  };
+
   VyneLiveSession.prototype._set = function (s) {
     this.state = s;
+    /*
+     * v5.34.33: one global flag saying "a live session owns this page right
+     * now". vyne-client.js reads it before acting on an expired session, so a
+     * background 401 can no longer navigate away from a working interview (the
+     * Live socket talks to Google directly and needs nothing from our API).
+     * Set here because _set is the single choke point for the state machine.
+     */
+    try {
+      window.__vyneLiveActive = (s === 'live');
+      if (s !== 'live' && typeof window.__vyneOnLiveIdle === 'function') window.__vyneOnLiveIdle();
+    } catch (e) {}
     if (this.opts.onState) { try { this.opts.onState(s); } catch (e) {} }
+  };
+
+  /*
+   * v5.34.33: talking IS activity.
+   *
+   * vyne-client.js tracks idle only from click/keydown/mousemove/touchstart,
+   * and a hands-free voice interview produces none of them — so its 30-minute
+   * idle sweep signs the interviewee out mid-sentence while they are audibly
+   * present, taking the interview and the trace with it. The interviewee's
+   * speech and the agent's turns are the missing activity signal.
+   */
+  VyneLiveSession.prototype._touchAppSession = function () {
+    try { if (typeof window.vyneTouchSession === 'function') window.vyneTouchSession(); } catch (e) {}
   };
 
   VyneLiveSession.prototype._fail = function (reason, err) {
@@ -771,6 +1018,7 @@
       this._micLastLoudAt = now;
       if (!this._micInUtterance) {
         this._micInUtterance = true;
+        this._touchAppSession();   // v5.34.33: speaking counts as being present
         this._utteranceStartedAt = now;
         this._uttSum = 0; this._uttN = 0; this._uttPeak = 0;
         this._uttServerActivityBefore = this._lastServerActivityAt || 0;
@@ -893,6 +1141,18 @@
       if (self.opts.onNoReply) { try { self.opts.onNoReply(self._replyTurnNo); } catch (e) {} }
     }, REPLY_WATCHDOG_MS);
   };
+  /**
+   * How long a reply may exist as TEXT with no audio before the app is told
+   * (v5.34.40). Overridable for tests.
+   */
+  var MUTE_REPLY_MS = Number(window.VYNE_MUTE_REPLY_MS) || 6000;
+  /* v5.34.43: shorter than this and it is a transcription fragment, not a
+   * reply. 20 chars is below any real interviewer sentence ("I am still
+   * here." is 16, and that one WAS real — but it arrived as a whole turn with
+   * a full stop, which the fragments never do; the floor is set at 12 so a
+   * short real sentence still counts and a 7-char tail does not). */
+  var MUTE_TEXT_MIN_CHARS = Number(window.VYNE_MUTE_TEXT_MIN_CHARS) || 12;
+
   VyneLiveSession.prototype._noteModelActivity = function (f) {
     var now = Date.now();
     if (this._awaitingReply && (f.modelText || f.audio.length || f.agentText || f.turnComplete)) {
@@ -902,6 +1162,58 @@
            (now - this._lastUserTextAt) + 'ms after last fragment)', {
         kind: f.audio.length ? 'audio' : (f.modelText ? 'thinking-text' : (f.agentText ? 'transcript' : 'turnComplete')) });
     }
+    /*
+     * v5.34.40 — the reply that arrives as TEXT and never as VOICE.
+     *
+     * The unattended soak caught this on a healthy socket:
+     *   turn 5: reply NONE | heard "Skills are the part I worry about most…"
+     *           | said  "How is the organization addressing that knowledge gap…"
+     * The model understood the answer AND composed its question — the output
+     * transcript is right there — and then sent no audio at all. In the app
+     * that transcript renders into the chat, so the interviewee is left
+     * reading a question nobody asked aloud, in a silence with no
+     * explanation. It is the "VYNE agent was typing text with long gaps"
+     * report, and no amount of latency tuning would ever have addressed it,
+     * because the reply was not late: it was mute.
+     *
+     * So the session now NOTICES. The accumulated transcript for the turn is
+     * handed to the app after MUTE_REPLY_MS of textual-but-silent reply, and
+     * the app can speak it with TTS rather than leave the room quiet. Audio
+     * arriving later cancels this, and the app is told so it can stop its
+     * own playback — one voice at a time remains the rule.
+     */
+    if (f.agentText) {
+      this._turnText = (this._turnText || '') + f.agentText;
+      if (!this._turnAudio && !this._muteReplyTimer) {
+        var self = this;
+        this._muteReplyTimer = setTimeout(function () {
+          self._muteReplyTimer = null;
+          if (self.closed || self._turnAudio || self.muted) return;
+          // Never speak over playback, and never after this turn was
+          // interrupted — that is the loop described above.
+          if (self.queue && self.queue.pending()) return;
+          if (self._turnWasInterrupted) return;
+          var text = String(self._turnText || '').trim();
+          if (!text) return;
+          self._muteReplies = (self._muteReplies || 0) + 1;
+          vlog('!!! REPLY WITH NO VOICE — the model sent its question as TEXT and no audio for ' +
+               MUTE_REPLY_MS + 'ms. The interviewee can read it and cannot hear it.', {
+            replyNo: self._muteReplies, chars: text.length, text: snip(text, 120),
+            turnState: self._turnState, wsState: rs(self.ws),
+            msSinceSessionStart: self.startedAt ? Date.now() - self.startedAt : null
+          });
+          if (!(self.flags && self.flags.speakMuteReplies)) {
+            vlog('   (not speaking it — vyneLiveFlags({speakMuteReplies:true}) turns that on; ' +
+                 'off by default because it fed the mic and made the agent choke)');
+            return;
+          }
+          if (self.opts.onReplyWithoutAudio) {
+            try { self.opts.onReplyWithoutAudio(text); } catch (e) { vlog('onReplyWithoutAudio THREW', e && e.message); }
+          }
+        }, MUTE_REPLY_MS);
+      }
+    }
+
     // Per-turn state for the UI: thinking → speaking → idle. Session-level
     // _gotAgentFrame stays as it is (the opening retry depends on it).
     if (f.modelText && !this._turnAudio && !this._turnThinkingAt) this._turnThinkingAt = now;
@@ -909,6 +1221,15 @@
     if (f.audio.length && !this._turnAudio) {
       this._turnAudio = true;
       this._turnFirstAudioAt = now;
+      // v5.34.40: the voice did arrive. Disarm, and if the app already started
+      // speaking the text itself, tell it to stop — two voices is worse than
+      // either one alone (see S3 in the original handoff).
+      if (this._muteReplyTimer) { clearTimeout(this._muteReplyTimer); this._muteReplyTimer = null; }
+      if (this._spokeFallback) {
+        this._spokeFallback = false;
+        vlog('model audio arrived AFTER the text was spoken locally — telling the app to stop its fallback voice');
+        if (this.opts.onAudioArrivedLate) { try { this.opts.onAudioArrivedLate(); } catch (e) {} }
+      }
       // v5.34.30: one line per reply, readable at a glance across a whole
       // interview: is the gap between "you stopped" and "he started" growing?
       this._replyNo = (this._replyNo || 0) + 1;
@@ -927,13 +1248,70 @@
     }
     if (f.turnComplete) {
       this._lastTurnCompleteAt = now;
+      this._touchAppSession();   // v5.34.33: an agent turn is activity too
+      /*
+       * v5.34.40: the turn is OVER and no audio ever came. There is nothing
+       * left to wait for, so do not sit out the rest of MUTE_REPLY_MS — the
+       * interviewee is already in silence.
+       */
+      /*
+       * v5.34.43 — a transcript FRAGMENT is not a mute reply.
+       *
+       * The 90-minute run reported eleven of these. Seven were seven
+       * characters long — "So most", "What is" — arriving at a connection
+       * boundary. That is a transcription tail being flushed, not the model
+       * answering in text, and reporting it as `!!! MUTE TURN` put eleven
+       * failure lines in a trace that contained four real ones. An instrument
+       * that cries wolf costs more than it gives: the whole value of this
+       * trace is that a `!!!` line means something.
+       *
+       * A genuine text-only reply is a SENTENCE. Below the floor we still
+       * record the fact — quietly, so the data is not lost — but we do not
+       * call it a failure and we never speak it aloud.
+       */
+      if (!this._turnAudio && String(this._turnText || '').trim() && !this.muted) {
+        if (this._muteReplyTimer) { clearTimeout(this._muteReplyTimer); this._muteReplyTimer = null; }
+        var txt = String(this._turnText).trim();
+        if (txt.length < MUTE_TEXT_MIN_CHARS) {
+          vlog('turnComplete with a short transcript fragment and no audio — not counted as a mute reply',
+               { chars: txt.length, text: snip(txt, 60) });
+        } else {
+          this._muteReplies = (this._muteReplies || 0) + 1;
+          vlog('!!! MUTE TURN — turnComplete with a transcript and no audio at all', {
+            replyNo: this._muteReplies, chars: txt.length, text: snip(txt, 120),
+            willSpeak: !!(this.flags && this.flags.speakMuteReplies) });
+          if (this.flags && this.flags.speakMuteReplies && this.opts.onReplyWithoutAudio) {
+            try { this.opts.onReplyWithoutAudio(txt); } catch (e) {}
+          }
+        }
+      }
       vlog('model turn ENDS', { turnHadAudio: !!this._turnAudio, playbackPending: this.queue ? this.queue.pending() : null,
         msSinceLastUtteranceEnd: this._micLastLoudAt ? now - this._micLastLoudAt : null });
+      this._bankTurnUsage();          // v5.34.52 — before the turn state resets
       if (this.queue) this.queue.endRun('turnComplete');
       this._turnAudio = false; this._loggedTurnAudio = false;
+      this._turnWasInterrupted = false;
+      this._turnText = '';
+      if (this._muteReplyTimer) { clearTimeout(this._muteReplyTimer); this._muteReplyTimer = null; }
       this._setTurnState('idle');
     }
   };
+  /**
+   * Add the turn just finished to the session total. (v5.34.52)
+   *
+   * Idempotent by construction: _turnUsage is cleared once banked, so a second
+   * turnComplete for the same turn — or the flush at stop() — cannot count it
+   * twice.
+   */
+  VyneLiveSession.prototype._bankTurnUsage = function () {
+    var t = this._turnUsage;
+    if (!t) return;
+    this._turnUsage = null;
+    this.usage.tokensIn = (this.usage.tokensIn || 0) + t.tokensIn;
+    this.usage.tokensOut = (this.usage.tokensOut || 0) + t.tokensOut;
+    this.usage.turns = (this.usage.turns || 0) + 1;
+  };
+
   VyneLiveSession.prototype._setTurnState = function (s) {
     if (this._turnState === s) return;
     this._turnState = s;
@@ -970,7 +1348,10 @@
         // setup frame is not reliably honoured on the constrained endpoint).
         manualVad: self.flags && self.flags.manualVad ? true : undefined,
         // v5.34.29: resume the previous connection's conversation (see onmessage).
-        resumeHandle: self.opts.resumeHandle || undefined
+        resumeHandle: self.opts.resumeHandle || undefined,
+        // v5.34.33: this grant continues that session — a ~10-minute handover
+        // inside one interview, not a new session competing for the cap.
+        renewalOf: self.opts.renewalOf || undefined
       })
     }).then(function (r) {
       if (!r.ok) {
@@ -1403,14 +1784,16 @@
           });
           self.queue.flush();
           self._turnAudio = false; self._loggedTurnAudio = false;
+          /* v5.34.41: this turn was interrupted. _turnAudio going back to false
+           * must NOT be read as "no voice ever came" — it is why the mute-reply
+           * timer re-armed mid-turn and the fallback talked over the model. */
+          self._turnWasInterrupted = true;
+          if (self._muteReplyTimer) { clearTimeout(self._muteReplyTimer); self._muteReplyTimer = null; }
           self._setTurnState('idle');
           if (self.opts.onInterrupted) { try { self.opts.onInterrupted(); } catch (e) {} }
         }
         // Usage always counts — the tokens were spent regardless of pause state.
-        if (f.usage) {
-          self.usage.tokensIn = f.usage.promptTokenCount || self.usage.tokensIn;
-          self.usage.tokensOut = f.usage.responseTokenCount || self.usage.tokensOut;
-        }
+        if (f.usage) self._recordUsage(f.usage);
         // While paused, the session stays open but must be INERT: a turn that
         // arrives mid-pause is discarded whole — not just its audio. Previously
         // only audio was gated on self.muted, so agentText/turnComplete still
@@ -1483,6 +1866,33 @@
           });
           self.audioRejected = true;
           if (self.opts.onAudioRejected) { try { self.opts.onAudioRejected(ev.reason); } catch (e) {} }
+        }
+        /*
+         * v5.34.39 — RESOURCE_EXHAUSTED is not a slow model.
+         *
+         * The unattended soak finally caught it: six 10-minute sessions in an
+         * afternoon and the SAME configuration that had answered 34 of 35 turns
+         * with a 1.2 s median came back with a 31.8 s median, half the turns
+         * unanswered, and a run of closes ending in
+         *   1011 — Resource has been exhausted (e.g. check quota).
+         * Google is rate-limiting the PROJECT, and until now that arrived in
+         * the app as "the interviewer has gone quiet" — indistinguishable from
+         * a bad model, a bad network or a bug in this code, which is why it was
+         * chased through nine releases of model and VAD and thinking settings.
+         *
+         * Named here so it can never be read as silence again, and so the one
+         * response that actually helps — wait, do not immediately re-mint — can
+         * be taken by the bridge.
+         */
+        var quotaExhausted = /resource has been exhausted|RESOURCE_EXHAUSTED|check quota|rate.?limit/i.test(String(ev.reason || ''));
+        if (quotaExhausted) {
+          vlog('!!! GOOGLE IS RATE-LIMITING THIS PROJECT — 1011 RESOURCE_EXHAUSTED. Not a model fault and not a bug: ' +
+               'the project has spent its Live API allowance. Reconnecting immediately makes it worse.', {
+            code: ev.code, reason: ev.reason, model: self.grant && self.grant.model,
+            secondsSinceOpen: self.startedAt ? Math.round((Date.now() - self.startedAt) / 1000) : 0
+          });
+          self.quotaExhausted = true;
+          if (self.opts.onQuotaExhausted) { try { self.opts.onQuotaExhausted(ev.reason); } catch (e) {} }
         }
         if (self.opts.onClose) { try { self.opts.onClose(ev.code, ev.reason, sawSetup); } catch (e) {} }
         if (!settled) {
@@ -1617,6 +2027,9 @@
     // Release the unused part of the reservation. keepalive so it still goes
     // out if the interviewee closed the tab — otherwise an abandoned session
     // silently forfeits its whole 45-minute reservation against the firm's cap.
+    // v5.34.52: a handover or a hang-up lands mid-turn far more often than
+    // not. Bank whatever that turn had accrued before reporting.
+    this._bankTurnUsage();
     if (this.grant) {
       var seconds = this.startedAt ? Math.round((Date.now() - this.startedAt) / 1000) : 0;
       try {

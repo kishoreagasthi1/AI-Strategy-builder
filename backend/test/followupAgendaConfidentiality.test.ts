@@ -25,7 +25,7 @@
  * projects away. A consultant who wants to say something specific still can, by
  * writing it into `text` — which is then a decision somebody made.
  */
-import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { describe, it, expect, beforeAll, beforeEach, afterAll } from "vitest";
 import pg from "pg";
 import { migrate } from "../src/db/migrate.js";
 import { initPool, closePool } from "../src/db/pool.js";
@@ -161,6 +161,31 @@ describe.skipIf(!ENABLED)("drafting and delivering a follow-up agenda (V2-M1)", 
     await admin.end();
     await app.close();
     await closePool();
+  });
+
+  /*
+   * Every test below builds the SAME fixture: Dana Reed, at Acme, round 1.
+   *
+   * That was fine until v5.34.11 added the duplicate-interview guard, which
+   * refuses a second interview for the same (person, client, round) with a
+   * 409 — correctly. From that release on, the first test in this file passed
+   * and every later one failed at its own fixture, on a 409 that has nothing
+   * to do with what the test is about. Seven red tests that looked like a
+   * confidentiality regression and were not.
+   *
+   * The guard is right and stays; the fixture is what was wrong. Clearing
+   * Dana's rows between tests restores the isolation each test always assumed
+   * it had, without weakening a single assertion.
+   */
+  beforeEach(async () => {
+    await admin.query("BEGIN");
+    await admin.query("SELECT set_config('app.tenant_id', $1, true)", [tenant]);
+    await admin.query(
+      `DELETE FROM interview_transcripts WHERE tenant_id = $1 AND interviewee_name = 'Dana Reed'`,
+      [tenant]);
+    await admin.query(
+      `DELETE FROM interviews WHERE tenant_id = $1 AND interviewee_name = 'Dana Reed'`, [tenant]);
+    await admin.query("COMMIT");
   });
 
   /** Invite Dana, complete her interview, and put the round in the workspace. */

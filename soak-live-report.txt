@@ -1,0 +1,31 @@
+soak-live 2026-09-11T11:49:58.806Z model=models/gemini-3.1-flash-live-preview minutes=20
+[    0.0s] starting: 20 minutes on models/gemini-3.1-flash-live-preview
+[    0.2s] TTS models available to this key: models/gemini-2.5-flash-preview-tts, models/gemini-2.5-pro-preview-tts, models/gemini-3.1-flash-tts-preview
+[    0.2s] using models/gemini-2.5-flash-preview-tts
+[    0.2s] generating 5 spoken answers with gemini-2.5-flash-preview-tts (cached in soak-answers/)
+[   11.6s]   answer 1: 11.7s
+[   19.5s]   answer 2: 11.6s
+[   34.4s]   answer 3: 12.0s
+[   74.3s]   answer 4: 10.5s
+[   81.0s]   answer 5: 10.0s
+[   81.2s] conn 1: setupComplete
+[  103.4s] conn 1 turn 1: reply 1023ms | heard "The biggest constraint is not tooling, it is that our master" | said "That's a significant challenge. How are you currently managing that manual recon"
+[  136.7s] conn 1 turn 2: reply 12748ms | heard "We have run three pilots, one for demand forecasting, one fo" | said "Interesting that forecasting succeeded despite the data issues. What was differe"
+[  160.1s] conn 1 turn 3: reply NONE | heard "Governance sits with a steering committee that meets monthly"
+[  160.1s] conn 1: HEARD the answer and did NOT reply at minute 2.7 — the real signature.
+[  160.1s] conn 1 ended: close 1011 Internal error encountered. (handle kept)
+[  160.3s] conn 2: setupComplete (resumed)
+[  199.8s] conn 2 turn 1: reply 18588ms | heard "We have run three pilots, one for demand forecasting, one fo" | said "Interesting that forecasting succeeded despite the data issues. What was differe"
+[  260.4s] conn 2 turn 2: reply 40620ms | heard "Governance sits with a steering committee that meets monthly" | said "That sounds like a bottleneck. Are there any plans to integrate reviews earlier "
+[  304.1s] conn 2 turn 3: reply 23391ms | heard "Skills are the part I worry about most. We can hire data eng" | said "That gap can cause major delays. Are you considering any data literacy programs "
+[  339.7s] conn 2 turn 4: reply 15849ms | heard "We centralized data and analytics about two years ago, and m" | said "How does the central team coordinate with those federated analysts? Is there a p"
+[  376.2s] conn 2 turn 5: reply 15714ms | heard "The biggest constraint is not tooling. It is that our master" | said "That's a significant challenge. How are you currently managing that manual recon"
+[  475.6s] conn 2 turn 6: reply NONE | heard "We have run three pilots, one for demand forecasting, one fo"
+[  475.6s] conn 2: HEARD the answer and did NOT reply at minute 7.9 — the real signature.
+[  475.6s] conn 2 ended: close 1008 The operation was aborted. (handle kept)
+[  476.2s] conn 3: setupComplete (resumed)
+[  526.9s] conn 3 turn 1: reply 9969ms | heard "Governance sits with a steering committee that meets monthly" | said "That sounds like a bottleneck. Are there any plans to integrate reviews earlier "
+[  540.2s] conn 3 turn 2: reply -10187ms | heard "Skills are the part I worry about most. We can hire data eng" | said "cycle?That gap can cause major delays. Are you considering any data literacy pro"
+[  555.1s] conn 3 turn 3: reply -11716ms | heard "We centralized data and analytics about two years ago, and m" | said "embedding dataHow does the central team coordinate with those federated analysts"
+[  569.8s] conn 3 turn 4: reply -11652ms | heard "The biggest constraint is not tooling, it is that our master" | said "or aligning models with the masterThat's a significant challenge. How are you cu"
+[  585.0s] conn 3 turn 5: reply -12142ms | heard "We have run three pilots, one for demand forecasting, one fo" | said "are thereInteresting that forecasting succeeded despite the data issues. What wa"

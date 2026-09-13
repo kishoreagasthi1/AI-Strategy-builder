@@ -1,0 +1,13 @@
+# Keep the build context small and the image honest. (v5.34.63)
+#
+# Without this, `COPY backend ./backend` copies the HOST's node_modules over the
+# ones `npm ci` just installed inside the image — so the container would run
+# against macOS-built native modules, and the whole point of testing in a pinned
+# Linux image would be lost. It is also the difference between a context of a
+# few MB and one of several hundred.
+**/node_modules
+**/dist
+.git
+*.zip
+backend/coverage
+frontend/.firebase

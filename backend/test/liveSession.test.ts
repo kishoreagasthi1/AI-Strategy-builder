@@ -11,13 +11,31 @@
  * The property that matters most is the last one: a hostile client must not be
  * able to talk its way into MORE budget by lying at reconciliation time.
  */
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, beforeAll, afterAll } from "vitest";
 import {
   reserveTokensFor, reserveSession, reconcileSession,
   makeLiveSession, AUDIO_TOKENS_PER_SECOND, MAX_SESSION_SECONDS,
-  DEFAULT_SESSION_SECONDS, TASK_HOLD, TASK_HOLD_RELEASE, TASK_ACTUAL, NON_BILLABLE_TASKS,
+  DEFAULT_SESSION_SECONDS, TASK_HOLD, TASK_HOLD_RELEASE, TASK_ACTUAL, NON_BILLABLE_TASKS, liveThinkingBudget, liveVadConfig, liveCompressionConfig, liveResumptionEnabled,
 } from "../src/llm/liveSession.js";
 import { PRICE_TABLE, estimateCost } from "../src/llm/types.js";
+
+/**
+ * v5.34.32: these tests describe the token with NO operator env set. The
+ * deploy gate runs in the operator's shell, where GEMINI_LIVE_* / VYNE_LIVE_*
+ * are exported for the deploy itself — and that leaked into the assertions
+ * (a real deploy was aborted by it). Snapshot and clear them for this file;
+ * tests that need a value set it themselves and restore it.
+ */
+const ENV_PREFIXES = ["GEMINI_LIVE_", "VYNE_LIVE_"];
+const envSnapshot: Record<string, string | undefined> = {};
+beforeAll(() => {
+  for (const k of Object.keys(process.env)) {
+    if (ENV_PREFIXES.some((p) => k.startsWith(p))) { envSnapshot[k] = process.env[k]; delete process.env[k]; }
+  }
+});
+afterAll(() => {
+  for (const [k, v] of Object.entries(envSnapshot)) { if (v !== undefined) process.env[k] = v; }
+});
 
 const base = {
   tenantId: "t1", userId: "u1", module: "interview_agent",
@@ -198,12 +216,13 @@ describe("the minted grant", () => {
     // degrades to a plain token and reports pinned:false so the caller knows
     // it must send the persona itself.
     const bodies: any[] = [];
-    let call = 0;
+    // v5.34.24: the ladder now sheds optional fields (transcription extras,
+    // thinking) before giving up the pin, so "the constraint field itself is
+    // unknown" is modelled as: every body carrying it is rejected.
     const fetchImpl = vi.fn(async (_u: any, init: any) => {
-      bodies.push(JSON.parse(init.body));
-      call++;
-      if (call < 3) {
-        return { ok: false, status: 400, text: async () => 'Unknown name "x" at \'auth_token\': Cannot find field.' } as any;
+      const b = JSON.parse(init.body); bodies.push(b);
+      if (b.bidiGenerateContentSetup) {
+        return { ok: false, status: 400, text: async () => 'Unknown name "bidiGenerateContentSetup" at \'auth_token\': Cannot find field.' } as any;
       }
       return { ok: true, json: async () => ({ name: "eph" }) } as any;
     });
@@ -211,6 +230,7 @@ describe("the minted grant", () => {
     const grant = await live.mint("s", 600, "You are an interviewer.");
     expect(grant.token).toBe("eph");
     expect(grant.pinned).toBe(false);
+    expect(bodies.length).toBe(5);                        // 2 feature sets × 2 shapes + bare
     expect(bodies[bodies.length - 1].uses).toBe(1);       // still single-use
     expect(bodies[bodies.length - 1].expireTime).toBeDefined();  // still bounded
   });
@@ -313,5 +333,222 @@ describe("voice selection (v5.32.47)", () => {
     // differently in both places, and both were wrong.
     expect(c.generationConfig.speechConfig.voiceConfig.prebuiltVoiceConfig.voiceName).toBe("Orus");
     expect(c.speechConfig, "speechConfig must not sit beside generationConfig").toBeUndefined();
+  });
+});
+
+describe("thinking budget is OPT-IN and never costs the persona pin (v5.34.22)", () => {
+  const okFetch = (bodies: any[]) => vi.fn(async (_u: any, init: any) => {
+    bodies.push(JSON.parse(init.body));
+    return { ok: true, json: async () => ({ name: "eph" }) } as any;
+  });
+  const setup = (b: any) => b.bidiGenerateContentSetup?.setup ?? b.bidiGenerateContentSetup;
+
+  it("unset: the wire is byte-for-byte what 5.34.21 sent (no thinkingConfig)", async () => {
+    const prev = process.env.GEMINI_LIVE_THINKING_BUDGET;
+    delete process.env.GEMINI_LIVE_THINKING_BUDGET;
+    try {
+      const bodies: any[] = [];
+      const live = makeLiveSession({ apiKey: "k", fetchImpl: okFetch(bodies) as any, paidTier: true });
+      const g = await live.mint("s", 900, "persona");
+      expect(bodies.length).toBe(1);
+      expect(setup(bodies[0]).generationConfig.thinkingConfig).toBeUndefined();
+      expect(g.pinned).toBe(true);
+      expect(g.thinkingBudget).toBeUndefined();
+    } finally { if (prev !== undefined) process.env.GEMINI_LIVE_THINKING_BUDGET = prev; }
+  });
+
+  it("set to 0: thinkingConfig.thinkingBudget=0 sits under generationConfig on the FIRST attempt", async () => {
+    const bodies: any[] = [];
+    const live = makeLiveSession({ apiKey: "k", fetchImpl: okFetch(bodies) as any, paidTier: true, thinkingBudget: 0 });
+    const g = await live.mint("s", 900, "persona");
+    expect(bodies.length).toBe(1);
+    const c = setup(bodies[0]);
+    expect(c.generationConfig.thinkingConfig).toEqual({ thinkingBudget: 0 });
+    expect(c.thinkingConfig, "must not sit beside generationConfig").toBeUndefined();
+    expect(c.systemInstruction.parts[0].text).toBe("persona");
+    expect(g.pinned).toBe(true);
+    expect(g.thinkingBudget).toBe(0);
+  });
+
+  it("rejected thinkingConfig falls back to the SAME pinned shape without it — pinned stays true", async () => {
+    const bodies: any[] = [];
+    const fetchImpl = vi.fn(async (_u: any, init: any) => {
+      const b = JSON.parse(init.body); bodies.push(b);
+      if (setup(b)?.generationConfig?.thinkingConfig) {
+        return { ok: false, status: 400, text: async () => 'Invalid JSON payload received. Unknown name "thinkingConfig"' } as any;
+      }
+      return { ok: true, json: async () => ({ name: "eph" }) } as any;
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const live = makeLiveSession({ apiKey: "k", fetchImpl: fetchImpl as any, paidTier: true, thinkingBudget: 0 });
+      const g = await live.mint("s", 900, "persona");
+      expect(g.pinned).toBe(true);
+      expect(g.thinkingBudget).toBeUndefined();
+      const last = setup(bodies[bodies.length - 1]);
+      expect(last.generationConfig.thinkingConfig).toBeUndefined();
+      expect(last.systemInstruction.parts[0].text).toBe("persona");   // the pin survived
+      expect(warn).toHaveBeenCalled();
+    } finally { warn.mockRestore(); }
+  });
+
+  it("a real error on a thinking attempt (403) still fails fast — no doomed retries", async () => {
+    let calls = 0;
+    const fetchImpl = vi.fn(async () => { calls++; return { ok: false, status: 403, text: async () => "API key not valid" } as any; });
+    await expect(makeLiveSession({ apiKey: "bad", fetchImpl: fetchImpl as any, thinkingBudget: 0 }).mint("s", 60))
+      .rejects.toThrow(/403/);
+    expect(calls).toBe(1);
+  });
+
+  it("garbage in the env var is ignored, not sent", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const prev = process.env.GEMINI_LIVE_THINKING_BUDGET;
+    try {
+      process.env.GEMINI_LIVE_THINKING_BUDGET = "lots";
+      expect(liveThinkingBudget()).toBeUndefined();
+      process.env.GEMINI_LIVE_THINKING_BUDGET = "-1";
+      expect(liveThinkingBudget()).toBeUndefined();
+      process.env.GEMINI_LIVE_THINKING_BUDGET = "0";
+      expect(liveThinkingBudget()).toBe(0);
+      process.env.GEMINI_LIVE_THINKING_BUDGET = "1024";
+      expect(liveThinkingBudget()).toBe(1024);
+      expect(liveThinkingBudget(0)).toBe(0);          // explicit option wins
+    } finally {
+      if (prev === undefined) delete process.env.GEMINI_LIVE_THINKING_BUDGET; else process.env.GEMINI_LIVE_THINKING_BUDGET = prev;
+      warn.mockRestore();
+    }
+  });
+});
+
+describe("token extras — transcription and manual VAD are pinned, and shed before the pin (v5.34.24)", () => {
+  const setup = (b: any) => b.bidiGenerateContentSetup?.setup ?? b.bidiGenerateContentSetup;
+  const okFetch = (bodies: any[]) => vi.fn(async (_u: any, init: any) => {
+    bodies.push(JSON.parse(init.body));
+    return { ok: true, json: async () => ({ name: "eph" }) } as any;
+  });
+
+  it("by default pins both transcriptions and NOT realtimeInputConfig", async () => {
+    const bodies: any[] = [];
+    const live = makeLiveSession({ apiKey: "k", fetchImpl: okFetch(bodies) as any, paidTier: true });
+    const g = await live.mint("s", 900, "persona");
+    const c = setup(bodies[0]);
+    expect(c.inputAudioTranscription).toEqual({});
+    expect(c.outputAudioTranscription).toEqual({});
+    expect(c.realtimeInputConfig).toBeUndefined();
+    expect(c.systemInstruction.parts[0].text).toBe("persona");
+    expect(g.pinned).toBe(true);
+    expect(g.pinnedExtras).toEqual({ transcription: true, manualVad: false, vad: undefined, resumption: true,
+      compression: { triggerTokens: 25600, slidingWindow: { targetTokens: 12800 } }, resumed: false });
+    expect(c.contextWindowCompression).toEqual({ triggerTokens: 25600, slidingWindow: { targetTokens: 12800 } });
+    expect(c.sessionResumption).toEqual({});
+  });
+
+  it("manualVad pins automaticActivityDetection.disabled into the token", async () => {
+    const bodies: any[] = [];
+    const live = makeLiveSession({ apiKey: "k", fetchImpl: okFetch(bodies) as any, paidTier: true });
+    const g = await live.mint("s", 900, "persona", undefined, { manualVad: true });
+    expect(setup(bodies[0]).realtimeInputConfig).toEqual({ automaticActivityDetection: { disabled: true } });
+    expect(g.pinnedExtras).toMatchObject({ transcription: true, manualVad: true, vad: { disabled: true }, resumption: true, resumed: false });
+  });
+
+  it("rejected extras are shed and the persona pin survives", async () => {
+    const bodies: any[] = [];
+    const fetchImpl = vi.fn(async (_u: any, init: any) => {
+      const b = JSON.parse(init.body); bodies.push(b);
+      if (setup(b)?.inputAudioTranscription) return { ok: false, status: 400, text: async () => 'Unknown name "inputAudioTranscription"' } as any;
+      return { ok: true, json: async () => ({ name: "eph" }) } as any;
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const live = makeLiveSession({ apiKey: "k", fetchImpl: fetchImpl as any, paidTier: true });
+      const g = await live.mint("s", 900, "persona", undefined, { manualVad: true });
+      expect(g.pinned).toBe(true);
+      expect(g.pinnedExtras).toEqual({ transcription: false, manualVad: false, vad: undefined, resumption: false, compression: undefined, resumed: false });
+      const last = setup(bodies[bodies.length - 1]);
+      expect(last.inputAudioTranscription).toBeUndefined();
+      expect(last.systemInstruction.parts[0].text).toBe("persona");
+    } finally { warn.mockRestore(); }
+  });
+});
+
+describe("VAD settings pinned from env (v5.34.28)", () => {
+  const ENV = ["GEMINI_LIVE_VAD_END_SENSITIVITY", "GEMINI_LIVE_VAD_START_SENSITIVITY", "GEMINI_LIVE_VAD_SILENCE_MS", "GEMINI_LIVE_VAD_PREFIX_MS"];
+  const save = () => Object.fromEntries(ENV.map((k) => [k, process.env[k]]));
+  const restore = (o: any) => ENV.forEach((k) => { if (o[k] === undefined) delete process.env[k]; else process.env[k] = o[k]; });
+  it("unset → nothing; manualVad alone → disabled only", () => {
+    const o = save(); ENV.forEach((k) => delete process.env[k]);
+    try {
+      expect(liveVadConfig(false)).toBeUndefined();
+      expect(liveVadConfig(true)).toEqual({ disabled: true });
+    } finally { restore(o); }
+  });
+  it("maps env to the documented wire names and rejects junk", () => {
+    const o = save();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      process.env.GEMINI_LIVE_VAD_END_SENSITIVITY = "high";
+      process.env.GEMINI_LIVE_VAD_SILENCE_MS = "600";
+      process.env.GEMINI_LIVE_VAD_START_SENSITIVITY = "medium";   // junk
+      delete process.env.GEMINI_LIVE_VAD_PREFIX_MS;
+      expect(liveVadConfig(false)).toEqual({ endOfSpeechSensitivity: "END_SENSITIVITY_HIGH", silenceDurationMs: 600 });
+      expect(warn).toHaveBeenCalled();
+    } finally { restore(o); warn.mockRestore(); }
+  });
+  it("lands under realtimeInputConfig.automaticActivityDetection in the token and is echoed in pinnedExtras", async () => {
+    const o = save();
+    try {
+      process.env.GEMINI_LIVE_VAD_END_SENSITIVITY = "HIGH"; process.env.GEMINI_LIVE_VAD_SILENCE_MS = "500";
+      const bodies: any[] = [];
+      const fetchImpl = vi.fn(async (_u: any, init: any) => { bodies.push(JSON.parse(init.body)); return { ok: true, json: async () => ({ name: "eph" }) } as any; });
+      const live = makeLiveSession({ apiKey: "k", fetchImpl: fetchImpl as any, paidTier: true });
+      const g = await live.mint("s", 900, "persona");
+      const c = bodies[0].bidiGenerateContentSetup;
+      expect(c.realtimeInputConfig).toEqual({ automaticActivityDetection: { endOfSpeechSensitivity: "END_SENSITIVITY_HIGH", silenceDurationMs: 500 } });
+      expect(g.pinnedExtras?.vad).toEqual({ endOfSpeechSensitivity: "END_SENSITIVITY_HIGH", silenceDurationMs: 500 });
+    } finally { restore(o); }
+  });
+});
+
+describe("session resumption handle is pinned into the renewed token (v5.34.29)", () => {
+  it("a resumeHandle lands in sessionResumption.handle and is echoed as resumed:true", async () => {
+    const bodies: any[] = [];
+    const fetchImpl = vi.fn(async (_u: any, init: any) => { bodies.push(JSON.parse(init.body)); return { ok: true, json: async () => ({ name: "eph" }) } as any; });
+    const live = makeLiveSession({ apiKey: "k", fetchImpl: fetchImpl as any, paidTier: true });
+    const g = await live.mint("s2", 900, "persona", undefined, { resumeHandle: "  handle-abc  " });
+    const c = bodies[0].bidiGenerateContentSetup;
+    expect(c.sessionResumption).toEqual({ handle: "handle-abc" });
+    expect(c.contextWindowCompression.slidingWindow.targetTokens).toBe(12800);
+    expect(g.pinnedExtras?.resumed).toBe(true);
+  });
+});
+
+describe("compression window and resumption switches (v5.34.30)", () => {
+  const ENV = ["GEMINI_LIVE_COMPRESS", "GEMINI_LIVE_COMPRESS_TRIGGER_TOKENS", "GEMINI_LIVE_COMPRESS_TARGET_TOKENS", "GEMINI_LIVE_RESUMPTION"];
+  const save = () => Object.fromEntries(ENV.map((k) => [k, process.env[k]]));
+  const restore = (o: any) => ENV.forEach((k) => { if (o[k] === undefined) delete process.env[k]; else process.env[k] = o[k]; });
+  it("defaults to the documented example window; env overrides; target never exceeds trigger", () => {
+    const o = save(); ENV.forEach((k) => delete process.env[k]);
+    try {
+      expect(liveCompressionConfig()).toEqual({ triggerTokens: 25600, slidingWindow: { targetTokens: 12800 } });
+      process.env.GEMINI_LIVE_COMPRESS_TRIGGER_TOKENS = "8000"; process.env.GEMINI_LIVE_COMPRESS_TARGET_TOKENS = "9000";
+      expect(liveCompressionConfig()).toEqual({ triggerTokens: 8000, slidingWindow: { targetTokens: 8000 } });
+      process.env.GEMINI_LIVE_COMPRESS = "0";
+      expect(liveCompressionConfig()).toBeUndefined();
+      expect(liveResumptionEnabled()).toBe(true);
+      process.env.GEMINI_LIVE_RESUMPTION = "off";
+      expect(liveResumptionEnabled()).toBe(false);
+    } finally { restore(o); }
+  });
+  it("with resumption off, no sessionResumption is pinned and a handle is ignored", async () => {
+    const o = save();
+    try {
+      process.env.GEMINI_LIVE_RESUMPTION = "0";
+      const bodies: any[] = [];
+      const fetchImpl = vi.fn(async (_u: any, init: any) => { bodies.push(JSON.parse(init.body)); return { ok: true, json: async () => ({ name: "eph" }) } as any; });
+      const g = await makeLiveSession({ apiKey: "k", fetchImpl: fetchImpl as any, paidTier: true }).mint("s", 900, "p", undefined, { resumeHandle: "H" });
+      expect(bodies[0].bidiGenerateContentSetup.sessionResumption).toBeUndefined();
+      expect(g.pinnedExtras?.resumption).toBe(false);
+      expect(g.pinnedExtras?.resumed).toBe(false);
+    } finally { restore(o); }
   });
 });

@@ -67,7 +67,7 @@
  * reports nothing at all simply forfeits the whole reservation, which is the
  * safe direction.
  */
-import type { LimitCheck, Meter } from "./gateway.js";
+import type { LimitCheck, Meter, Payer } from "./gateway.js";
 import { estimateCost } from "./types.js";
 import { withTenant } from "../db/pool.js";
 
@@ -191,6 +191,9 @@ export interface LiveSessionOptions {
   baseUrl?: string;
   /** Same meaning as tts.ts / geminiAiStudio.ts: true when the key is billed. */
   paidTier?: boolean;
+  /** Pin a thinkingBudget into the token (0 = no thinking). Defaults to
+   *  GEMINI_LIVE_THINKING_BUDGET; unset leaves the model's default. */
+  thinkingBudget?: number;
 }
 
 export interface LiveSessionGrant {
@@ -208,6 +211,12 @@ export interface LiveSessionGrant {
    *  False means the API rejected the constraint field and the caller must
    *  supply the system instruction in the client setup frame instead. */
   pinned: boolean;
+  /** The thinking budget actually pinned, when one was configured AND the
+   *  API accepted it. Echoed so the client trace can show it. */
+  thinkingBudget?: number;
+  /** Which optional setup fields the token actually carries (v5.34.24). */
+  pinnedExtras?: { transcription: boolean; manualVad: boolean; vad?: Record<string, unknown>;
+                   resumption?: boolean; compression?: Record<string, unknown>; resumed?: boolean };
 }
 
 /**
@@ -299,7 +308,8 @@ export function makeLiveSession(opts: LiveSessionOptions) {
      * and the response modality into the token itself, so the grant cannot be
      * redirected to something we did not price.
      */
-    async mint(sessionId: string, maxSeconds: number, systemInstruction?: string, requestedVoice?: string): Promise<LiveSessionGrant> {
+    async mint(sessionId: string, maxSeconds: number, systemInstruction?: string, requestedVoice?: string,
+               mintOpts?: { manualVad?: boolean; resumeHandle?: string }): Promise<LiveSessionGrant> {
       const useVoice = resolveVoice(requestedVoice, voice);
       const now = Date.now();
       const expireTime = new Date(now + maxSeconds * 1000).toISOString();
@@ -345,14 +355,61 @@ export function makeLiveSession(opts: LiveSessionOptions) {
        * Same nesting rule as the browser's setup frame: speechConfig lives
        * under generationConfig, NOT beside it.
        */
-      const constraints = {
+      const thinkingBudget = liveThinkingBudget(opts.thinkingBudget);
+      const manualVad = !!mintOpts?.manualVad;
+      /*
+       * v5.34.24: EXTRAS pinned into the token, not left to the browser's setup
+       * frame. A production trace (5.34.23) showed 22 s of agent audio with
+       * ZERO outputTranscription frames although the client's setup asked for
+       * both transcriptions — i.e. on the constrained endpoint the client's
+       * setup fields are not reliably honoured; what the token carries is what
+       * the session runs with. So the transcriptions (the transcript IS the
+       * product) and, when asked, the manual-VAD switch travel in the token.
+       * Unknown-field rejections drop the extras before they drop the pin.
+       */
+      const vad = liveVadConfig(manualVad);
+      const resumeHandle = (mintOpts?.resumeHandle || "").trim() || undefined;
+      /*
+       * v5.34.29: two more extras, both documented Live API session controls.
+       *
+       * contextWindowCompression (sliding window): without it an audio-only
+       * session is hard-capped at 15 minutes and its context grows without
+       * bound — which is the "slowed down after 7-8 minutes" report: every
+       * reply re-reads a longer history. The sliding window keeps the context
+       * bounded and lifts the cap.
+       *
+       * sessionResumption: the server hands the client a handle
+       * (sessionResumptionUpdate) that a NEW connection can present to carry
+       * the conversation over. Connections die at ~10 minutes regardless; with
+       * a handle the renewal keeps the interview's memory instead of starting
+       * Jack from a blank slate with a "connection was renewed" nudge.
+       */
+      const compression = liveCompressionConfig();
+      const resumptionOn = liveResumptionEnabled();
+      const extrasFor = () => ({
+        inputAudioTranscription: {},
+        outputAudioTranscription: {},
+        ...(compression ? { contextWindowCompression: compression } : {}),
+        ...(resumptionOn ? { sessionResumption: resumeHandle ? { handle: resumeHandle } : {} } : {}),
+        ...(vad ? { realtimeInputConfig: { automaticActivityDetection: vad } } : {}),
+      });
+      const constraintsFor = (withThinking: boolean, withExtras: boolean) => ({
         model,
         generationConfig: {
           responseModalities: ["AUDIO"],
           speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: useVoice } } },
+          // v5.34.22: OPT-IN. gemini-2.5 native-audio thinks (dynamic budget)
+          // before every reply, in text; that is the 3-15 s "nothing happening"
+          // after the interviewee speaks. thinkingBudget: 0 turns it off. Same
+          // nesting as the SDK (liveConnectConfigToMldev → generationConfig.
+          // thinkingConfig). Unset = wire unchanged from 5.34.21.
+          ...(withThinking && thinkingBudget !== undefined
+            ? { thinkingConfig: { thinkingBudget } }
+            : {}),
         },
         ...(systemInstruction ? { systemInstruction: { parts: [{ text: systemInstruction }] } } : {}),
-      };
+        ...(withExtras ? extrasFor() : {}),
+      });
 
       // Field-name candidates, most-preferred first. The empty entry is the
       // unconstrained fallback and must stay last.
@@ -360,15 +417,31 @@ export function makeLiveSession(opts: LiveSessionOptions) {
       // The `{ setup: constraints }` wrapper on the second attempt mirrors the
       // pre-flatten shape the SDK accepts from callers, in case this API
       // version does the flattening server-side instead.
-      const attempts: Array<Record<string, unknown>> = [
-        { ...base, bidiGenerateContentSetup: constraints },
-        { ...base, bidiGenerateContentSetup: { setup: constraints } },
-        { ...base },
+      //
+      // Optional features (thinking budget, extras) are shed one set at a time
+      // before pinning is given up: an unknown optional field must cost that
+      // feature, never the persona pin (a security boundary).
+      const wantThinking = thinkingBudget !== undefined;
+      const featureSets: Array<{ thinking: boolean; extras: boolean }> = [
+        { thinking: wantThinking, extras: true },
+        { thinking: wantThinking, extras: false },
+        ...(wantThinking ? [{ thinking: false, extras: true }, { thinking: false, extras: false }] : []),
       ];
+      type Attempt = { body: Record<string, unknown>; thinking: boolean; extras: boolean; pinned: boolean; optional: boolean };
+      const attempts: Attempt[] = [];
+      for (const fs of featureSets) {
+        const c = constraintsFor(fs.thinking, fs.extras);
+        const optional = fs.thinking || fs.extras;
+        attempts.push({ body: { ...base, bidiGenerateContentSetup: c }, ...fs, pinned: true, optional });
+        attempts.push({ body: { ...base, bidiGenerateContentSetup: { setup: c } }, ...fs, pinned: true, optional });
+      }
+      attempts.push({ body: { ...base }, thinking: false, extras: false, pinned: false, optional: false });
 
       let res: Response | undefined;
       let detail = "";
       let pinned = false;
+      let thinkingApplied = false;
+      let extrasApplied = false;
       for (let i = 0; i < attempts.length; i++) {
         res = await fetchImpl(`${baseUrl}/v1alpha/auth_tokens`, {
           method: "POST",
@@ -376,14 +449,26 @@ export function makeLiveSession(opts: LiveSessionOptions) {
           // Same key-transport reasoning as tts.ts and the AI Studio adapter:
           // newer "AQ."-prefixed keys 401 on the ?key= query form.
           headers: { "content-type": "application/json", "x-goog-api-key": opts.apiKey ?? "" },
-          body: JSON.stringify(attempts[i]),
+          body: JSON.stringify(attempts[i].body),
         });
-        if (res.ok) { pinned = i < attempts.length - 1; break; }
+        if (res.ok) { pinned = attempts[i].pinned; thinkingApplied = attempts[i].thinking; extrasApplied = attempts[i].extras; break; }
         detail = await res.text().catch(() => "");
         // Only a rejected FIELD NAME is worth retrying. A bad key, a quota
         // problem or a disabled API must surface immediately rather than being
-        // masked by two more doomed attempts.
+        // masked by two more doomed attempts. An attempt carrying OPTIONAL
+        // features is the one exception: ANY 400 there falls through to the
+        // next feature set, because the features are optional and the pin is not.
+        if (attempts[i].optional && res.status === 400) {
+          console.warn(`[liveSession] optional setup fields rejected by auth_tokens (thinking=${attempts[i].thinking}, extras=${attempts[i].extras}: ${detail.slice(0, 160)}); retrying with fewer`);
+          continue;
+        }
         if (!/Unknown name|Cannot find field/i.test(detail)) break;
+      }
+      if (thinkingBudget !== undefined && !thinkingApplied) {
+        console.warn(`[liveSession] GEMINI_LIVE_THINKING_BUDGET=${thinkingBudget} could not be pinned; session runs with the model default`);
+      }
+      if (!extrasApplied) {
+        console.warn(`[liveSession] transcription${manualVad ? "/manualVad" : ""} could not be pinned into the token; the browser's setup frame is the only carrier`);
       }
 
       if (!res || !res.ok) {
@@ -396,9 +481,117 @@ export function makeLiveSession(opts: LiveSessionOptions) {
       const token = data.token ?? data.name;
       if (!token) throw new Error("live-session: no token in response");
 
-      return { token, model, voice: useVoice, maxSeconds, expiresAt: expireTime, sessionId, pinned };
+      return { token, model, voice: useVoice, maxSeconds, expiresAt: expireTime, sessionId, pinned,
+               thinkingBudget: thinkingApplied ? thinkingBudget : undefined,
+               pinnedExtras: { transcription: extrasApplied, manualVad: extrasApplied && manualVad, vad: extrasApplied ? vad : undefined,
+                               resumption: extrasApplied && resumptionOn, compression: extrasApplied ? compression : undefined,
+                               resumed: extrasApplied && resumptionOn && !!resumeHandle } };
     },
   };
+}
+
+/**
+ * Context-window compression to pin into the token (v5.34.30).
+ *
+ * A native-audio session accrues ~25 tokens per second of audio in EACH
+ * direction; nothing about the model is "exponential", but every reply
+ * re-reads everything said so far, so per-turn latency climbs with the length
+ * of the conversation. 5.34.28's accidental 5-minute token reset the context
+ * every 5 minutes (fast, but amnesiac); 5.34.29 kept the context (right, but
+ * slower and slower). The documented answer is a sliding window with EXPLICIT
+ * sizes — the empty `slidingWindow: {}` 5.34.29 sent leaves the trigger at the
+ * server default, i.e. near the 128k ceiling, i.e. never in an interview.
+ *
+ *   GEMINI_LIVE_COMPRESS_TRIGGER_TOKENS   default 25600  (docs example)
+ *   GEMINI_LIVE_COMPRESS_TARGET_TOKENS    default 12800  (docs example; ≈8 min of audio)
+ *   GEMINI_LIVE_COMPRESS=0                 turn compression off entirely
+ *
+ * The persona (systemInstruction) is not part of the window; the scoring
+ * pass reads its own transcript. Only the model's short-term conversational
+ * memory is bounded, which is what an interviewer needs.
+ */
+export function liveCompressionConfig(): Record<string, unknown> | undefined {
+  const off = String(process.env.GEMINI_LIVE_COMPRESS ?? "").trim();
+  if (off === "0" || off.toLowerCase() === "false" || off.toLowerCase() === "off") return undefined;
+  const int = (raw: string | undefined, name: string, dflt: number) => {
+    if (raw === undefined || raw === "") return dflt;
+    const n = Number(raw);
+    if (!Number.isInteger(n) || n <= 0) { console.warn(`[liveSession] ${name}="${raw}" ignored — must be a positive integer`); return dflt; }
+    return n;
+  };
+  const trigger = int(process.env.GEMINI_LIVE_COMPRESS_TRIGGER_TOKENS, "GEMINI_LIVE_COMPRESS_TRIGGER_TOKENS", 25600);
+  const target = int(process.env.GEMINI_LIVE_COMPRESS_TARGET_TOKENS, "GEMINI_LIVE_COMPRESS_TARGET_TOKENS", 12800);
+  return { triggerTokens: trigger, slidingWindow: { targetTokens: Math.min(target, trigger) } };
+}
+
+/** `GEMINI_LIVE_RESUMPTION=0` disables session resumption (to isolate its
+ *  cost if a trace shows per-turn latency tracking sessionResumptionUpdate). */
+export function liveResumptionEnabled(): boolean {
+  const v = String(process.env.GEMINI_LIVE_RESUMPTION ?? "").trim().toLowerCase();
+  return !(v === "0" || v === "false" || v === "off");
+}
+
+/**
+ * Server-side voice-activity settings to pin into the token (v5.34.28).
+ *
+ * The first v1alpha production trace answered audio — with 13–28 s between the
+ * interviewee stopping and the model starting, and thought summaries arriving
+ * only ~0.5 s before the audio. That gap is the server deciding the turn has
+ * ended, not the model thinking. These knobs are the documented controls for
+ * it (Live API docs, automaticActivityDetection): a HIGH end-of-speech
+ * sensitivity and a short silence window close the turn sooner.
+ *
+ *   GEMINI_LIVE_VAD_END_SENSITIVITY = LOW | HIGH   → endOfSpeechSensitivity
+ *   GEMINI_LIVE_VAD_START_SENSITIVITY = LOW | HIGH → startOfSpeechSensitivity
+ *   GEMINI_LIVE_VAD_SILENCE_MS = <int>              → silenceDurationMs
+ *   GEMINI_LIVE_VAD_PREFIX_MS = <int>               → prefixPaddingMs
+ *
+ * Unset = nothing sent (server defaults). manualVad (from the browser flag)
+ * sets disabled:true alongside whatever is configured.
+ */
+export function liveVadConfig(manualVad: boolean): Record<string, unknown> | undefined {
+  const out: Record<string, unknown> = {};
+  const sens = (raw: string | undefined, prefix: string) => {
+    const v = String(raw || "").trim().toUpperCase();
+    if (!v) return undefined;
+    if (v === "LOW" || v === "HIGH") return `${prefix}_${v}`;
+    console.warn(`[liveSession] VAD sensitivity "${raw}" ignored — must be LOW or HIGH`);
+    return undefined;
+  };
+  const int = (raw: string | undefined, name: string) => {
+    if (raw === undefined || raw === "") return undefined;
+    const n = Number(raw);
+    if (!Number.isInteger(n) || n < 0) { console.warn(`[liveSession] ${name}="${raw}" ignored — must be a non-negative integer`); return undefined; }
+    return n;
+  };
+  const end = sens(process.env.GEMINI_LIVE_VAD_END_SENSITIVITY, "END_SENSITIVITY");
+  const start = sens(process.env.GEMINI_LIVE_VAD_START_SENSITIVITY, "START_SENSITIVITY");
+  const silence = int(process.env.GEMINI_LIVE_VAD_SILENCE_MS, "GEMINI_LIVE_VAD_SILENCE_MS");
+  const prefix = int(process.env.GEMINI_LIVE_VAD_PREFIX_MS, "GEMINI_LIVE_VAD_PREFIX_MS");
+  if (manualVad) out.disabled = true;
+  if (end) out.endOfSpeechSensitivity = end;
+  if (start) out.startOfSpeechSensitivity = start;
+  if (silence !== undefined) out.silenceDurationMs = silence;
+  if (prefix !== undefined) out.prefixPaddingMs = prefix;
+  return Object.keys(out).length ? out : undefined;
+}
+
+/**
+ * The thinking budget to pin, or undefined for "leave the model alone".
+ *
+ * Read from the option first, then GEMINI_LIVE_THINKING_BUDGET. Anything that
+ * is not a non-negative integer is treated as unset and warned about once,
+ * rather than sent to Google as a string and rejected on every mint.
+ */
+export function liveThinkingBudget(explicit?: number): number | undefined {
+  const raw = explicit !== undefined ? String(explicit) : process.env.GEMINI_LIVE_THINKING_BUDGET;
+  if (raw === undefined || raw === "") return undefined;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 0) {
+    console.warn(`[liveSession] GEMINI_LIVE_THINKING_BUDGET="${raw}" ignored — must be a non-negative integer (0 disables thinking)`);
+    return undefined;
+  }
+  return n;
 }
 
 export type LiveSession = ReturnType<typeof makeLiveSession>;
@@ -481,10 +674,10 @@ export async function findOpenHold(
   tenantId: string,
   userId: string,
   sessionId: string
-): Promise<{ tokensIn: number; tokensOut: number } | null> {
+): Promise<{ tokensIn: number; tokensOut: number; payer: Payer; payerKeyHint?: string } | null> {
   return withTenant(tenantId, async (c) => {
-    const r = await c.query<{ tokens_in: number; tokens_out: number }>(
-      `SELECT h.tokens_in, h.tokens_out
+    const r = await c.query<{ tokens_in: number; tokens_out: number; payer: string | null; payer_key_hint: string | null }>(
+      `SELECT h.tokens_in, h.tokens_out, h.payer, h.payer_key_hint
          FROM usage_events h
         WHERE h.tenant_id = current_setting('app.tenant_id', true)::uuid
           AND h.user_id = $1
@@ -501,7 +694,18 @@ export async function findOpenHold(
     );
     const row = r.rows[0];
     if (!row) return null;
-    return { tokensIn: Number(row.tokens_in), tokensOut: Number(row.tokens_out) };
+    /*
+     * The payer comes from the STORED hold for the same reason the amounts do
+     * (v5.32.54, above): the browser must have no say in who gets billed. A
+     * request that could name its own payer could move an interview onto — or
+     * off — a client's account from the client's own laptop.
+     */
+    return {
+      tokensIn: Number(row.tokens_in),
+      tokensOut: Number(row.tokens_out),
+      payer: row.payer === "client_key" ? "client_key" : "platform",
+      payerKeyHint: row.payer_key_hint ?? undefined,
+    };
   });
 }
 
@@ -518,9 +722,17 @@ export async function reconcileSession(
      * NEVER derive this from anything the browser sent.
      */
     reservedOverride?: { tokensIn: number; tokensOut: number };
+    /**
+     * v5.34.59 — whose credential paid. Both rows written here MUST carry the
+     * same value as the hold they compensate; the caller reads it from the
+     * ledger (findOpenHold), never from the request body.
+     */
+    payer?: Payer;
+    payerKeyHint?: string;
   }
 ): Promise<void> {
   const reserved = args.reservedOverride ?? reserveTokensFor(args.maxSeconds);
+  const payer: Payer = args.payer ?? "platform";
 
   // 1. Release the ENTIRE hold. Previously this wrote a partial refund, which
   //    left the difference sitting in usage_events looking like consumption —
@@ -533,6 +745,7 @@ export async function reconcileSession(
     tokensIn: -reserved.tokensIn, tokensOut: -reserved.tokensOut,
     costEstUsd: -estimateCost(args.model, reserved.tokensIn, reserved.tokensOut),
     latencyMs: 0, ok: true, clientName: args.clientName,
+    payer, payerKeyHint: args.payerKeyHint,
   });
 
   // 2. Record what the session ACTUALLY used. Clamped to the hold, so a client
@@ -550,5 +763,6 @@ export async function reconcileSession(
     costEstUsd: estimateCost(args.model, usedIn, usedOut),
     latencyMs: Math.round(args.actualSeconds * 1000), ok: true,
     clientName: args.clientName,
+    payer, payerKeyHint: args.payerKeyHint,
   });
 }

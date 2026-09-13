@@ -562,6 +562,7 @@ body{font-family:'Inter',sans-serif;background:var(--navy);color:var(--white);mi
         <div class="status-dot" id="status-dot"></div>
         <span id="status-text">Ready</span>
       </div>
+      <span title="Your voice is turned into text as you speak. The audio is not kept; the transcript is, so your scores can be explained." style="font-size:10px;color:#5E6B77;border:1px solid rgba(1,32,61,0.15);border-radius:999px;padding:3px 9px;margin-right:8px;letter-spacing:0.02em;white-space:nowrap;cursor:help;">Transcribed, not recorded</span>
       <span id="iv-clock" title="Elapsed interview time — stops while paused" style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;color:#5E6B77;margin-right:8px;min-width:44px;display:inline-block;text-align:right;">00:00</span>
       <button id="iv-pause" onclick="togglePause()" title="Pause the interview and stop the clock" style="padding:6px 12px;background:rgba(1,32,61,0.05);border:1px solid rgba(1,32,61,0.15);border-radius:8px;color:var(--mid-gray);font-size:11px;cursor:pointer;font-family:'Inter',sans-serif;margin-right:6px;">⏸ Pause</button>
       <button onclick="finishInterview()" style="padding:6px 12px;background:rgba(1,32,61,0.05);border:1px solid rgba(1,32,61,0.15);border-radius:8px;color:var(--mid-gray);font-size:11px;cursor:pointer;font-family:'Inter',sans-serif;">Finish & Export</button>
@@ -2240,10 +2241,39 @@ function buildRecognition(){
       console.warn('Speech recognition error:', e.error);
     }
   };
+  /*
+   * v5.34.22: EVERY start/stop of the legacy recogniser is traced with the
+   * caller's stack. This object opens its OWN getUserMedia stream and its own
+   * MediaRecorder; if it ever runs while the live session owns the microphone
+   * there are two capture chains and two turn-takers on one interview, and
+   * that must be visible in the trace as a line with a stack — not inferred.
+   */
+  ['start','stop','abort'].forEach(function(m){
+    var f=r[m]; if(typeof f!=='function') return;
+    r[m]=function(){
+      VL('recognition.'+m+'()', { liveOwns: (typeof liveOwnsConversation==='function') && liveOwnsConversation(),
+        isListening: !!S.isListening, via: viaStack() });
+      return f.apply(r, arguments);
+    };
+  });
   return r;
 }
 
 async function toggleMic(){
+  /*
+   * v5.34.22: the microphone has ONE owner. While the realtime session is
+   * running it holds the capture stream and the model does the turn-taking;
+   * this button used to start a SECOND capture (VyneRecognition → its own
+   * getUserMedia + MediaRecorder + red RECORDING banner) on top of it — the
+   * "clicked the mic, it turned red, still recording after I stopped" report.
+   * On the live path the button is an indicator (see setLiveMicUI); Pause is
+   * the way to stop the interviewer hearing you.
+   */
+  if(liveOwnsConversation()){
+    VL('CLICK: mic button while LIVE owns the mic — ignored', { via: viaStack() });
+    showToast('🎤 Live voice is on — just speak. Use ⏸ Pause to mute.');
+    return;
+  }
   if(S.isSpeaking||S.isThinking)return;
 
   if(S.isListening){
@@ -2263,8 +2293,10 @@ async function toggleMic(){
   if(micPermission==='unknown'){
     const ok=await requestMicPermission();
     if(!ok){showToast('Microphone denied -- use text input below');return;}
-    recognition=buildRecognition();
   }
+  // v5.34.22: built lazily — a live interview never builds it at all, and a
+  // standard interview that started after a live one ended needs it now.
+  if(!recognition && micPermission!=='denied') recognition=buildRecognition();
   if(!recognition){showToast('Speech not supported -- use Chrome or Edge');return;}
 
   // Do NOT clear transcript on restart -- accumulate across pause+resume cycles
@@ -2311,8 +2343,9 @@ function onSpeakEnd(){
   setStatus('','Ready');
   document.getElementById('waveform').classList.add('idle');
   document.getElementById('btn-mic').disabled=false;
-  // Auto-open mic after agent speaks
-  if(S.voiceMode!=='text'&&recognition&&!S.isThinking){
+  // Auto-open mic after agent speaks — text+TTS path ONLY. On the live path
+  // the model owns the microphone (v5.34.22).
+  if(S.voiceMode!=='text'&&recognition&&!S.isThinking&&!liveOwnsConversation()){
     setTimeout(()=>{
       if(!S.isListening&&!S.isThinking&&!S.isSpeaking){
         // Clear previous answer -- this is a new question from the agent
@@ -2342,6 +2375,10 @@ function ttsVoice(){
 
 async function speak(text){
   if(S.voiceMode==='text')return;
+  // v5.34.22: ONE audio output. TTS never plays over a live session — that
+  // is two voices on one interview, and it is what a "distorted" or
+  // "different voice" report sounds like from the interviewee's chair.
+  if(liveOwnsConversation()){ VL('speak() SUPPRESSED — live session owns audio output', { text: String(text).slice(0,60), via: viaStack() }); return; }
   if(window._vyneHoldSpeech){
     // Tap-to-begin overlay is still up: hold playback, but synthesize NOW so
     // the voice is ready the instant the user taps (seamless first question).
@@ -2428,10 +2465,36 @@ function showToast(msg,duration=5000){
   document.body.appendChild(el);setTimeout(()=>el&&el.remove(),duration);
 }
 
+/** The interviewer's display name — the identity the setup assigned, and the
+ *  name the persona actually introduces itself with. Falls back only when no
+ *  identity was assigned at all. */
+function agentLabel(){
+  try{
+    return (LIVE && LIVE.opts && LIVE.opts.interviewerName) || S.interviewerName || 'VYNE Agent';
+  }catch(e){ return 'VYNE Agent'; }
+}
+/** Initials for the avatar bubble: "Jack Smith" → "JS". */
+function agentInitials(){
+  var n=String(agentLabel()||'').trim();
+  if(!n || n==='VYNE Agent') return 'VY';
+  var parts=n.split(/\s+/).filter(Boolean);
+  return ((parts[0][0]||'')+(parts.length>1?parts[parts.length-1][0]:'')).toUpperCase() || 'VY';
+}
+
 function addMessage(role,text,extra={}){
   const isAI=role==='ai';
   const timestamp=new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
-  const av=isAI?'VY':(S.stakeholderName?S.stakeholderName[0].toUpperCase():'U');
+  /*
+   * v5.34.41 — the interviewer has a NAME, and it is not "VYNE Agent".
+   *
+   * The setup assigns an identity (assignedInterviewerIdentity → S.interviewerName,
+   * e.g. "Jack Smith"), the persona introduces itself by that name, and the
+   * voice says it aloud in the first sentence — and then every chat bubble was
+   * labelled "VYNE Agent" by a hardcoded string. To the interviewee that is two
+   * different people in one conversation, and it undercuts the one thing the
+   * product is selling: that this is an interview with somebody.
+   */
+  const av=isAI?agentInitials():(S.stakeholderName?S.stakeholderName[0].toUpperCase():'U');
   const wrap=document.getElementById('messages-wrap');
   const div=document.createElement('div');
   div.className='msg';
@@ -2441,14 +2504,14 @@ function addMessage(role,text,extra={}){
     :fmt(text);
 
   const clarifyHtml=(!isAI&&!extra.docInfo&&!extra.isClarification)
-    ?`<div style="margin-top:6px"><button class="clarify-btn" data-original="${encodeURIComponent(text)}" onclick="openClarifyModal(this)">✏️ Clarify this answer</button></div>`
+    ?`<div style="margin-top:6px"><button class="clarify-btn" data-original="${encodeURIComponent(text)}" onclick="openClarifyModal(this)">✏️ Add to this answer</button></div>`
     :'';
 
   div.innerHTML=`
     <div class="msg-avatar ${isAI?'ai':'user'}">${esc(av)}</div>
     <div class="msg-content">
       <div class="msg-name ${isAI?'ai':'user'}">
-        ${isAI?'VYNE Agent':esc(S.stakeholderName||'You')}
+        ${isAI?esc(agentLabel()):esc(S.stakeholderName||'You')}
         <span class="msg-time">${timestamp}</span>
       </div>
       <div class="msg-bubble ${isAI?'ai':'user'} ${extra.docInfo?'doc-card':''} ${extra.isClarification?'clarification':''}">${bubbleContent}</div>
@@ -2467,7 +2530,7 @@ function addMessage(role,text,extra={}){
 function showTyping(){
   const wrap=document.getElementById('messages-wrap');
   const d=document.createElement('div');d.className='msg';d.id='typing';
-  d.innerHTML=`<div class="msg-avatar ai">VY</div><div class="msg-content"><div class="msg-name ai">VYNE Agent</div><div class="typing-indicator"><div class="typing-dot"></div><div class="typing-dot"></div><div class="typing-dot"></div></div></div>`;
+  d.innerHTML=`<div class="msg-avatar ai">${esc(agentInitials())}</div><div class="msg-content"><div class="msg-name ai">${esc(agentLabel())}</div><div class="typing-indicator"><div class="typing-dot"></div><div class="typing-dot"></div><div class="typing-dot"></div></div></div>`;
   wrap.appendChild(d);wrap.scrollTop=wrap.scrollHeight;
 }
 function hideTyping(){const e=document.getElementById('typing');if(e)e.remove();}
@@ -2494,13 +2557,13 @@ function openClarifyModal(btn){
   modal.className='modal-overlay';modal.id='clarify-modal';
   modal.innerHTML=`
     <div class="modal-box">
-      <div class="modal-title">✏️ Clarify Your Answer</div>
-      <div class="modal-sub">Your original answer stays in the conversation. This sends a clarification the agent will incorporate into the assessment scoring.</div>
+      <div class="modal-title">✏️ Add to Your Answer</div>
+      <div class="modal-sub">Your original answer stays in the conversation. This adds to it, and the agent will take both into account when scoring.</div>
       <div class="original-quote">"${esc(original.length>200?original.substring(0,200)+'...':original)}"</div>
-      <textarea class="clarify-textarea" id="clarify-text" placeholder="Type your clarification or correction here..."></textarea>
+      <textarea class="clarify-textarea" id="clarify-text" placeholder="Add anything you left out, or correct something you said..."></textarea>
       <div class="modal-btns">
         <button class="btn-modal-cancel" onclick="closeClarifyModal()">Cancel</button>
-        <button class="btn-modal-submit" onclick="submitClarification('${encodeURIComponent(original)}')">Send Clarification →</button>
+        <button class="btn-modal-submit" onclick="submitClarification('${encodeURIComponent(original)}')">Send →</button>
       </div>
     </div>`;
   document.body.appendChild(modal);
@@ -2513,10 +2576,10 @@ function closeClarifyModal(){
 
 async function submitClarification(encodedOriginal){
   const clarifyText=document.getElementById('clarify-text')?.value?.trim();
-  if(!clarifyText){showToast('Please type your clarification.');return;}
+  if(!clarifyText){showToast('Please type what you would like to add.');return;}
   const original=decodeURIComponent(encodedOriginal);
   closeClarifyModal();
-  addMessage('user',`📝 Clarification: ${clarifyText}`,{isClarification:true});
+  addMessage('user',`📝 Added: ${clarifyText}`,{isClarification:true});
   await sendToAgent(`I want to clarify or add to my previous answer. Original: "${original.substring(0,300)}". My clarification: ${clarifyText}`);
 }
 
@@ -3271,6 +3334,9 @@ function buildSystemPrompt(){
 }
 
 async function callClaude(message){
+  // v5.34.22: the TEXT model is being asked to take a turn. On a live
+  // interview this must never happen; the stack says who asked.
+  VL('callClaude() — TEXT path taking a turn', { liveOwns: liveOwnsConversation(), text: String(message).slice(0,60), via: viaStack() });
   const messages=[...S.messages,{role:'user',content:message}];
   const res=await vyneLLM({
     method:'POST',
@@ -3382,10 +3448,19 @@ function applyScoreData(scoreData){
 }
 
 async function sendToAgent(message){
+  VL('sendToAgent()', { liveOwns: liveOwnsConversation(), liveAlive: (typeof liveActive==='function') && liveActive(),
+                        text: String(message).slice(0,60), via: viaStack() });
   // When realtime owns the conversation, a typed message is spoken into the
   // SAME session rather than starting a parallel text conversation — two
   // conversations against one interview would produce contradictory scores.
-  if(typeof liveActive==='function' && liveActive()){
+  // v5.34.22: "owns" rather than "is alive right now". A session mid-renewal
+  // is not alive for a second or two, and that second used to be enough for a
+  // message to fall through to the text model and be answered by TTS — in a
+  // different voice, on a different transcript, on top of the returning live
+  // session. LIVE.say() holds the message and sends it into the renewed
+  // socket instead. The text path is only for an interview live never had, or
+  // has definitively lost (LIVE.stopped).
+  if(liveOwnsConversation()){
     try{ LIVE.say(message); }catch(e){}
     return;
   }
@@ -3825,7 +3900,57 @@ function buildLiveContext(){
   if(S.isRefreshMode && S.refreshScope && S.refreshScope.length){
     parts.push('This is a follow-up round. Focus on: ' + S.refreshScope.join(', ') + '.');
   }
-  return parts.join('\n').slice(0, 5500);
+  /*
+   * v5.34.33 — what has already been said, so "continue later" continues.
+   *
+   * A deep dive can end before it is finished: the duration ceiling, a lapsed
+   * grant, a closed laptop, or the interviewee simply having to go. The
+   * transcript survives (liveAppend mirrors it into S.displayMessages and
+   * every turn autosaves), but a resumed session was told only "welcome me
+   * back and ask your next question" — so the interviewer walked back in with
+   * no memory and re-asked ground already covered, which to the interviewee is
+   * indistinguishable from having wasted the first hour.
+   *
+   * The prior conversation therefore goes into the session context, which the
+   * server fences as DATA inside the persona (interviewerPersona.ts) rather
+   * than as instructions. Bounded from the END: the recent exchanges are what
+   * the next question should follow from, and the whole block has to fit
+   * inside MAX_CONTEXT_CHARS alongside everything above.
+   */
+  var prior = priorTranscriptBlock(3200);
+  if(prior){
+    parts.push('');
+    parts.push(prior);
+  }
+  return parts.join('\n').slice(0, 5800);
+}
+
+/**
+ * The tail of the conversation so far, as plain labelled turns, plus which
+ * dimensions already have evidence. Returns '' when there is nothing to carry.
+ */
+function priorTranscriptBlock(budget){
+  try{
+    var msgs = (S.displayMessages || []).filter(function(m){ return m && m.text; });
+    if(!msgs.length) return '';
+    var lines = [];
+    var used = 0;
+    for(var i = msgs.length - 1; i >= 0; i--){
+      var who = msgs[i].role === 'user' ? (S.stakeholderName || 'Interviewee') : 'You (the interviewer)';
+      var line = who + ': ' + String(msgs[i].text).replace(/\s+/g, ' ').trim();
+      if(line.length > 400) line = line.slice(0, 400) + '…';
+      if(used + line.length > budget) break;
+      used += line.length + 1;
+      lines.unshift(line);
+    }
+    if(!lines.length) return '';
+    var covered = Object.keys(S.scores || {}).filter(function(d){ return S.scores[d]; });
+    var head = ['This interview is being CONTINUED — it has already been running and was interrupted.',
+                'Do not start over and do not re-ask what is already answered below. Pick up from the last exchange.'];
+    if(covered.length) head.push('Dimensions with evidence already: ' + covered.join(', ') + '.');
+    if(lines.length < msgs.length) head.push('(Earlier exchanges omitted; the most recent ' + lines.length + ' are below.)');
+    return head.join('\n') + '\nConversation so far:\n' + lines.join('\n');
+  }catch(e){ return ''; }
 }
 
 /** Returns true when the live session is running and owns the conversation. */
@@ -3845,6 +3970,26 @@ function buildLiveContext(){
  */
 function liveActive(){
   return !!(LIVE && LIVE.session && !LIVE.stopped && LIVE.isAlive());
+}
+
+/**
+ * Does the realtime path OWN this interview's microphone, audio output and
+ * turn-taking? (v5.34.22)
+ *
+ * Distinct from liveActive(), which asks whether the socket is usable at this
+ * instant. Ownership is coarser and stickier: it starts when a live session
+ * is created and ends only when the live path is over for good (LIVE.stopped —
+ * finished, restarted, or a renewal that failed). In between, a lapsed grant
+ * being renewed still OWNS the interview; nothing else may capture the mic,
+ * play audio, or take a turn while it comes back. Every "two systems fighting"
+ * bug in this file came from a check that was momentarily false.
+ */
+function liveOwnsConversation(){
+  return !!(LIVE && !LIVE.stopped);
+}
+/** Four frames of caller stack, for trace lines that ask "who did this". */
+function viaStack(){
+  try{ return String(new Error().stack||'').split('\n').slice(2,6).join(' | '); }catch(e){ return 'unavailable'; }
 }
 
 /** Shared live-path trace (vyne-live.js). No-op if that file is stale-cached. */
@@ -3877,6 +4022,51 @@ function clearLivePreparing(){
   LIVE_AWAITING_FIRST_AUDIO = false;
   VL('UI: first audio — clearing preparing message');
   try{ setStatus('ready','Listening...'); }catch(e){}
+}
+
+/* ── LIVE MICROPHONE UI (v5.34.22) ──────────────────────────────────────────
+ * On the live path the microphone is always open and the model decides when
+ * a turn ends. The voice bar was still showing the standard controls — a mic
+ * TOGGLE and "Click 🎤 to start · click again to stop · click Send" — which
+ * is an instruction to start the OTHER microphone. So while live owns the
+ * conversation the button becomes an indicator with a level meter, and the
+ * placeholder says what is actually true.
+ */
+function setLiveMicUI(on){
+  var btn=document.getElementById('btn-mic'), ph=document.getElementById('transcript-placeholder');
+  var vt=document.getElementById('voice-transcript');
+  if(!btn) return;
+  VL('UI: setLiveMicUI(' + !!on + ')');
+  if(on){
+    btn.classList.remove('active'); btn.disabled=false;
+    btn.title='Live voice — the interviewer is listening. Use Pause to mute.';
+    btn.innerHTML='🎤<span id="live-mic-meter" style="position:absolute;left:6px;right:6px;bottom:5px;height:3px;border-radius:2px;background:rgba(1,32,61,0.18);overflow:hidden"><span id="live-mic-meter-fill" style="display:block;height:100%;width:0%;background:#2F7D4F;transition:width 80ms linear"></span></span>';
+    btn.style.position='relative';
+    if(ph) ph.textContent='Live voice — just speak. The interviewer is listening and will reply when you pause.';
+    if(vt) vt.classList.remove('listening');
+    document.getElementById('waveform').classList.remove('idle');
+  }else{
+    btn.innerHTML='🎤'; btn.style.position='';
+    btn.title='Click to start speaking — click again to pause/stop';
+    if(ph) ph.textContent='Click 🎤 to start · click again to stop · click Send or press Enter';
+  }
+}
+function setLiveMicLevel(rms){
+  var fill=document.getElementById('live-mic-meter-fill');
+  if(!fill) return;
+  // ~0.05 RMS is a normal speaking level on a laptop mic with AGC.
+  var pct=Math.min(100, Math.round(Math.sqrt(Math.min(1, rms/0.05))*100));
+  fill.style.width=pct+'%';
+  fill.style.background = pct>20 ? '#2F7D4F' : '#9AA5AF';
+}
+/** thinking → speaking → idle, per model turn. */
+function setLiveTurnState(st){
+  if(LIVE_AWAITING_FIRST_AUDIO && st!=='speaking') return;   // the opening has its own message
+  if(IV_CLOCK.paused) return;
+  var who=(LIVE && LIVE.opts && LIVE.opts.interviewerName) || 'The interviewer';
+  if(st==='thinking') setStatus('thinking', who + ' is thinking…');
+  else if(st==='speaking') setStatus('speaking', who + ' is speaking — you can interrupt');
+  else setStatus('ready','Listening...');
 }
 
 function startLiveVoice(isResume){
@@ -3935,6 +4125,88 @@ function startLiveVoice(isResume){
     // reasoning text itself is never rendered — it is not what it said.
     onAgentThinking: function(){ if(LIVE_AWAITING_FIRST_AUDIO) setLivePreparing(); },
     onAgentSpeaking: function(){ clearLivePreparing(); },
+    // v5.34.22: what the interviewee sees between saying something and
+    // hearing the answer. A native-audio model can think for several seconds
+    // per reply; with the status stuck on "Listening..." that read as a dead
+    // line and sent people to the mic button.
+    onTurnState: function(st){
+      setLiveTurnState(st);
+      // A reply arriving clears a previous "no reply" warning on the badge.
+      if(st==='speaking'){ var b=document.getElementById('vyne-voice-badge'); if(b && /no reply/.test(b.textContent)) setVoiceBadge('live', LIVE_VOICE_IN_USE); }
+    },
+    onMicLevel: function(rms){ setLiveMicLevel(rms); },
+    onMicSilent: function(info){
+      setVoiceBadge('live', LIVE_VOICE_IN_USE + ' · ⚠ mic is silent — check your input device');
+    },
+    onAudioRejected: function(){
+      setVoiceBadge('live', LIVE_VOICE_IN_USE + ' · ⚠ Google rejected your last answer (1007 audio) — reconnecting');
+    },
+    /*
+     * v5.34.39: the project is rate-limited. Say THAT, rather than leaving a
+     * silence the interviewee reads as a broken product or their own bad
+     * microphone. The unattended soak proved this is what a "slow, degrading
+     * interview" has actually been: the same configuration that answered in
+     * 1.2 s early in the day answered in 32 s once the project's Live
+     * allowance was spent, and the app had no way to say so.
+     */
+    /*
+     * v5.34.40 — speak a reply the model only sent as text.
+     *
+     * Found by the unattended soak on a perfectly healthy socket: the model
+     * understood the answer, composed its next question (the output
+     * transcript proves it) and sent no audio. liveAppend has already put
+     * that text on screen, so the interviewee is reading a question they
+     * cannot hear — which is exactly the "agent was typing text" report.
+     *
+     * TTS is normally SUPPRESSED while live owns the audio output, and that
+     * rule exists for a good reason (two voices on one interview). This is the
+     * one exception, and it is bounded: only the turn's own text, only when no
+     * audio came, and cancelled the moment Google's voice does arrive.
+     */
+    onReplyWithoutAudio: function(text){
+      if(S.voiceMode === 'text') return;
+      var clean = String(text || '').replace(/[*#_`]/g,'').replace(/\n+/g,' ').trim();
+      if(!clean) return;
+      VL('app: speaking a reply that arrived without audio', { chars: clean.length });
+      setVoiceBadge('live', LIVE_VOICE_IN_USE + ' · ⚠ no voice from Google on that reply — reading it aloud');
+      try{
+        if(window.__vyneFallbackVoice){ try{ window.__vyneFallbackVoice.pause(); }catch(e){} }
+        window.__vyneFallbackVoice = window.vyneSpeak(clean, {
+          voice: ttsVoice(),
+          onended: function(){ window.__vyneFallbackVoice = null; }
+        });
+        if(LIVE && LIVE.session) LIVE.session._spokeFallback = true;
+      }catch(e){ VL('app: fallback speech THREW', e && e.message); }
+    },
+    /* The real voice turned up after all — stop ours mid-sentence rather than
+     * let two interviewers talk at once. */
+    onAudioArrivedLate: function(){
+      try{
+        if(window.__vyneFallbackVoice){ window.__vyneFallbackVoice.pause(); window.__vyneFallbackVoice = null; }
+      }catch(e){}
+      setVoiceBadge('live', LIVE_VOICE_IN_USE);
+    },
+    onQuotaExhausted: function(info){
+      var secs = info && info.waitMs ? Math.round(info.waitMs / 1000) : 0;
+      setVoiceBadge('live', LIVE_VOICE_IN_USE + ' · ⏳ Google is rate-limiting this project' +
+                    (secs ? ' — waiting ' + secs + 's before reconnecting' : ''));
+      try{ setStatus('thinking', 'The voice service is rate-limited right now. Holding your place — ' +
+                                 'your answers are saved and it will pick up where you left off.'); }catch(e){}
+    },
+    onApiMismatch: function(){
+      setVoiceBadge('live', LIVE_VOICE_IN_USE + ' · ⚠ API service is on an older build — redeploy the API');
+    },
+    onUplinkIgnored: function(st){
+      // Speech-level audio went up and the server did not react at all. This
+      // is the S1 signature; the trace line carries the verdict (quiet vs
+      // server-side) and which experiment flag to try next.
+      setVoiceBadge('live', LIVE_VOICE_IN_USE + ' · ⚠ your voice is not reaching the interviewer (' + (st && st.meanRms < 0.02 ? 'too quiet' : 'server did not react') + ')');
+    },
+    onNoReply: function(n){
+      // The model transcribed the interviewee and never answered. Say so on
+      // the badge rather than leaving "Listening..." to imply otherwise.
+      setVoiceBadge('live', LIVE_VOICE_IN_USE + ' · ⚠ no reply to your last answer (turn ' + n + ')');
+    },
     onPartialAgent: function(t){ clearLivePreparing(); liveAppend('ai', t); },
     onPartialUser:  function(t){ liveAppend('user', t); },
     // The badge names the voice the session actually opened with — the value
@@ -3984,12 +4256,60 @@ function startLiveVoice(isResume){
     // happening rather than flashing an alarming "session ended".
     onRenewing: function(n){ setVoiceBadge('live', LIVE_VOICE_IN_USE + ' · reconnecting (' + n + ')'); },
     onRenewed: function(){ setVoiceBadge('live', LIVE_VOICE_IN_USE); },
+    /*
+     * v5.34.42 — the handover reconnected but the interviewer never spoke.
+     * Say so. The previous behaviour was to leave the interviewee listening to
+     * a dead line for the rest of the interview, which is exactly what the
+     * 10-minute trace showed ("Are you there?" — transcribed, never answered).
+     */
+    onRenewSilent: function(){
+      setVoiceBadge('live', LIVE_VOICE_IN_USE + ' · reconnecting');
+      try{ setStatus('thinking', 'Reconnecting your interviewer — one moment.'); }catch(e){}
+    },
     onError: function(r){ setVoiceBadge('standard', liveReasonText(r)); },
-    onEnded: function(){ setVoiceBadge('standard', 'session ended'); }
+    onEnded: function(r, turns){
+      /*
+       * v5.34.33 — an interview that ends early must still be an interview.
+       *
+       * Turn-by-turn autosave is debounced (autoSave → 1.2 s), so the last
+       * exchange of a session that ends abruptly — a refused handover, the
+       * duration ceiling, a dropped connection — could be the one that never
+       * reached storage. Save SYNCHRONOUSLY here, with no debounce, before
+       * anything else: this is the last moment the page is guaranteed to be
+       * alive, and what is written is what the interviewee can come back to.
+       *
+       * The transcript itself lives in S.displayMessages (liveAppend mirrors
+       * every fragment), and buildLiveContext feeds it back into the resumed
+       * session, so continuing later resumes the conversation rather than
+       * restarting it.
+       */
+      try{ saveSession(); }catch(e){}
+      VL('app onEnded — interview state saved for resume', {
+        reason: r, turns: (turns && turns.length) || 0,
+        displayMessages: (S.displayMessages && S.displayMessages.length) || 0,
+        sessionCode: S.sessionCode || null });
+      var resumable = r !== 'finished' && r !== 'interview_finished';
+      setVoiceBadge('standard', r === 'audio_rejected'
+        ? 'Google is rejecting audio turns on this model (1007) — standard voice for now'
+        : r === 'quota_exhausted'
+          ? 'Google is rate-limiting this project — your answers are saved; resume in a few minutes'
+          : r === 'renew_silent'
+          ? 'the voice connection would not come back — your answers are saved; resume with your code'
+          : (resumable ? 'session ended — your answers are saved; you can resume with your code'
+                       : 'session ended'));
+      if(resumable){
+        try{ setStatus('idle', 'Your interview is saved. Resume any time with code ' +
+                              (S.sessionCode || 'shown on your setup screen') + '.'); }catch(e){}
+      }
+      // Live is over for good (LIVE.stopped) unless it is merely paused; only
+      // then does the microphone go back to the standard controls.
+      if(!liveOwnsConversation()) setLiveMicUI(false);
+    }
   });
   try{ setStatus('thinking', 'Connecting to your interviewer…'); }catch(e){}
   return LIVE.start().then(function(){
     setVoiceBadge('live', LIVE_VOICE_IN_USE);
+    setLiveMicUI(true);
     // NOT "Listening..." — the socket is up, but the model has not spoken yet
     // and may not for another ten to twenty seconds. Saying we are listening
     // here is precisely what made a normal wait read as a dead line.
@@ -4149,6 +4469,7 @@ async function setInterviewPaused(paused){
     }
     liveBreakTurn();
     setPausedUI(true);
+    setLiveMicLevel(0);
     autoSave();
   }else{
     // RESUME. If the live session outlived its grant during a long pause it is
@@ -4181,6 +4502,24 @@ async function setInterviewPaused(paused){
     setPausedUI(false);
   }
 }
+
+/*
+ * v5.34.22: release the live grant when the page goes away (S4).
+ *
+ * A hard refresh closes the WebSocket but never ran stop(), so the budget
+ * hold on the server stayed OPEN. Holds are counted for ten minutes
+ * (routes/voice.ts OPEN_SESSION_WINDOW_SECONDS) against a cap of three, so
+ * the third refresh in ten minutes was refused with too_many_live_sessions —
+ * and the page did what it is built to do on a refusal: fell back to text +
+ * TTS. That is the "VYNE_Agent speaking after a hard refresh" report. stop()
+ * posts /close with keepalive, which survives the unload.
+ */
+window.addEventListener('pagehide', function(){
+  if(LIVE && !LIVE.stopped){
+    VL('pagehide — releasing live grant');
+    try{ LIVE.stop('page_unload'); }catch(e){}
+  }
+});
 
 // Thin wrapper — the button just flips the single source of truth.
 async function togglePause(){
@@ -4244,7 +4583,9 @@ function launchInterviewScreen(isResume){
   const is=document.getElementById('interview-screen');is.style.display='flex';
   document.getElementById('header-meta').textContent=`${S.client} · ${S.stakeholderName||S.stakeholderRole} · ${S.industry}`;
   showSessionCodeBar();
-  if(S.voiceMode!=='text')recognition=buildRecognition();
+  // v5.34.22: the legacy recogniser is built on the tap, and only when the
+  // live path is not taking the interview. Building it here left a second
+  // microphone owner lying around on every live interview.
   // Load benchmarks from pre-engagement briefing into session state
   var briefingForBenchmarks = loadBriefingContext(S.client);
   if(briefingForBenchmarks && briefingForBenchmarks.benchmarks){
@@ -4331,10 +4672,14 @@ function launchInterviewScreen(isResume){
     // Unlock audio
     try{const ac=new(window.AudioContext||window.webkitAudioContext)();const b=ac.createBuffer(1,1,22050);const s=ac.createBufferSource();s.buffer=b;s.connect(ac.destination);s.start();}catch(e){}
     // Request mic
+    // v5.34.22: permission is checked here so a denial can route to text mode
+    // BEFORE the live path is attempted, but the legacy recogniser is no
+    // longer built here. It is built only if the live path is unavailable (see
+    // below): on a live interview it must not exist at all.
+    var micOk = true;
     if(S.voiceMode!=='text'){
-      const ok=await requestMicPermission();
-      if(ok){recognition=buildRecognition();}
-      else{document.getElementById('text-toggle-btn').click();showToast('Microphone denied -- switched to text mode');}
+      micOk=await requestMicPermission();
+      if(!micOk){document.getElementById('text-toggle-btn').click();showToast('Microphone denied -- switched to text mode');}
     }
     // ── REALTIME FIRST (v5.32.41) ────────────────────────────────────────
     // Try the speech-native path. If it is unavailable for ANY reason — no key
@@ -4365,6 +4710,9 @@ function launchInterviewScreen(isResume){
     window._vyneHoldSpeech=false;
     var held=(window._vyneHeldSpeech||[]).splice(0);
     if(!wentLive){
+      // Standard path: the legacy recogniser is the microphone owner here.
+      if(S.voiceMode!=='text' && micOk && !recognition){ recognition=buildRecognition(); }
+      setLiveMicUI(false);
       held.forEach(function(t){ speak(t); });
       // Realtime was skipped or failed, and we deferred the opening rather than
       // prefetching it. Run it now on the text path so the interview still starts.
@@ -4894,6 +5242,70 @@ document.addEventListener('DOMContentLoaded', function(){
     document.body.appendChild(prev);
   };
 
+  /*
+   * v5.34.45 — WHAT THE INTERVIEWEE IS TOLD, BEFORE THE MICROPHONE OPENS.
+   *
+   * privacy.html and dpa.html already described voice handling accurately, and
+   * neither was linked from anything the INTERVIEWEE sees. The only notice on
+   * this path was "the agent speaks questions aloud and listens to your
+   * responses", on the consultant's setup screen. So the person whose voice is
+   * processed was never shown what happens to it.
+   *
+   * Why this matters beyond courtesy: several US states (California, Illinois,
+   * Florida, Pennsylvania, Washington, Massachusetts among them) require ALL
+   * parties to consent before a conversation is intercepted, and the statutes
+   * are not limited to saved audio — the federal definition is the "aural or
+   * other acquisition of the contents" through a device, which a transcript
+   * plainly is. The live CIPA litigation turns almost entirely on one thing:
+   * whether an UNDISCLOSED THIRD PARTY received the contents. Ours is Google,
+   * in real time, and "we do not keep a recording" does not answer that — the
+   * audio still leaves the browser. So the disclosure names it.
+   *
+   * Deliberately an explicit tick rather than notice-by-proximity. In an
+   * all-party state the defensible artefact is an affirmative act, and it is
+   * stored with the session (see S.consent) so there is a record that it
+   * happened and which wording was shown.
+   */
+  var CONSENT_VERSION = '2026-09-12';
+  var CONSENT_TEXT =
+    'This interview is transcribed, not recorded. Your voice is turned into text as you speak, ' +
+    'and the audio is not kept. The transcript is stored so your answers can be explained — it is ' +
+    'what lets us show why each readiness score was given. Speech is processed by a third-party AI ' +
+    'provider (Google) to produce that text. Your consulting team can read the transcript; it is ' +
+    'not shared outside the engagement.';
+
+  function consentBlock(){
+    return '<div style="background:rgba(1,32,61,0.04);border:1px solid rgba(1,32,61,0.12);border-radius:10px;padding:14px 16px;margin-bottom:16px">' +
+        '<div style="font-size:12px;font-weight:700;color:#132433;letter-spacing:0.02em;margin-bottom:6px">Transcribed, not recorded</div>' +
+        '<div style="font-size:12px;color:#46535F;line-height:1.6;margin-bottom:10px">' + esc(CONSENT_TEXT) + '</div>' +
+        '<label style="display:flex;align-items:flex-start;gap:9px;cursor:pointer;font-size:12px;color:#132433;line-height:1.5">' +
+          '<input type="checkbox" id="iv-consent" onchange="_vyneConsentChanged()" style="margin-top:2px;width:16px;height:16px;flex:none;cursor:pointer">' +
+          '<span>I understand, and I agree to continue. ' +
+            '<a href="privacy.html" target="_blank" rel="noopener" style="color:#7A5C1E;font-weight:600;text-decoration:underline">Privacy notice</a></span>' +
+        '</label>' +
+      '</div>';
+  }
+
+  /** Enable the start buttons only once the box is ticked. */
+  window._vyneConsentChanged = function(){
+    var ok = !!(document.getElementById('iv-consent') || {}).checked;
+    var btns = document.querySelectorAll('[data-needs-consent]');
+    for (var i = 0; i < btns.length; i++) {
+      btns[i].disabled = !ok;
+      btns[i].style.opacity = ok ? '1' : '0.45';
+      btns[i].style.cursor = ok ? 'pointer' : 'not-allowed';
+    }
+  };
+
+  /** Record WHAT was agreed and WHEN, with the session. A consent nobody can
+   *  evidence afterwards is not much use when it is asked about. */
+  window._vyneRecordConsent = function(){
+    try {
+      S.consent = { acknowledgedAt: new Date().toISOString(), version: CONSENT_VERSION, text: CONSENT_TEXT };
+      if (typeof saveSession === 'function') saveSession();
+    } catch (e) {}
+  };
+
   function renderWelcome(){
     var prior = latestSession();
     var round = roundInfo();
@@ -4931,7 +5343,8 @@ document.addEventListener('DOMContentLoaded', function(){
               return '<div style="font-size:13px;color:#132433;line-height:1.6;margin-bottom:6px"><span style="color:#7A5C1E;font-weight:700;font-size:11px">' + esc(a.dimension) + '</span> — ' + esc(a.text) + '</div>';
             }).join('') +
           '</div>' +
-          '<button style="' + BTN + ';background:#C6A46B;color:#01203D" onclick="_vyneIvFresh(false)">▶ Begin Follow-up Interview</button>' +
+          consentBlock() +
+          '<button data-needs-consent disabled style="' + BTN + ';background:#C6A46B;color:#01203D;opacity:0.45;cursor:not-allowed" onclick="_vyneRecordConsent();_vyneIvFresh(false)">▶ Begin Follow-up Interview</button>' +
         '</div>';
       return;
     }
@@ -4947,10 +5360,11 @@ document.addEventListener('DOMContentLoaded', function(){
           esc(iv.interviewee_role) + ' · ' + esc(iv.client_name) +
           (round && round.refresh ? ' · <span style="color:#7A5C1E;font-weight:600">' + esc(round.label) + '</span>' : '') + '</div>' +
         '<div style="font-size:13px;color:#46535F;line-height:1.65;margin-bottom:18px">A guided conversation about your organisation\'s AI readiness, led by an AI interviewer. Speak or type your answers — everything saves automatically, and you can pause any time and pick up where you left off.</div>' +
+        consentBlock() +
         (started
-          ? '<button style="' + BTN + ';background:#C6A46B;color:#01203D" onclick="_vyneIvResume()">▶ Continue where you left off</button>' +
-            '<button style="' + BTN + ';background:rgba(1,32,61,0.06);color:#46535F;border:1px solid rgba(1,32,61,0.15)" onclick="_vyneIvFresh(true)">Start over from the beginning</button>'
-          : '<button style="' + BTN + ';background:#C6A46B;color:#01203D" onclick="_vyneIvFresh(false)">▶ ' + startLabel + '</button>') +
+          ? '<button data-needs-consent disabled style="' + BTN + ';background:#C6A46B;color:#01203D;opacity:0.45;cursor:not-allowed" onclick="_vyneRecordConsent();_vyneIvResume()">▶ Continue where you left off</button>' +
+            '<button data-needs-consent disabled style="' + BTN + ';background:rgba(1,32,61,0.06);color:#46535F;border:1px solid rgba(1,32,61,0.15);opacity:0.45;cursor:not-allowed" onclick="_vyneRecordConsent();_vyneIvFresh(true)">Start over from the beginning</button>'
+          : '<button data-needs-consent disabled style="' + BTN + ';background:#C6A46B;color:#01203D;opacity:0.45;cursor:not-allowed" onclick="_vyneRecordConsent();_vyneIvFresh(false)">▶ ' + startLabel + '</button>') +
         previewLink +
       '</div>';
   }

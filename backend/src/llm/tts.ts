@@ -115,6 +115,50 @@ export function makeTts(opts: TtsOptions) {
   const fetchImpl = opts.fetchImpl ?? fetch;
   const baseUrl = opts.baseUrl ?? "https://generativelanguage.googleapis.com";
 
+  /**
+   * The model id actually in use, once a 404 has taught us better (v5.34.37).
+   *
+   * ── Why this is needed ──────────────────────────────────────────────────
+   *
+   * The literal above is a GUESS about Google's catalogue, and on 2026-09-11 it
+   * was shown to be wrong for a live project: ListModels offered
+   * `gemini-2.5-flash-preview-tts`, `gemini-2.5-pro-preview-tts` and
+   * `gemini-3.1-flash-tts-preview`, and NOT `gemini-2.5-flash-tts`. So every
+   * TTS call 404'd.
+   *
+   * That failure was invisible because TTS is the FALLBACK path: it only runs
+   * when realtime voice is unavailable, which is precisely the moment nobody
+   * is in a position to debug a second failure. An interview would have lost
+   * its voice entirely with nothing but a 502 in a log.
+   *
+   * A pinned id cannot be right forever — preview ids retire, GA ids appear —
+   * so the id stops being load-bearing: on a 404 the catalogue is consulted
+   * and a TTS model that this key really has is used instead. The operator is
+   * told which, so `GEMINI_TTS_MODEL` can pin it and skip the round trip.
+   */
+  let discovered: string | null = null;
+
+  /** TTS models this key can actually call, best first. */
+  async function discoverTtsModel(): Promise<string | null> {
+    try {
+      const r = await fetchImpl(`${baseUrl}/v1beta/models?pageSize=1000`, {
+        signal: AbortSignal.timeout(PROVIDER_TIMEOUT_MS),
+        headers: { "x-goog-api-key": opts.apiKey ?? "" },
+      });
+      if (!r.ok) return null;
+      const data = (await r.json()) as { models?: { name?: string; supportedGenerationMethods?: string[] }[] };
+      const usable = (data.models ?? []).filter((m) =>
+        /tts/i.test(m.name ?? "") && (m.supportedGenerationMethods ?? []).includes("generateContent"));
+      if (!usable.length) return null;
+      // Selection is on CAPABILITY, then on a preference for the cheap fast
+      // tier — never on a remembered name, which is what failed here.
+      const pick = usable.find((m) => /flash/i.test(m.name ?? "")) ?? usable[0];
+      return (pick.name ?? "").replace(/^models\//, "") || null;
+    } catch {
+      return null;
+    }
+  }
+
   return {
     isConfigured: () => Boolean(opts.apiKey),
     model,
@@ -122,10 +166,14 @@ export function makeTts(opts: TtsOptions) {
     /** See TtsOptions.paidTier doc comment. */
     freeTier: !opts.paidTier,
 
+    /** The id in use right now — the literal above, or what a 404 taught us. */
+    effectiveModel: () => discovered ?? model,
+
     async synthesize(text: string, voice?: string): Promise<TtsResult> {
       const voiceName = voice ?? defaultVoice;
-      const res = await fetchImpl(
-        `${baseUrl}/v1beta/models/${model}:generateContent`,
+      let useModel = discovered ?? model;
+      const call = (m: string) => fetchImpl(
+        `${baseUrl}/v1beta/models/${m}:generateContent`,
         {
           method: "POST",
           signal: AbortSignal.timeout(PROVIDER_TIMEOUT_MS),
@@ -145,9 +193,28 @@ export function makeTts(opts: TtsOptions) {
           }),
         }
       );
+      let res = await call(useModel);
+      /*
+       * A 404 here means the id is not in this key's catalogue — not that TTS
+       * is unavailable. Ask what is, once, and remember it for the process.
+       */
+      if (res.status === 404 && !discovered) {
+        const found = await discoverTtsModel();
+        if (found && found !== useModel) {
+          console.warn(
+            `[tts] ${useModel} is not available to this key (404). Using ${found} instead — ` +
+            `set GEMINI_TTS_MODEL=${found} on the service to pin it and skip this lookup.`
+          );
+          discovered = found;
+          useModel = found;
+          res = await call(useModel);
+        } else {
+          console.warn(`[tts] ${useModel} returned 404 and no alternative TTS model is available to this key`);
+        }
+      }
       if (!res.ok) {
         const detail = await res.text().catch(() => "");
-        throw new Error(`tts ${res.status}: ${detail.slice(0, 300)}`);
+        throw new Error(`tts ${res.status} (${useModel}): ${detail.slice(0, 300)}`);
       }
       const data = (await res.json()) as {
         candidates?: { content?: { parts?: { inlineData?: { mimeType?: string; data?: string } }[] } }[];
@@ -161,7 +228,7 @@ export function makeTts(opts: TtsOptions) {
       const rate = rateMatch ? Number(rateMatch[1]) : 24000;
       const wav = pcmToWav(Buffer.from(inline.data, "base64"), rate);
       return {
-        audioBase64: wav.toString("base64"), mime: "audio/wav", voice: voiceName, model,
+        audioBase64: wav.toString("base64"), mime: "audio/wav", voice: voiceName, model: useModel,
         usage: {
           tokensIn: data.usageMetadata?.promptTokenCount ?? 0,
           tokensOut: data.usageMetadata?.candidatesTokenCount ?? 0,

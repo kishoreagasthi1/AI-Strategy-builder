@@ -11,3 +11,26 @@ dist/
 coverage/
 .vscode/
 .idea/
+
+# v5.34.63. Scratch output from live voice/soak runs and one-off probes. These
+# are megabytes of generated audio and transcript dumps, not source; they were
+# never meant to be part of a release.
+*.zip
+*.wav
+voice-runs/
+voice-answers/
+soak-answers/
+_to_delete/
+elevenlabs-selfcheck.*
+voice-record.txt
+voice-selfcheck.txt
+voice-faultcheck.txt
+soak-base.txt
+soak-budget.txt
+soak-rested.txt
+base.txt
+base2.txt
+gen25.txt
+nocompress.txt
+think.txt
+/0

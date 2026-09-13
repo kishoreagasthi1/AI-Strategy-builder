@@ -41,7 +41,14 @@ export type AuditAction =
   | "subscription_checkout_started"
   | "subscription_checkout_completed"
   | "subscription_status_changed"
-  | "subscription_canceled";
+  | "subscription_canceled"
+  /*
+   * v5.34.63. Deleting an interview now erases its transcript — the verbatim
+   * conversation with a named executive — which until 034 no code path could
+   * remove at all. The content goes; this row is what is left to say it
+   * happened, and it carries names and a count but never any of the words.
+   */
+  | "transcript_erased";
 
 /**
  * Deliberately opens its OWN transaction rather than accepting an existing

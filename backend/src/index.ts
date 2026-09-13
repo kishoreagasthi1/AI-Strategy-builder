@@ -16,6 +16,7 @@ import { makeSubscriptionLimitCheck, withSubscriptionGate } from "./billing/subs
 import { makeGeminiAiStudioAdapter } from "./llm/adapters/geminiAiStudio.js";
 import { makeGeminiVertexAdapter } from "./llm/adapters/geminiVertex.js";
 import { makeAnthropicVertexAdapter } from "./llm/adapters/anthropicVertex.js";
+import { makeAnthropicApiAdapter } from "./llm/adapters/anthropicApi.js";
 import { makeOpenAiAdapter } from "./llm/adapters/openai.js";
 import { initSentry, initErrorReporting, captureError } from "./monitoring/errors.js";
 import { makeStripeClient } from "./billing/stripeClient.js";
@@ -122,6 +123,17 @@ async function main(): Promise<void> {
       }),
       makeGeminiVertexAdapter({ project: config.gcpProject, model: process.env.GEMINI_MODEL }),
       makeAnthropicVertexAdapter({ project: config.gcpProject, location: config.vertexLocation }),
+      /*
+       * v5.34.54 — Claude on an API KEY rather than GCP credentials.
+       *
+       * Registered so the name resolves for routing; the platform's own
+       * ANTHROPIC_API_KEY configures it when present, and it is skipped by the
+       * chain when absent (isConfigured). Its real purpose is BYOK: a client
+       * who wants their strategy deck on their OWN Anthropic account supplies a
+       * key, and anthropic-vertex has nowhere to put one — it authenticates
+       * with Application Default Credentials.
+       */
+      makeAnthropicApiAdapter({ apiKey: config.anthropicApiKey, model: process.env.ANTHROPIC_MODEL }),
       makeOpenAiAdapter({ apiKey: config.openaiApiKey }),
     ],
     meter: dbMeter,
