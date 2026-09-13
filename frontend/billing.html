@@ -172,8 +172,44 @@ tr.unattributed td{color:var(--quiet-soft);font-style:italic}
   </div>
   <div class="panel">
     <h2>Keys on file</h2>
+    <!--
+      v5.34.64. The sentence below is the rule the product now actually
+      enforces, and it is here rather than in a tooltip because it changes what
+      happens when something goes wrong: a client's interview can fail.
+    -->
+    <p class="hint" style="margin-bottom:12px">
+      A client with a key on file runs on <strong>their key alone</strong>. If it stops working,
+      their work stops with a message naming them — it does not quietly move onto your account.
+      Grant fallback below for any client whose work you would rather cover than interrupt.
+    </p>
     <div id="byok-list"><div class="hint">Loading…</div></div>
     <div id="byok-open-invites"></div>
+  </div>
+
+  <!--
+    v5.34.64 — permission for the firm's key to cover ONE client's failures.
+    Its own panel, beneath the keys, because it is only meaningful for a client
+    who HAS a key, and because it is a money decision that should not be
+    mistaken for a routing setting.
+  -->
+  <div class="panel">
+    <h2>If a client's key stops working</h2>
+    <p class="hint" style="margin-bottom:12px">
+      By default nothing runs on your account for a client who supplies their own key — a revoked key
+      or a lapsed billing account <strong>fails the work rather than moving the charge to you</strong>.
+      Granting fallback for a client reverses that for them: their documents, decks and interviews carry on,
+      on your key and your bill, whenever theirs is refused. Live interviews are the expensive case —
+      about $2 for 90 minutes — so this is worth granting deliberately rather than broadly.
+    </p>
+    <div class="row" style="gap:10px;flex-wrap:wrap">
+      <input type="text" id="grant-client" placeholder="Client name (exactly as on the engagement)"
+             style="flex:1;min-width:240px"/>
+      <input type="text" id="grant-reason" placeholder="Why (optional) — e.g. pilot, procurement pending"
+             style="flex:1;min-width:200px"/>
+      <button class="btn" onclick="saveGrant()">Grant fallback</button>
+    </div>
+    <div id="grant-msg" class="msg" style="margin-top:12px"></div>
+    <div id="grant-list"></div>
   </div>
 
   <!--
@@ -189,6 +225,24 @@ tr.unattributed td{color:var(--quiet-soft);font-style:italic}
       This <strong>reorders the providers you already allow</strong> for those tasks — it cannot route their
       work to a provider your policy excludes, and it never changes who pays. Voice interviews are not
       listed because live audio runs on Gemini regardless; no other provider here supports it.
+    </p>
+    <!--
+      v5.34.64. "It never changes who pays" was false for exactly one
+      combination until this release: a client holding a GOOGLE key who preferred
+      Anthropic had their work moved onto the FIRM's Anthropic account, because
+      the preference reordered the chain before their credential was substituted
+      into it. Found in production on 2026-09-13, on a real client, a minute
+      after the feature was first used.
+
+      The sentence is true again because a BYOK client's chain is now confined
+      to their own credentials — and this paragraph exists because the guard
+      that keeps it true is visible to the person setting the preference, who
+      would otherwise meet it only as a refusal.
+    -->
+    <p class="hint" style="margin-bottom:12px">
+      A client who supplies their own key can only be pointed at a provider <em>they</em> have a key for,
+      since anything else would move their work onto your bill. Clients on your keys may be pointed
+      at any provider your policy allows.
     </p>
     <div class="row" style="gap:10px;flex-wrap:wrap">
       <input type="text" id="route-client" placeholder="Client name (exactly as on the engagement)"
@@ -223,6 +277,99 @@ async function loadKeys(){
   await renderKeyList();
   loadOpenInvites();
   loadRouting();
+  loadGrants();          // v5.34.64 — independent, for the same reason
+}
+
+/* ── v5.34.64 — whose failures the firm has agreed to cover ───────────────── */
+
+async function loadGrants(){
+  var box = document.getElementById("grant-list");
+  if (!box) return;
+  box.textContent = "";
+  try{
+    var r = await fetch(API_BASE + "/api/byok/fallback-grants", { headers: hdrs() });
+    var d = await r.json();
+    if(!r.ok) return;
+    if(!d.grants || !d.grants.length){
+      var none = document.createElement("div");
+      none.className = "hint";
+      /*
+       * The empty state has to say what the ABSENCE means, because here the
+       * absence is the behaviour. "No grants" reads as nothing configured; what
+       * it actually says is that every BYOK client's work stops when their key
+       * does, which is the thing someone needs to know before it happens.
+       */
+      none.textContent = "No client has fallback. If a client's own key fails, their work stops "
+        + "and nothing is charged to you.";
+      box.appendChild(none);
+      return;
+    }
+    var table = document.createElement("table");
+    var thead = document.createElement("thead");
+    var hrow = document.createElement("tr");
+    ["Client","Why","Granted",""].forEach(function(t){
+      var th = document.createElement("th"); th.textContent = t; hrow.appendChild(th);
+    });
+    thead.appendChild(hrow); table.appendChild(thead);
+    var tbody = document.createElement("tbody");
+    d.grants.forEach(function(x){
+      var tr = document.createElement("tr");
+      function cell(text){ var td = document.createElement("td"); td.textContent = text; tr.appendChild(td); return td; }
+      cell(x.clientName);
+      cell(x.reason || "—");
+      cell(x.grantedAt ? new Date(x.grantedAt).toLocaleDateString() : "—");
+      var act = document.createElement("td");
+      var a = document.createElement("a");
+      a.href = "#";
+      a.textContent = "withdraw";
+      // Same rule as every other table here: the client name goes in a data
+      // attribute, never interpolated into markup or an inline handler.
+      a.dataset.client = x.clientName;
+      a.addEventListener("click", function(ev){
+        ev.preventDefault();
+        revokeGrant(this.dataset.client);
+      });
+      act.appendChild(a);
+      tr.appendChild(act);
+      tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+    box.appendChild(table);
+  }catch(e){ /* supplementary to the keys list above */ }
+}
+
+async function saveGrant(){
+  var name = document.getElementById("grant-client").value.trim();
+  var reason = document.getElementById("grant-reason").value.trim();
+  var msg = document.getElementById("grant-msg");
+  if(!name){ msg.className = "msg err"; msg.textContent = "Enter the client name first."; return; }
+  try{
+    var r = await fetch(API_BASE + "/api/byok/fallback-grants", {
+      method: "POST", headers: Object.assign({"content-type":"application/json"}, hdrs()),
+      body: JSON.stringify({ clientName: name, reason: reason || undefined })
+    });
+    var d = await r.json().catch(function(){ return {}; });
+    if(!r.ok){ msg.className = "msg err"; msg.textContent = d.detail || ("Could not save: " + (d.error || r.status)); return; }
+    msg.className = "msg ok";
+    // States the consequence in money terms, because that is what was agreed to.
+    msg.textContent = "Granted — if " + name + "'s own key is refused, their work continues on your key "
+      + "and the cost lands on your bill.";
+    document.getElementById("grant-client").value = "";
+    document.getElementById("grant-reason").value = "";
+    loadGrants();
+  }catch(e){ msg.className = "msg err"; msg.textContent = "Could not save: " + e.message; }
+}
+
+async function revokeGrant(clientName){
+  if(!confirm("Withdraw fallback for " + clientName + "?\n\nIf their own key fails, their work will stop "
+              + "instead of running on yours.")) return;
+  try{
+    await fetch(API_BASE + "/api/byok/fallback-grants/revoke", {
+      method: "POST", headers: Object.assign({"content-type":"application/json"}, hdrs()),
+      body: JSON.stringify({ clientName: clientName })
+    });
+    loadGrants();
+  }catch(e){ /* the list reload below is the confirmation */ }
 }
 
 async function renderKeyList(){
@@ -457,7 +604,18 @@ async function saveRouting(){
       body: JSON.stringify({ clientName: name, textVendor: vendor })
     });
     var d = await r.json().catch(function(){ return {}; });
-    if(!r.ok){ msg.className = "msg err"; msg.textContent = "Could not save: " + (d.error || r.status); return; }
+    if(!r.ok){
+      msg.className = "msg err";
+      /*
+       * v5.34.64. The server sends a `detail` for the one refusal a consultant
+       * can actually act on — the client supplies a key for a different vendor,
+       * so preferring this one would move their work onto the firm's bill. The
+       * old line printed `d.error`, which here would read "Could not save:
+       * vendor_not_keyed": a wire value, no consequence, and no remedy.
+       */
+      msg.textContent = d.detail || ("Could not save: " + (d.error || r.status));
+      return;
+    }
     msg.className = "msg ok";
     msg.textContent = "Saved — " + name + " will prefer " + (VENDOR_LABEL[vendor] || vendor)
       + " wherever your policy already allows it.";

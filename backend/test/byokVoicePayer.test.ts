@@ -21,7 +21,7 @@ import { voiceRoutes } from "../src/routes/voice.js";
 import { LlmGateway } from "../src/llm/gateway.js";
 import { dbMeter } from "../src/llm/metering.js";
 import { PROD_POLICY } from "../src/llm/router.js";
-import type { ByokLiveBinding } from "../src/llm/byok/resolveLive.js";
+import type { ByokLiveBinding, ByokLiveResolution } from "../src/llm/byok/resolveLive.js";
 
 const ENABLED = process.env.RLS_TEST === "1";
 const ADMIN_URL = process.env.TEST_DATABASE_URL ?? "postgres://vyne:vyne@localhost:5432/vyne";
@@ -61,6 +61,13 @@ async function appWith(opts: {
   user: string;
   platform: ReturnType<typeof fakeLive>;
   binding?: ByokLiveBinding | null;
+  /**
+   * v5.34.64. A key IS on file for this client and cannot be spent. Distinct
+   * from `binding: null`, which now means the client has no key at all.
+   */
+  unusable?: { reason: string; clientName: string };
+  /** Has the firm agreed to cover this client's failures? Default: no. */
+  granted?: boolean;
   onRejected?: (i: { tenantId: string; clientName: string; detail: string }) => void;
 }): Promise<FastifyInstance> {
   const app = Fastify();
@@ -79,7 +86,12 @@ async function appWith(opts: {
       dbMeter,
       opts.platform.live,
       {
-        forClient: async (_t, clientName) => (clientName ? opts.binding ?? null : null),
+        forClient: async (_t, clientName): Promise<ByokLiveResolution> => {
+          if (!clientName) return { kind: "none" };
+          if (opts.unusable) return { kind: "unusable", ...opts.unusable };
+          return opts.binding ? { kind: "ok", binding: opts.binding } : { kind: "none" };
+        },
+        fallbackGrant: async () => !!opts.granted,
         onRejected: opts.onRejected,
       }
     );
@@ -314,5 +326,103 @@ describe.skipIf(!ENABLED)("v5.34.59 — voice sessions on a client's own key", (
     expect(r.statusCode).toBe(200);
     expect(r.json().payer).toBe("platform");
     expect(clientLive.minted).toHaveLength(0);
+  });
+});
+
+/* ── v5.34.64: a key on file that cannot be spent ─────────────────────────── */
+
+describe.skipIf(!ENABLED)("v5.34.64 — an unusable client key does not become the firm's interview", () => {
+  let db: pg.Client;
+  let tenant: string;
+  let user: string;
+
+  beforeAll(async () => {
+    await migrate(ADMIN_URL);
+    initPool(ADMIN_URL);
+    db = new pg.Client({ connectionString: ADMIN_URL });
+    await db.connect();
+    tenant = (await db.query(`INSERT INTO tenants (name) VALUES ('Voice Confinement Firm') RETURNING id`)).rows[0].id;
+    user = (await db.query(
+      `INSERT INTO users (identity_platform_uid, email) VALUES ('uid-voice-confine','c@firm.com')
+         ON CONFLICT (identity_platform_uid) DO UPDATE SET email = EXCLUDED.email RETURNING id`)).rows[0].id;
+    await db.query(`SELECT set_config('app.tenant_id', $1, false)`, [tenant]);
+  });
+
+  beforeEach(async () => {
+    await db.query(`DELETE FROM usage_events WHERE tenant_id = $1`, [tenant]);
+  });
+
+  afterAll(async () => {
+    await db.query(`DELETE FROM usage_events WHERE tenant_id = $1`, [tenant]);
+    await db.query(`DELETE FROM tenants WHERE id = $1`, [tenant]);
+    await db.end();
+    await closePool();
+  });
+
+  const open = (app: FastifyInstance, clientName?: string) =>
+    app.inject({ method: "POST", url: "/api/voice/live-session",
+      payload: { module: "interview_agent", maxSeconds: 900, ...(clientName ? { clientName } : {}) } });
+
+  const rows = async () =>
+    (await db.query(`SELECT task, payer FROM usage_events WHERE tenant_id = $1`, [tenant])).rows;
+
+  const UNUSABLE = { reason: "their key is on file but switched off (status: failed)", clientName: "Nestle" };
+
+  it("refuses the session, and reserves nothing", async () => {
+    /*
+     * The path that used to cost the most. A key revoked months ago produced
+     * interviews that looked entirely normal — same latency, same voice, same
+     * transcript — and landed on the firm at roughly $2 per 90 minutes. The
+     * only signal was a red status on a settings screen nobody opens daily.
+     */
+    const platform = fakeLive({ key: "PLATFORM" });
+    const app = await appWith({ tenant, user, platform, unusable: UNUSABLE });
+    const r = await open(app, "Nestle");
+    await app.close();
+
+    expect(r.statusCode).toBe(402);
+    expect(r.json().error).toBe("client_key_unusable");
+    // The firm's key was never minted against.
+    expect(platform.minted).toHaveLength(0);
+    // And no hold was reserved, so nothing has to be released later.
+    expect(await rows()).toHaveLength(0);
+  });
+
+  it("names the client, the reason and the remedy", async () => {
+    // A consultant reads this with an executive waiting. "Something went wrong"
+    // would send them to the wrong place; the fix is on a screen they own.
+    const app = await appWith({ tenant, user, platform: fakeLive({ key: "PLATFORM" }), unusable: UNUSABLE });
+    const r = await open(app, "Nestle");
+    await app.close();
+
+    const detail = r.json().detail as string;
+    expect(detail).toContain("Nestle");
+    expect(detail).toContain("switched off");
+    expect(detail).toMatch(/nothing was charged to your account/i);
+    expect(detail).toMatch(/fallback grant/i);
+  });
+
+  it("mints on the firm's key when that client has a grant", async () => {
+    const platform = fakeLive({ key: "PLATFORM" });
+    const app = await appWith({ tenant, user, platform, unusable: UNUSABLE, granted: true });
+    const r = await open(app, "Nestle");
+    await app.close();
+
+    expect(r.statusCode).toBe(200);
+    expect(r.json().payer).toBe("platform");
+    expect(platform.minted).toHaveLength(1);
+  });
+
+  it("a client with NO key on file is unaffected — the firm pays, as always", async () => {
+    // The ordinary case for almost every client, and the one a mistake in the
+    // none/unusable distinction would break for everybody at once.
+    const platform = fakeLive({ key: "PLATFORM" });
+    const app = await appWith({ tenant, user, platform, binding: null });
+    const r = await open(app, "Acme");
+    await app.close();
+
+    expect(r.statusCode).toBe(200);
+    expect(r.json().payer).toBe("platform");
+    expect(platform.minted).toHaveLength(1);
   });
 });

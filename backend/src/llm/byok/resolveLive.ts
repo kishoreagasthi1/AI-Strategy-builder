@@ -50,12 +50,38 @@ export interface ByokLiveBinding {
 }
 
 /**
- * The live session a client's own Google key should mint, or null to mean
- * "use the platform's".
+ * What a client's own Google key can do for this interview. (v5.34.64)
  *
- * Null on every failure — no key, inactive key, unreadable secret, Secret
- * Manager down. An interview must not fail because a client's credential
- * cannot be read; the firm pays for that one and the Owner sees why.
+ * ── Why three outcomes and not two ──────────────────────────────────────────
+ *
+ * This used to return `ByokLiveBinding | null`, and null meant two completely
+ * different things: "this client has no key, the firm pays, business as usual"
+ * and "this client HAS a key and it does not work". Collapsing them is what let
+ * a revoked key turn into a firm-funded interview with nobody deciding that —
+ * the caller could not tell the two apart, so it treated both as the ordinary
+ * case.
+ *
+ * They now differ, because they have different right answers: `none` falls
+ * through to the platform, `unusable` fails the mint unless the firm has
+ * granted fallback for that client (migration 036).
+ */
+export type ByokLiveResolution =
+  /** No key on file for this client. The firm's credential is correct here. */
+  | { kind: "none" }
+  /** Their key resolved; this session will be minted on it and billed to them. */
+  | { kind: "ok"; binding: ByokLiveBinding }
+  /**
+   * A key IS on file and could not be used — inactive, unreadable, or the
+   * secret is gone. Whoever called must decide whether the firm covers it.
+   */
+  | { kind: "unusable"; reason: string; clientName: string };
+
+/**
+ * Resolve a client's own Google key for a live interview.
+ *
+ * The failure modes are unchanged from v5.34.59 — no key, inactive key,
+ * unreadable secret, Secret Manager down — but they are no longer all reported
+ * as "use the platform's". See ByokLiveResolution.
  */
 export function makeByokLiveResolver(opts: ByokLiveOptions) {
   const lookup = opts.lookup ?? activeKeyFor;
@@ -64,11 +90,28 @@ export function makeByokLiveResolver(opts: ByokLiveOptions) {
   return async function resolveByokLive(
     tenantId: string,
     clientName: string | undefined
-  ): Promise<ByokLiveBinding | null> {
-    if (!clientName) return null;   // unattributed work is the firm's own
+  ): Promise<ByokLiveResolution> {
+    if (!clientName) return { kind: "none" };   // unattributed work is the firm's own
     try {
       const row = await lookup(tenantId, clientName, "gemini-aistudio");
-      if (!row || row.status !== "active" || !row.secretName) return null;
+      if (!row) return { kind: "none" };
+      /*
+       * A row that exists but is switched off or has lost its secret is NOT
+       * "no key". The client supplied one; it is on file; it cannot be spent.
+       * Reporting that as `none` is exactly the conflation described above.
+       */
+      if (row.status !== "active") {
+        return {
+          kind: "unusable", clientName: row.clientName,
+          reason: `their key is on file but switched off (status: ${row.status})`,
+        };
+      }
+      if (!row.secretName) {
+        return {
+          kind: "unusable", clientName: row.clientName,
+          reason: "their key is on file but was never stored — it has no secret behind it",
+        };
+      }
 
       const key = await fetchKey(opts.secretStore, row.secretName);
       if (!key) {
@@ -76,10 +119,10 @@ export function makeByokLiveResolver(opts: ByokLiveOptions) {
         // migration 033 for the production incident this closes.
         const why = "the key could not be read from Secret Manager — check the service account's permissions";
         opts.onResolveError?.({ tenantId, clientName, err: new Error(why), clientNorm: row.clientNorm, reason: why });
-        return null;
+        return { kind: "unusable", clientName: row.clientName, reason: why };
       }
       opts.onResolveOk?.({ tenantId, clientNorm: row.clientNorm });
-      return {
+      return { kind: "ok", binding: {
         /*
          * paidTier: true is the attestation being honoured — the client's
          * administrator confirmed in writing that this key belongs to a billed
@@ -98,13 +141,19 @@ export function makeByokLiveResolver(opts: ByokLiveOptions) {
         }),
         keyHint: row.keyHint ?? "",
         clientName: row.clientName,
-      };
+      } };
     } catch (err) {
-      opts.onResolveError?.({
-        tenantId, clientName, err,
-        reason: `the key could not be resolved: ${(err as Error)?.message ?? "unknown error"}`,
-      });
-      return null;
+      const reason = `the key could not be resolved: ${(err as Error)?.message ?? "unknown error"}`;
+      opts.onResolveError?.({ tenantId, clientName, err, reason });
+      /*
+       * v5.34.64. This used to return null — "use the platform's" — for any
+       * thrown error, including a Secret Manager outage or a database blip. A
+       * client who has supplied a key is a client who is paying; an
+       * infrastructure fault on our side must not quietly move their bill onto
+       * the firm. `unusable` lets the caller decide, and the safe default at
+       * that decision is to stop.
+       */
+      return { kind: "unusable", clientName, reason };
     }
   };
 }

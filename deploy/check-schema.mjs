@@ -62,6 +62,16 @@ const EXPECTED = [
   { migration: "034_transcript_erasure.sql", kind: "policy", name: "interview_transcripts.tenant_delete_erasure" },
   { migration: "035_client_routing.sql", kind: "table", name: "client_routing" },
   { migration: "035_client_routing.sql", kind: "column", name: "client_routing.text_vendor" },
+  /*
+   * v5.34.64, and this one fails expensively in the direction nobody watches.
+   * Without the table, hasFallbackGrant() throws, the server catches and
+   * returns false, and every BYOK client is treated as having no grant — so
+   * live interviews are refused for clients the firm explicitly agreed to
+   * cover. Fail-closed is right for a missing grant; failing silently for a
+   * missing TABLE is the schema drift this script exists to name.
+   */
+  { migration: "036_byok_fallback_grant.sql", kind: "table", name: "byok_fallback_grant" },
+  { migration: "036_byok_fallback_grant.sql", kind: "column", name: "client_routing.checked_against_keys" },
 ];
 
 const client = new pg.Client({ connectionString: url });

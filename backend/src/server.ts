@@ -14,6 +14,7 @@ import { makeByokResolver } from "./llm/byok/resolve.js";
 import { makeByokLiveResolver } from "./llm/byok/resolveLive.js";
 import { deactivateKey, recordResolveError, clearResolveError } from "./llm/byok/byokRepo.js";
 import { routingFor } from "./llm/byok/clientRouting.js";
+import { hasFallbackGrant } from "./llm/byok/fallbackGrant.js";
 import type { ProviderAdapter } from "./llm/types.js";
 import { DEV_POLICY, PROD_POLICY } from "./llm/router.js";
 import { healthRoutes } from "./routes/health.js";
@@ -342,6 +343,24 @@ export async function buildServer(deps: BuildDeps): Promise<FastifyInstance> {
         return null;
       }
     },
+    /*
+     * Has the firm agreed to carry this client's key failures (v5.34.64)?
+     *
+     * Wired unconditionally, like clientRouting and for the same reason: it is
+     * a database read, not a Secret Manager one. It is consulted only when a
+     * client actually has credentials resolved for the call, so a firm with no
+     * BYOK clients never pays for the lookup.
+     */
+    fallbackGrant: async ({ tenantId, clientName }) => {
+      try {
+        return await hasFallbackGrant(tenantId, clientName);
+      } catch (err) {
+        // No grant on error. A database blip must not start spending the
+        // firm's money on a client who is supposed to be paying their own way.
+        app.log.error({ err, clientName }, "fallback grant could not be read — assuming none");
+        return false;
+      }
+    },
     onByokRejected: ({ tenantId, clientName, provider, detail }) => {
       /*
        * Mark the key failed so the Owner's screen stops saying "active", and
@@ -553,7 +572,7 @@ export async function buildServer(deps: BuildDeps): Promise<FastifyInstance> {
                 secretStore: { projectId: config.gcpProject },
                 onResolveError: ({ tenantId, clientName, clientNorm, reason, err }) => {
                   app.log.error({ err, clientName },
-                    "byok(live): a client key is on file but could not be used — the firm's key will pay for this session");
+                    "byok(live): a client key is on file but could not be used — the session is refused unless this client has a fallback grant");
                   if (clientNorm && reason) {
                     void recordResolveError(tenantId, clientNorm, "gemini-aistudio", reason);
                   }
@@ -562,6 +581,20 @@ export async function buildServer(deps: BuildDeps): Promise<FastifyInstance> {
                   void clearResolveError(tenantId, clientNorm, "gemini-aistudio");
                 },
               }),
+              /*
+               * v5.34.64: the voice route asks this before letting the firm's
+               * credential mint a session for a BYOK client whose own key
+               * cannot be spent. Same fail-closed rule as the gateway's.
+               */
+              fallbackGrant: async (tenantId, clientName) => {
+                try {
+                  return await hasFallbackGrant(tenantId, clientName);
+                } catch (err) {
+                  app.log.error({ err, clientName },
+                    "byok(live): fallback grant could not be read — assuming none");
+                  return false;
+                }
+              },
               onRejected: ({ tenantId, clientName, detail }) => {
                 app.log.warn({ clientName, detail: redactProviderDetail(detail) },
                   "byok(live): a client's key was refused by Google — marking it failed");

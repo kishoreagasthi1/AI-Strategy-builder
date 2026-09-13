@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>VYNE™ — Data Processing Agreement</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet"/>
+<!-- Deliberately standalone — see about.html's comment. -->
+<style>
+:root{
+  --navy:#01203D;--navy-2:#0A2E4D;--ink:#132433;--paper:#F3F1EB;--panel:#FFFFFF;
+  --panel-raised:#FAF8F3;--line:#E8E3D8;--line-strong:#D8D3C7;--quiet:#6C7783;--quiet-soft:#9AA4AE;
+  --gold:#A88553;--gold-2:#C6A46B;--signal-bg:#F4ECDD;--live:#2F7D4F;--live-bg:#E9F2EC;
+  --warn:#A9761C;--warn-bg:#F8EFDC;--danger:#B0324B;--danger-bg:#F7E7EB;
+  --r-sm:9px;--r-lg:14px;--r-pill:999px;
+  --shadow:0 1px 2px rgba(16,33,47,.05),0 10px 30px rgba(16,33,47,.06);
+}
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:var(--paper);color:var(--ink);font-family:'Inter',system-ui,sans-serif;font-size:14px;line-height:1.65;
+  -webkit-font-smoothing:antialiased;min-height:100vh}
+.page{max-width:820px;margin:0 auto;padding:2rem}
+a{color:var(--gold);font-weight:600;text-decoration:none}
+a:hover{text-decoration:underline}
+.header{display:flex;align-items:center;justify-content:space-between;margin-bottom:26px;padding-bottom:1rem;border-bottom:1px solid rgba(184,151,42,0.3)}
+.logo-row{display:flex;align-items:center;gap:12px}
+.logo-hex{width:40px;height:40px}
+.logo-text{font-family:'Space Grotesk','Inter',sans-serif;font-size:18px;color:#132433;letter-spacing:0.08em}
+.logo-sub{font-size:10px;color:#7A5C1E;letter-spacing:0.2em;text-transform:uppercase;display:block}
+.sub{font-size:12px;color:var(--quiet);margin-bottom:18px}
+.legal-nav{display:flex;gap:16px;font-size:12.5px;margin-bottom:20px}
+.banner{border-radius:var(--r-lg);padding:16px 18px;font-size:13px;font-weight:600;margin-bottom:24px;line-height:1.6;background:var(--warn-bg);color:var(--warn)}
+.panel{background:var(--panel-raised);border:1px solid var(--line);border-radius:var(--r-lg);box-shadow:var(--shadow);padding:28px 30px;margin-bottom:20px}
+h1{font-family:'Space Grotesk',sans-serif;font-size:24px;color:var(--navy);margin-bottom:6px}
+.doc-meta{font-size:12px;color:var(--quiet-soft);margin-bottom:24px}
+h2{font-family:'Space Grotesk',sans-serif;font-size:15px;color:var(--navy);margin:26px 0 10px}
+h2:first-of-type{margin-top:0}
+h3{font-size:13px;color:var(--ink);margin:16px 0 6px;font-weight:700}
+p{margin-bottom:12px;color:var(--ink)}
+ul,ol{margin:0 0 12px 22px}
+li{margin-bottom:6px}
+table{width:100%;border-collapse:collapse;font-size:13px;margin-bottom:14px}
+th{text-align:left;font-size:10.5px;text-transform:uppercase;letter-spacing:.06em;color:var(--quiet-soft);padding:6px 8px;border-bottom:1px solid var(--line)}
+td{padding:8px;border-bottom:1px solid var(--line);vertical-align:top}
+.placeholder{background:var(--signal-bg);color:#7A5C1E;padding:1px 6px;border-radius:4px;font-weight:600;font-size:12.5px}
+.footer{margin-top:36px;font-size:11.5px;color:var(--quiet-soft);text-align:center;line-height:1.7}
+</style>
+</head>
+<body>
+<div class="page">
+<div class="header">
+  <div class="logo-row">
+    <svg class="logo-hex" viewBox="0 0 40 40" fill="none">
+      <polygon points="20,2 36,10 36,30 20,38 4,30 4,10" fill="none" stroke="#C6A46B" stroke-width="1.8"/>
+      <circle cx="20" cy="20" r="9" fill="none" stroke="#C6A46B" stroke-width="1.4"/>
+      <line x1="14" y1="26" x2="26" y2="14" stroke="#C6A46B" stroke-width="1.4"/>
+    </svg>
+    <div>
+      <div class="logo-text">VYNORA</div>
+      <span class="logo-sub">Legal</span>
+    </div>
+  </div>
+</div>
+<div class="sub"><a href="index.html">← Back to VYNE</a></div>
+<div class="legal-nav">
+  <a href="terms.html">Terms of Service</a>
+  <a href="privacy.html">Privacy Policy</a>
+  <a href="dpa.html">Data Processing Agreement</a>
+</div>
+
+<div class="banner">
+  ⚠ DRAFT TEMPLATE — NOT LEGAL ADVICE. A Data Processing Agreement is a binding contract with specific
+  requirements under GDPR Article 28, CCPA/CPRA, and similar laws. This draft has NOT been reviewed by an
+  attorney and must be customized (entity names, sub-processor list, transfer mechanism, applicable law)
+  and executed by both parties — typically as an addendum referenced from the Terms of Service — before it
+  has any legal effect. If Customer or its Interviewees are in the EU/UK/Switzerland, this draft's transfer
+  mechanism section in particular needs qualified review.
+</div>
+
+<div class="panel">
+<h1>Data Processing Agreement</h1>
+<div class="doc-meta">Draft — not yet in effect. Last updated: <span class="placeholder">[DATE]</span></div>
+
+<h2>1. Parties and Relationship to the Terms of Service</h2>
+<p>This Data Processing Agreement ("DPA") supplements the <a href="terms.html">Terms of Service</a> between
+<span class="placeholder">[Vynora Consulting LLC]</span> ("Processor," "Vynora") and the consulting firm
+identified as Customer in its account ("Controller," "Customer"). It applies to personal data Processor
+processes on Controller's behalf in connection with the Service — most significantly, responses collected
+from Interviewees at Controller's own clients, who are typically not direct customers of Vynora.
+Capitalized terms not defined here have the meaning given in the Terms of Service or the
+<a href="privacy.html">Privacy Policy</a>.</p>
+
+<h2>2. Subject Matter and Duration</h2>
+<p>Processor will process personal data on Controller's behalf for the duration of Controller's subscription
+to the Service, and thereafter only as necessary to comply with Section 9 (Return or Deletion of Data) or as
+required by law.</p>
+
+<h2>3. Nature and Purpose of Processing</h2>
+<p>Processor processes personal data to provide the Service: hosting and storing engagement data, running
+AI-assisted interview, synthesis, scoring, and solution-design generation, providing tenant-isolated storage
+and access controls, and generating usage/billing records.</p>
+
+<h2>4. Categories of Data Subjects and Data</h2>
+<table>
+<tr><th>Data subjects</th><th>Categories of personal data</th></tr>
+<tr><td>Controller's consultant users (owner/consultant accounts)</td><td>Name, work email, role, activity/audit logs</td></tr>
+<tr><td>Interviewees (Controller's clients' personnel)</td><td>Name, role/title, interview responses (text and, if voice mode is used, transcribed audio), engagement metadata</td></tr>
+</table>
+<p><span class="placeholder">[Controller should confirm whether any special category data (health, etc.) is
+ever solicited via interview questions — the Service is not designed to collect special category data, and
+Controller is responsible for configuring interview content accordingly.]</span></p>
+
+<h2>5. Controller and Processor Obligations</h2>
+<p>Controller warrants that it has a valid legal basis for the processing of personal data it submits to the
+Service (including Interviewee responses) and has provided any notices or obtained any consents required
+under applicable law before inviting an Interviewee. Processor will:</p>
+<ul>
+<li>process personal data only on Controller's documented instructions (including as necessary to provide
+the Service), unless required otherwise by law;</li>
+<li>ensure personnel authorized to process personal data are bound by confidentiality obligations;</li>
+<li>implement appropriate technical and organizational security measures, including per-tenant database
+row-level security, encrypted connections, and role-based access controls (see Section 6);</li>
+<li>assist Controller, to the extent reasonably possible, in responding to data subject requests (access,
+deletion, correction) and in fulfilling Controller's obligations regarding security, breach notification,
+and data protection impact assessments where applicable;</li>
+<li>notify Controller without undue delay after becoming aware of a personal data breach affecting
+Controller's data;</li>
+<li>make available information reasonably necessary to demonstrate compliance with this DPA, and allow for
+audits by Controller or an independent auditor on reasonable notice, subject to confidentiality.</li>
+</ul>
+
+<h2>6. Security Measures</h2>
+<p>Processor maintains, at minimum: row-level security enforcing per-tenant data isolation at the database
+layer (not just the application layer); a least-privilege application database role that cannot bypass
+tenant isolation; encrypted connections between the application and database and between clients and the
+Service; multi-factor authentication support for consultant accounts; structured audit logging of
+security-relevant actions (tenant provisioning, team and client-assignment changes); and no storage of raw
+AI-provider credentials in the browser.</p>
+
+<h2>7. Sub-processors</h2>
+<p>Controller authorizes Processor to engage the following categories of sub-processors, which may change as
+the Service evolves. Processor will maintain a current list and provide notice of material changes as
+described below.</p>
+<table>
+<tr><th>Sub-processor</th><th>Purpose</th></tr>
+<tr><td>Google Cloud Platform (Cloud SQL, Cloud Run, Vertex AI, Identity Platform)</td><td>Application hosting, database, authentication, and AI inference infrastructure</td></tr>
+<tr><td>Google (Gemini API — AI Studio and/or Vertex AI)</td><td>AI-generated interview scoring, synthesis, and design content</td></tr>
+<tr><td>Anthropic (via Vertex AI)</td><td>AI-generated synthesis and design content for premium/complex tasks</td></tr>
+<tr><td>OpenAI</td><td>AI-generated content (optional provider, if configured)</td></tr>
+<tr><td>Stripe</td><td>Subscription billing for Controller's firm-level account (does not process Interviewee data)</td></tr>
+<tr><td><span class="placeholder">[Sentry / error monitoring provider, if enabled]</span></td><td>Application error diagnostics — may incidentally capture request metadata on error; not intended to receive interview content</td></tr>
+</table>
+<p>Processor will provide at least <span class="placeholder">[14]</span> days' notice before adding a new
+sub-processor that will process Controller's personal data, during which Controller may object on
+reasonable data-protection grounds.</p>
+
+<h2>8. International Transfers</h2>
+<p>Processor's infrastructure operates primarily in the United States. If Controller or its Interviewees are
+located in the European Economic Area, United Kingdom, or Switzerland, the parties agree that transfers of
+personal data to the United States will be governed by
+<span class="placeholder">[the EU Standard Contractual Clauses (Module 2: Controller-to-Processor), executed
+as Annex __ to this DPA, together with the UK International Data Transfer Addendum where applicable]</span>.
+This section requires review by counsel familiar with current transfer-mechanism requirements before
+publication.</p>
+
+<h2>9. Return or Deletion of Data</h2>
+<p>Upon termination of Controller's subscription, Processor will make Customer Data available for export for
+<span class="placeholder">[30]</span> days, after which Processor will delete or anonymize Customer Data,
+except to the extent retention is required by law or for legitimate audit-log/security purposes as described
+in the Privacy Policy.</p>
+
+<h2>10. Liability</h2>
+<p>Each party's liability under this DPA is subject to the limitations of liability set out in the Terms of
+Service, except where such limitation is unenforceable under applicable data protection law.</p>
+
+<h2>11. Order of Precedence</h2>
+<p>In the event of a conflict between this DPA and the Terms of Service regarding the processing of personal
+data, this DPA controls.</p>
+
+<h2>12. Contact / Data Protection Officer</h2>
+<p><span class="placeholder">[dpo@vynora.example / privacy@vynora.example]</span></p>
+
+</div>
+
+<div class="footer">
+  This is a template, not a substitute for advice from a licensed attorney or data protection professional. ·
+  <a href="index.html">← Back to VYNE</a>
+</div>
+</div><!-- /.page -->
+</body>
+</html>

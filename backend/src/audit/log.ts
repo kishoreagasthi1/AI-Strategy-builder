@@ -48,7 +48,19 @@ export type AuditAction =
    * remove at all. The content goes; this row is what is left to say it
    * happened, and it carries names and a count but never any of the words.
    */
-  | "transcript_erased";
+  | "transcript_erased"
+  /*
+   * v5.34.64. A BYOK client runs on their own key alone; when it fails, the
+   * call fails. These two rows record the firm deciding otherwise for one named
+   * client — agreeing to absorb that client's inference costs whenever their
+   * credential stops working, and later withdrawing it.
+   *
+   * Audited because it is a money decision made in a settings panel, months
+   * before the invoice that reflects it. Without these, "why did we pay for
+   * Nestlé's interviews all quarter?" has no answer on file.
+   */
+  | "byok_fallback_granted"
+  | "byok_fallback_revoked";
 
 /**
  * Deliberately opens its OWN transaction rather than accepting an existing

@@ -13,6 +13,7 @@ import type { GenerateRequest, GenerateResult, ProviderAdapter } from "./types.j
 import { chainForTask, type RoutingPolicy } from "./router.js";
 import {
   applyByokToChain,
+  confineToClientCredentials,
   isCredentialRejection,
   type ByokCallContext,
   type ResolvedByok,
@@ -141,6 +142,20 @@ export interface GatewayOptions {
    * every client who has not asked for anything, i.e. almost all of them.
    */
   clientRouting?: (ctx: ByokCallContext) => Promise<ByokProvider | null>;
+  /**
+   * May the FIRM's credential cover this client when their own key fails?
+   * (v5.34.64 — migration 036)
+   *
+   * Absent, or resolving false, is the safe answer and the default for every
+   * client: a client who supplied a key runs on that key alone, and a refused
+   * credential fails the call instead of quietly moving the charge back onto
+   * the firm. Resolving true restores the pre-v5.34.64 behaviour for that one
+   * client, because the firm decided it should.
+   *
+   * A lookup that throws is treated as no grant. That direction is deliberate:
+   * a database blip must not be able to start spending the firm's money.
+   */
+  fallbackGrant?: (ctx: ByokCallContext) => Promise<boolean>;
 }
 
 /** Capacity blips worth retrying: rate limits and "high demand" 503s. */
@@ -257,9 +272,40 @@ export class LlmGateway {
       chainForTask(this.opts.policy, req.task, { defaultChain: this.opts.defaultChainOverride }),
       preferred
     );
-    const chain = byokAdapters.size
+    const interleaved = byokAdapters.size
       ? applyByokToChain(baseChain, new Set(byokAdapters.keys()))
       : baseChain;
+
+    /*
+     * Step 4 (v5.34.64): confine the chain to the client's OWN credentials
+     * unless the firm has granted otherwise for this client.
+     *
+     * This is what makes step 2's promise true. A preference reorders the
+     * chain, and until now a client holding a Google key who asked for
+     * Anthropic got the FIRM's Anthropic adapter first — their key untouched,
+     * the firm billed, and the screen asserting that a preference "never
+     * changes who pays". Confinement removes the firm's adapters from that
+     * client's chain entirely, so a preference can only ever permute
+     * credentials the client themselves is paying for.
+     *
+     * It also ends the silent fallback: a refused client key used to carry on
+     * down the chain to the platform credential, turning a revoked key into an
+     * invoice nobody approved. Now it fails, and says whose key failed.
+     */
+    let fallbackGranted = false;
+    if (byokAdapters.size && this.opts.fallbackGrant) {
+      try {
+        fallbackGranted = await this.opts.fallbackGrant({
+          tenantId: ctx.tenantId, clientName: ctx.clientName,
+        });
+      } catch {
+        // No grant on error — a failed lookup must not authorise spending.
+      }
+    }
+    const confined = byokAdapters.size && !fallbackGranted;
+    const chain = confineToClientCredentials(
+      interleaved, new Set(byokAdapters.keys()), { granted: fallbackGranted }
+    );
     /** Providers whose credential the vendor has just refused — see below. */
     const rejectedProviders = new Set<ByokProvider>();
     const now = this.opts.now ?? Date.now;
@@ -390,6 +436,29 @@ export class LlmGateway {
     // routes/llm.ts and routes/voice.ts, which log `.detail` via
     // req.log.error but never forward it in the HTTP response).
     const detail = errors.join(" | ");
+
+    /*
+     * v5.34.64. A confined chain reaching this point means the CLIENT's key
+     * failed and the firm's was deliberately out of reach. That is a different
+     * event from "the AI is down", it has a different remedy, and it must not
+     * be reported as an outage — a consultant who reads "all providers failed"
+     * will go looking at the platform instead of at their client's key.
+     *
+     * A transient 429/503 on the client's own key is still transient: their
+     * project is being rate-limited, retrying is the right advice, and nothing
+     * about that implicates the grant. So the capacity case is checked first.
+     */
+    if (confined && !sawTransient) {
+      const who = ctx.clientName ?? "this client";
+      throw new GatewayError(
+        402,
+        `${who} runs on their own API key, and that key was refused. ` +
+        `Nothing was charged to your account. Check the key on the Client API keys screen — ` +
+        `or, if you want this client's work to continue on your key when theirs fails, ` +
+        `turn on the fallback grant for them there.`,
+        detail
+      );
+    }
     if (sawTransient) {
       throw new GatewayError(
         503,

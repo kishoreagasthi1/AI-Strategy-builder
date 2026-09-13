@@ -89,20 +89,30 @@ export async function listRouting(tenantId: string): Promise<ClientRouting[]> {
 export async function setRouting(a: {
   tenantId: string; clientName: string; textVendor: ByokProvider;
   note?: string; setBy?: string;
+  /**
+   * Was this preference checked against the client's keys on file? (v5.34.64.)
+   * The route does the checking; this records that it happened, so a row
+   * written before the rule existed stays distinguishable from one written
+   * after it. See migration 036.
+   */
+  checkedAgainstKeys?: boolean;
 }): Promise<ClientRouting> {
   const norm = normClient(a.clientName);
   return withTenant(a.tenantId, async (c) => {
     const r = await c.query<Row>(
-      `INSERT INTO client_routing (tenant_id, client_norm, client_name, text_vendor, note, set_by)
-       VALUES (current_setting('app.tenant_id', true)::uuid, $1, $2, $3, $4, $5)
+      `INSERT INTO client_routing
+         (tenant_id, client_norm, client_name, text_vendor, note, set_by, checked_against_keys)
+       VALUES (current_setting('app.tenant_id', true)::uuid, $1, $2, $3, $4, $5, $6)
        ON CONFLICT (tenant_id, client_norm) DO UPDATE SET
          client_name = EXCLUDED.client_name,
          text_vendor = EXCLUDED.text_vendor,
          note = EXCLUDED.note,
          set_by = EXCLUDED.set_by,
+         checked_against_keys = EXCLUDED.checked_against_keys,
          updated_at = now()
        RETURNING client_norm, client_name, text_vendor, note, updated_at`,
-      [norm, a.clientName, a.textVendor, a.note ?? null, a.setBy ?? null]
+      [norm, a.clientName, a.textVendor, a.note ?? null, a.setBy ?? null,
+       a.checkedAgainstKeys ?? false]
     );
     return shape(r.rows[0]);
   });

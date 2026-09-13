@@ -43,9 +43,25 @@ import {
   type ByokProvider,
 } from "../llm/byok/byokRepo.js";
 import { listRouting, setRouting, clearRouting } from "../llm/byok/clientRouting.js";
+import {
+  listFallbackGrants, grantFallback, revokeFallback,
+} from "../llm/byok/fallbackGrant.js";
+import { auditLog } from "../audit/log.js";
 
 const PROVIDERS = ["gemini-aistudio", "anthropic-api"] as const;
 const INVITE_TTL_HOURS = 72;
+
+/**
+ * Vendor names as a consultant would say them (v5.34.64).
+ *
+ * The wire values leak into error messages otherwise, and "anthropic-api" in a
+ * sentence explaining a billing consequence is the wrong register for the
+ * person reading it — they are deciding who pays, not debugging a chain.
+ */
+const VENDOR_LABEL: Record<ByokProvider, string> = {
+  "gemini-aistudio": "Google (Gemini)",
+  "anthropic-api": "Anthropic (Claude)",
+};
 
 /**
  * The words the client's administrator agrees to.
@@ -192,15 +208,95 @@ export async function byokRoutes(app: FastifyInstance, deps: ByokDeps): Promise<
       note: z.string().max(500).optional(),
     }).safeParse(req.body);
     if (!parsed.success) { reply.code(400).send({ error: "invalid_input" }); return; }
+
+    /*
+     * v5.34.64. A client who supplies a key may only prefer a vendor they have
+     * actually keyed.
+     *
+     * Without this check, `ZZ BYOK Test` — holding a GOOGLE key — could be set
+     * to prefer Anthropic, and every document, deck and synthesis for them
+     * moved onto the FIRM's Anthropic account while the panel stated in plain
+     * words that a preference "never changes who pays". The confinement in
+     * gateway.ts means such a preference can no longer move the money; it would
+     * instead silently do nothing, which is its own kind of lie on a screen
+     * that says the client's wish was saved. So it is refused here, with the
+     * reason, at the moment someone tries to set it.
+     *
+     * A client with NO key is unaffected: they are on the firm's account by
+     * arrangement, every vendor in the firm's policy is payable, and a
+     * preference among them is exactly the feature v5.34.63 shipped.
+     */
+    const tenantId = req.ctx!.tenantId;
+    const norm = normClient(parsed.data.clientName);
+    const theirKeys = (await listKeys(tenantId))
+      .filter((k) => k.clientNorm === norm && k.status === "active");
+    if (theirKeys.length && !theirKeys.some((k) => k.provider === parsed.data.textVendor)) {
+      const held = [...new Set(theirKeys.map((k) => VENDOR_LABEL[k.provider] ?? k.provider))];
+      reply.code(409).send({
+        error: "vendor_not_keyed",
+        detail:
+          `${parsed.data.clientName} supplies their own ${held.join(" and ")} key, so their work runs on ` +
+          `${held.length > 1 ? "those providers" : "that provider"} and is billed to them. ` +
+          `Preferring ${VENDOR_LABEL[parsed.data.textVendor]} would mean running their work on your account instead. ` +
+          `Ask them for a ${VENDOR_LABEL[parsed.data.textVendor]} key, or grant fallback for this client first.`,
+      });
+      return;
+    }
+
     return {
       routing: await setRouting({
-        tenantId: req.ctx!.tenantId,
+        tenantId,
         clientName: parsed.data.clientName,
         textVendor: parsed.data.textVendor,
         note: parsed.data.note,
         setBy: req.ctx!.userId,
+        checkedAgainstKeys: true,
       }),
     };
+  });
+
+  /*
+   * ── Fallback grant (v5.34.64) ─────────────────────────────────────────────
+   *
+   * Permission for the firm's credential to cover ONE client when that client's
+   * own key cannot be spent. Off for everyone until turned on here. See
+   * migration 036 for why this is per-client rather than a single switch.
+   */
+  app.get("/api/byok/fallback-grants", async (req, reply) => {
+    if (!ownerOnly(req, reply)) return;
+    return { grants: await listFallbackGrants(req.ctx!.tenantId) };
+  });
+
+  app.post("/api/byok/fallback-grants", async (req, reply) => {
+    if (!ownerOnly(req, reply)) return;
+    const parsed = z.object({
+      clientName: z.string().min(1).max(200),
+      reason: z.string().max(500).optional(),
+    }).safeParse(req.body);
+    if (!parsed.success) { reply.code(400).send({ error: "invalid_input" }); return; }
+    const grant = await grantFallback({
+      tenantId: req.ctx!.tenantId,
+      clientName: parsed.data.clientName,
+      reason: parsed.data.reason,
+      grantedBy: req.ctx!.userId,
+    });
+    // Auditable: this is the firm agreeing to absorb a client's costs, which is
+    // exactly the kind of decision someone will later need to account for.
+    void auditLog(req.ctx!.tenantId, req.ctx!.userId, "byok_fallback_granted", {
+      clientName: parsed.data.clientName, reason: parsed.data.reason ?? null,
+    });
+    return { grant };
+  });
+
+  app.post("/api/byok/fallback-grants/revoke", async (req, reply) => {
+    if (!ownerOnly(req, reply)) return;
+    const parsed = z.object({ clientName: z.string().min(1).max(200) }).safeParse(req.body);
+    if (!parsed.success) { reply.code(400).send({ error: "invalid_input" }); return; }
+    await revokeFallback(req.ctx!.tenantId, parsed.data.clientName);
+    void auditLog(req.ctx!.tenantId, req.ctx!.userId, "byok_fallback_revoked", {
+      clientName: parsed.data.clientName,
+    });
+    return { ok: true };
   });
 
   app.post("/api/client-routing/clear", async (req, reply) => {

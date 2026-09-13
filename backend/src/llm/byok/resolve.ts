@@ -300,6 +300,57 @@ export function applyByokToChain(chain: readonly string[], available: ReadonlySe
 }
 
 /**
+ * Confine a chain to the CLIENT's own credentials. (v5.34.64)
+ *
+ * ── The rule ────────────────────────────────────────────────────────────────
+ *
+ * A client who has supplied a key runs on that key and nothing else. If it is
+ * refused, the call fails. The firm's credential is not reachable for that
+ * client — not as a fallback when their key lapses, not for a vendor they never
+ * keyed, and not because they stated a model preference.
+ *
+ * ── What this replaces, and why ─────────────────────────────────────────────
+ *
+ * Until v5.34.63 applyByokToChain left the firm's adapters in place behind the
+ * client's, and the comment above it called a client key that fails "a cost,
+ * not an outage". That framing had the firm absorbing the cost of a decision it
+ * never made: a revoked key, a project that lost API access or a lapsed billing
+ * account all read as business as usual from the consultant's side, while every
+ * call moved back onto the firm's account. The key turned red on the screen
+ * AFTER the work had already been paid for.
+ *
+ * The same gap had a second mouth. A preference reorders the chain before
+ * substitution, so a client holding a GOOGLE key who asked for Anthropic got
+ * the firm's Anthropic adapter first — their key untouched, the firm billed,
+ * and the panel asserting in plain text that a preference "never changes who
+ * pays". Confinement closes both with one rule instead of two special cases.
+ *
+ * ── When it does nothing ────────────────────────────────────────────────────
+ *
+ * `available` empty means this client brought no key: they are on the firm's
+ * account by arrangement, the chain is already correct, and nothing here
+ * applies. `granted` means the firm has explicitly decided to carry this
+ * client's failures (migration 036) — the full chain stands, fallback included.
+ *
+ * ── The failure this deliberately allows ────────────────────────────────────
+ *
+ * A live interview CAN now stop because a client's key stopped working. That is
+ * the point, and it is a real cost: the interview ends with the client's
+ * executive in the room. The grant exists so a firm can choose continuity for a
+ * named client in advance. What is no longer available is having that choice
+ * made silently, for every client, by a fallback nobody remembered was there.
+ */
+export function confineToClientCredentials(
+  chain: readonly string[],
+  available: ReadonlySet<string>,
+  opts: { granted: boolean }
+): string[] {
+  if (!available.size) return [...chain];   // not a BYOK client
+  if (opts.granted) return [...chain];      // the firm chose to carry this one
+  return chain.filter((name) => available.has(name));
+}
+
+/**
  * Is this failure the credential being refused, rather than the service being
  * busy?
  *

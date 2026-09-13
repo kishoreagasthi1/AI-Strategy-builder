@@ -204,6 +204,16 @@ const REQUIRED_TABLES: { table: string; migration: string }[] = [
   { table: "byok_keys",      migration: "031_byok_client_grain.sql" },
   { table: "byok_invites",   migration: "031_byok_client_grain.sql" },
   { table: "client_routing", migration: "035_client_routing.sql" },
+  /*
+   * v5.34.64, and this one fails in the direction that costs money. Absent the
+   * table, hasFallbackGrant() throws, server.ts catches and returns false, and
+   * every BYOK client is treated as having no grant — so an unmigrated database
+   * refuses live interviews for clients the firm explicitly agreed to cover.
+   * Fail-closed is the right default for a missing grant; failing at boot with
+   * the filename is better than discovering it from a consultant whose
+   * interview would not start.
+   */
+  { table: "byok_fallback_grant", migration: "036_byok_fallback_grant.sql" },
 ];
 
 /**

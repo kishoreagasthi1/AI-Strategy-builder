@@ -1,0 +1,42 @@
+soak-live 2026-09-11T13:43:13.933Z model=models/gemini-3.1-flash-live-preview minutes=10
+[    0.0s] starting: 10 minutes on models/gemini-3.1-flash-live-preview
+[    0.0s] generating 5 spoken answers with gemini-2.5-flash-preview-tts (cached in soak-answers/)
+[    0.0s]   answer 1: 11.7s
+[    0.0s]   answer 2: 11.6s
+[    0.0s]   answer 3: 12.0s
+[    0.0s]   answer 4: 10.5s
+[    0.0s]   answer 5: 10.0s
+[    0.2s] setup accepted: thinking=model default compression=25600 vad=server default
+[    0.4s] conn 1: setupComplete
+[   20.8s] conn 1 turn 1: reply 896ms | heard "We centralized data and analytics about two years ago, and m" | said "How does the central team coordinate with those federated analysts to ensure con"
+[   68.3s] conn 1 turn 2: reply 28282ms | heard "The biggest constraint is not tooling. It is that our master" | said "That sounds like a significant bottleneck. Are there current projects or plans t"
+[  111.8s] conn 1 turn 3: reply 23449ms | heard "We have run three pilots, one for demand forecasting, one fo" | said "What were the key factors that enabled the forecasting pilot to succeed where th"
+[  150.8s] conn 1 turn 4: reply 20775ms | heard "Governance sits with a steering committee that meets monthly" | said "Given that lag, are there discussions about moving governance checkpoints earlie"
+[  254.1s] conn 1 turn 5: reply NONE | heard "Skills are the part I worry about most. We can hire data eng" | said "How is the organization addressing that knowledge gap on the business side? Are "
+[  254.1s] conn 1: HEARD the answer and did NOT reply at minute 4.2 — the real signature: a live socket, an understood answer, no reply.
+[  278.1s] conn 1 turn 6: reply 958ms | heard "We centralized data and analytics about two years ago, and m" | said "You mentioned skills as your main worry now. Beyond hiring engineers, are there "
+[  304.4s] conn 1 turn 7: reply 5908ms | heard "The biggest constraint is not tooling, it is that our master" | said "I understand data consistency is a core challenge there. Are there specific doma"
+[  321.1s] conn 1 turn 8: reply NONE | heard "We have run three pilots, one for demand forecasting, one fo"
+[  321.1s] conn 1: HEARD the answer and did NOT reply at minute 5.4 — but the connection closed here (close 1011 Internal error encountered.), so this is the socket dying, not a refusal.
+[  321.1s] conn 1 ended: close 1011 Internal error encountered. (handle kept)
+[  321.4s] conn 2: setupComplete (resumed)
+[  343.8s] conn 2 turn 1: reply 1636ms | heard "Governance sits with a steering committee that meets monthly" | said "It sounds like that lag creates inefficiencies. Have you considered implementing"
+[  366.9s] conn 2 turn 2: reply 3693ms | heard "Skills are the part I worry about most. We can hire data eng" | said "To address that requirement gap, are you considering providing templates for req"
+[  413.1s] conn 2 turn 3: reply 4093ms | heard "We centralized data and analytics about two years ago, and m" | said "How does that centralized team share expertise or best practices with those fede"
+[  435.5s] conn 2 turn 4: reply 2157ms | heard "The biggest constraint is not tooling, it is that our master" | said "or internalGiven that master data challenge, have you set priorities for which r"
+[  456.2s] conn 2 turn 5: reply 2312ms | heard "have run three pilots, one for demand forecasting, one for s" | said "Was the supplier risk pilot from these past runs, or was it an older one? Unders"
+[  480.3s] conn 2 turn 6: reply 3445ms | heard "Governance sits with a steering committee that meets monthly" | said "Have you considered creating clear checkpoints where the steering committee must"
+[  553.6s] conn 2 turn 7: reply NONE | heard "Skills are the part I worry about most. We can hire data eng" | said "modeling,Perhaps establishing a data literacy program for business stakeholders "
+[  553.6s] conn 2: HEARD the answer and did NOT reply at minute 9.2 — the real signature: a live socket, an understood answer, no reply.
+[  613.3s] conn 2 turn 8: reply 39145ms | heard "We centralized data and analytics about two years ago, and m" | said "Would it help to develop data dictionaries or training sessions to improve the b"
+[  613.3s] conn 2 ended: soak deadline (handle kept)
+[  613.3s] 
+[  613.3s] ──────── verdict ────────
+[  613.3s] connections: 2   turns: 16   answered: 13   unanswered: 3
+[  613.3s] reply latency: median 3693ms   p90 28282ms   worst 39145ms
+[  613.3s] first answered turn: 896ms at minute 0.3   (quarters: 17542ms → 9214ms → 3141ms → 2638ms)
+[  613.3s] degradation: first half mean 14872ms → second half mean 7799ms
+[  613.3s] unanswered turns at minutes: 4.2, 5.4, 9.2
+[  613.3s] connection ends: close 1011 Internal error encountered. | soak deadline
+[  613.3s] full log: soak-base.txt
+[  613.3s] LOOK CLOSER — see the unanswered turns and the degradation line above.

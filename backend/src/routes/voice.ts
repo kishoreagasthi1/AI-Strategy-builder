@@ -27,7 +27,7 @@ import {
 } from "../llm/liveSession.js";
 import { buildInterviewerInstruction, MAX_CONTEXT_CHARS } from "../llm/interviewerPersona.js";
 import { isCredentialRejection } from "../llm/byok/resolve.js";
-import type { ByokLiveBinding } from "../llm/byok/resolveLive.js";
+import type { ByokLiveResolution } from "../llm/byok/resolveLive.js";
 import type { Payer } from "../llm/gateway.js";
 
 /**
@@ -150,8 +150,14 @@ export async function voiceRoutes(
    * credential, payer "platform".
    */
   byokLive?: {
-    forClient: (tenantId: string, clientName: string | undefined) => Promise<ByokLiveBinding | null>;
+    forClient: (tenantId: string, clientName: string | undefined) => Promise<ByokLiveResolution>;
     onRejected?: (info: { tenantId: string; clientName: string; detail: string }) => void;
+    /**
+     * May the firm's credential cover this client when their key cannot be
+     * spent? (v5.34.64 — migration 036.) Absent means no, for every client,
+     * which is the default and the safe answer.
+     */
+    fallbackGrant?: (tenantId: string, clientName: string | undefined) => Promise<boolean>;
   }
 ): Promise<void> {
   app.post("/api/voice/tts", async (req, reply) => {
@@ -252,10 +258,57 @@ export async function voiceRoutes(
        * free-tier — the client would have handed over a credential that is
        * never used, and kept paying the firm for it.
        *
-       * A null binding is the ordinary case and means "the platform pays".
+       * `kind: "none"` is the ordinary case and means "the platform pays".
        */
       const billTo = await resolveBillingClient(ctx, parsed.data.clientName);
-      const byokBinding = byokLive ? await byokLive.forClient(ctx.tenantId, billTo) : null;
+      const resolution = byokLive
+        ? await byokLive.forClient(ctx.tenantId, billTo)
+        : ({ kind: "none" } as const);
+
+      /*
+       * v5.34.64. A client with a key on file whose key cannot be spent does
+       * NOT silently become a firm-funded interview.
+       *
+       * Live audio is where the money is — roughly $2 for a 90-minute session
+       * against cents for a deck — so this is precisely the path where a
+       * forgotten fallback costs the most. Until now every failure here
+       * resolved to null and the platform credential minted the session; a key
+       * revoked months ago produced interviews that looked completely normal
+       * and landed entirely on the firm.
+       *
+       * The cost of this decision is real and was weighed: an interview can now
+       * fail to start because the client's key lapsed, and the consultant finds
+       * out with the client's executive already in the room. That is why the
+       * message names the client, the reason and the remedy rather than saying
+       * something went wrong — and why the grant exists, so a firm can decide
+       * in advance which clients it would rather cover than interrupt.
+       */
+      if (resolution.kind === "unusable") {
+        const granted = byokLive?.fallbackGrant
+          ? await byokLive.fallbackGrant(ctx.tenantId, billTo).catch(() => false)
+          : false;
+        if (!granted) {
+          req.log.warn(
+            { clientName: resolution.clientName, reason: resolution.reason },
+            "live session refused — client key unusable and no fallback grant"
+          );
+          reply.code(402).send({
+            error: "client_key_unusable",
+            detail:
+              `${resolution.clientName} runs interviews on their own API key, and ${resolution.reason}. ` +
+              `The session was not started and nothing was charged to your account. ` +
+              `Fix the key on the Client API keys screen, or turn on the fallback grant for this client ` +
+              `if you would rather cover their interviews when their key fails.`,
+          });
+          return;
+        }
+        req.log.warn(
+          { clientName: resolution.clientName, reason: resolution.reason },
+          "client key unusable — continuing on the firm's credential under an explicit grant"
+        );
+      }
+
+      const byokBinding = resolution.kind === "ok" ? resolution.binding : null;
       const effectiveLive: LiveSession = byokBinding?.live ?? live;
       const payer: Payer = byokBinding ? "client_key" : "platform";
 

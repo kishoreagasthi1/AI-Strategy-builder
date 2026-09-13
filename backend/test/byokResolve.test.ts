@@ -18,7 +18,7 @@ import {
   VENDOR_OF_ADAPTER,
 } from "../src/llm/byok/resolve.js";
 import { makeByokLiveResolver } from "../src/llm/byok/resolveLive.js";
-import { LlmGateway, type MeterEvent } from "../src/llm/gateway.js";
+import { LlmGateway, GatewayError, type MeterEvent } from "../src/llm/gateway.js";
 import { PROD_POLICY, DEV_POLICY } from "../src/llm/router.js";
 import type { ProviderAdapter, GenerateRequest } from "../src/llm/types.js";
 import type { ByokKeyRow, ByokProvider } from "../src/llm/byok/byokRepo.js";
@@ -298,6 +298,13 @@ describe("LlmGateway with BYOK", () => {
     events?: MeterEvent[];
     rejected?: any[];
     blockFreeTier?: boolean;
+    /**
+     * v5.34.64. Absent means NO grant, which is the production default for
+     * every client — a client who brought a key runs on it alone. Tests that
+     * assert the pre-v5.34.64 fallback pass `granted: true` explicitly, so the
+     * grant is never the thing a test gets by forgetting to think about it.
+     */
+    granted?: boolean;
   }) {
     return new LlmGateway({
       adapters: opts.adapters ?? [platform("gemini-vertex"), platform("anthropic-vertex")],
@@ -306,6 +313,7 @@ describe("LlmGateway with BYOK", () => {
       blockFreeTier: opts.blockFreeTier ?? true,
       byok: opts.resolve,
       onByokRejected: (i) => { opts.rejected?.push(i); },
+      fallbackGrant: async () => !!opts.granted,
       transientRetries: 0,
     });
   }
@@ -436,7 +444,23 @@ describe("LlmGateway with BYOK", () => {
     expect(seen).toEqual(["NESTLE-KEY"]);
   });
 
-  it("falls back to the platform when the client's key is refused, and reports it once", async () => {
+  /*
+   * ── v5.34.64 rewrote the two tests below ──────────────────────────────────
+   *
+   * They used to assert that a refused client key FELL THROUGH to the firm's
+   * credential and the call succeeded — "the interview does not stop because a
+   * client's key lapsed", in the words of the original. That was the shipped
+   * intent, and it was wrong: it decided, on the firm's behalf and silently,
+   * that a revoked key should become the firm's invoice. See migration 036.
+   *
+   * What was worth keeping has been kept, because none of it was about the
+   * fallback: the rejection is still reported exactly once with the client and
+   * provider named, the sibling adapter on the same key is still not retried,
+   * and a 429 still does not demote a perfectly good key. Each now appears
+   * twice — once confined, once under an explicit grant — so the grant is
+   * covered by the same assertions rather than by a separate, thinner test.
+   */
+  it("a refused client key stops the call, and is reported once", async () => {
     const events: MeterEvent[] = [];
     const rejected: any[] = [];
     const refusing = (async () => new Response(
@@ -450,12 +474,13 @@ describe("LlmGateway with BYOK", () => {
         fetchImpl: refusing,
       }),
     });
-    const res = await gw.generate(
-      { tenantId: "t1", userId: "u1", module: "m", clientName: "Nestle" }, REQ);
+    const err = await gw.generate(
+      { tenantId: "t1", userId: "u1", module: "m", clientName: "Nestle" }, REQ
+    ).catch((e) => e as GatewayError);
 
-    // The interview does not stop because a client's key lapsed.
-    expect(res.provider).toBe("gemini-vertex");
-    expect(res.text).toBe("platform:gemini-vertex");
+    // The firm's credential is not reachable for a client who brought a key.
+    expect(err).toBeInstanceOf(GatewayError);
+    expect((err as GatewayError).statusCode).toBe(402);
     // Reported once, naming the client and the provider, so the Owner's screen
     // can stop saying "active".
     expect(rejected).toHaveLength(1);
@@ -463,7 +488,32 @@ describe("LlmGateway with BYOK", () => {
     // And the sibling adapter on the SAME key was not tried again.
     const attempted = events.map((e) => e.provider);
     expect(attempted.filter((p) => p === "gemini-aistudio-2")).toHaveLength(0);
-    // The successful row is platform-paid; the failed one is not invoiced anyway.
+    // Nothing was billed to the firm, because nothing of the firm's ran.
+    expect(events.filter((e) => e.payer === "platform")).toHaveLength(0);
+  });
+
+  it("falls back to the platform when — and only when — the firm has granted it", async () => {
+    const events: MeterEvent[] = [];
+    const rejected: any[] = [];
+    const refusing = (async () => new Response(
+      JSON.stringify({ error: { status: "PERMISSION_DENIED" } }), { status: 403 })) as unknown as typeof fetch;
+
+    const gw = gatewayFor({
+      events, rejected, granted: true,
+      resolve: resolverWith({
+        rows: { "Nestle:gemini-aistudio": {} },
+        keys: { "projects/p/secrets/s/versions/3": "DEAD-KEY" },
+        fetchImpl: refusing,
+      }),
+    });
+    const res = await gw.generate(
+      { tenantId: "t1", userId: "u1", module: "m", clientName: "Nestle" }, REQ);
+
+    expect(res.provider).toBe("gemini-vertex");
+    expect(res.text).toBe("platform:gemini-vertex");
+    // The key is still marked failed — a grant covers the cost, it does not
+    // pretend the credential works.
+    expect(rejected).toHaveLength(1);
     expect(events.at(-1)!.payer).toBe("platform");
   });
 
@@ -475,6 +525,29 @@ describe("LlmGateway with BYOK", () => {
 
     const gw = gatewayFor({
       events, rejected,
+      resolve: resolverWith({
+        rows: { "Nestle:gemini-aistudio": {} },
+        keys: { "projects/p/secrets/s/versions/3": "GOOD-KEY" },
+        fetchImpl: busy,
+      }),
+    });
+    const err = await gw.generate(
+      { tenantId: "t1", userId: "u1", module: "m", clientName: "Nestle" }, REQ
+    ).catch((e) => e as GatewayError);
+
+    // Confined, so it does not reach the firm's adapter — but the advice is
+    // "try again", not "your client's key is broken", because it is not.
+    expect((err as GatewayError).statusCode).toBe(503);
+    expect(rejected).toHaveLength(0);             // key untouched
+  });
+
+  it("a rate-limited client key still falls back under a grant", async () => {
+    const rejected: any[] = [];
+    const busy = (async () => new Response(
+      JSON.stringify({ error: { status: "RESOURCE_EXHAUSTED" } }), { status: 429 })) as unknown as typeof fetch;
+
+    const gw = gatewayFor({
+      rejected, granted: true,
       resolve: resolverWith({
         rows: { "Nestle:gemini-aistudio": {} },
         keys: { "projects/p/secrets/s/versions/3": "GOOD-KEY" },
@@ -539,18 +612,28 @@ describe("makeByokLiveResolver", () => {
     });
   }
 
-  it("returns nothing for unattributed work", async () => {
-    expect(await liveResolver({ row: keyRow(), key: "K" })("t1", undefined)).toBeNull();
+  /*
+   * v5.34.64 changed this resolver's return type from `ByokLiveBinding | null`
+   * to a three-way ByokLiveResolution. `null` meant two different things —
+   * "no key on file, the firm pays" and "a key IS on file and cannot be spent"
+   * — and the voice route, unable to tell them apart, treated both as ordinary
+   * and minted the session on the firm's credential. The assertions below are
+   * the same ones, re-expressed against the outcome that is now distinguished.
+   */
+  it("'none' for unattributed work", async () => {
+    expect(await liveResolver({ row: keyRow(), key: "K" })("t1", undefined))
+      .toEqual({ kind: "none" });
   });
 
   it("binds a live session to the client's key, marked as a paid account", async () => {
-    const b = await liveResolver({ row: keyRow(), key: "CLIENT-LIVE" })("t1", "Nestle");
-    expect(b).not.toBeNull();
+    const r = await liveResolver({ row: keyRow(), key: "CLIENT-LIVE" })("t1", "Nestle");
+    expect(r.kind).toBe("ok");
+    if (r.kind !== "ok") return;
     // freeTier false is what lets it through the production lockdown in
     // routes/voice.ts — see the attestation note in resolveLive.ts.
-    expect(b!.live.freeTier).toBe(false);
-    expect(b!.keyHint).toBe("aaaa");
-    expect(b!.clientName).toBe("Nestle");
+    expect(r.binding.live.freeTier).toBe(false);
+    expect(r.binding.keyHint).toBe("aaaa");
+    expect(r.binding.clientName).toBe("Nestle");
   });
 
   it("only ever looks at the GOOGLE key — Anthropic cannot serve a voice session", async () => {
@@ -564,22 +647,37 @@ describe("makeByokLiveResolver", () => {
     expect(seen).toEqual(["gemini-aistudio"]);
   });
 
-  it("falls back rather than failing when the key is inactive or unreadable", async () => {
-    expect(await liveResolver({ row: keyRow({ status: "failed" }), key: "K" })("t1", "Nestle")).toBeNull();
+  it("reports a key on file that cannot be spent as 'unusable', not 'none'", async () => {
+    /*
+     * Was "falls back rather than failing when the key is inactive or
+     * unreadable". The fallback itself is what v5.34.64 removed: a client who
+     * supplied a key and whose key is switched off is not a client without a
+     * key, and the difference decides who pays for the next 90-minute
+     * interview. The route makes that call now (routes/voice.ts); this asserts
+     * it is given the information to make it.
+     */
+    const off = await liveResolver({ row: keyRow({ status: "failed" }), key: "K" })("t1", "Nestle");
+    expect(off.kind).toBe("unusable");
+
     const errs: unknown[] = [];
-    expect(await liveResolver({ row: keyRow(), key: null, onResolveError: (i) => errs.push(i) })("t1", "Nestle"))
-      .toBeNull();
+    const unreadable = await liveResolver({
+      row: keyRow(), key: null, onResolveError: (i) => errs.push(i),
+    })("t1", "Nestle");
+    expect(unreadable.kind).toBe("unusable");
+    // Still reported, so the Owner's screen stops claiming the key works.
     expect(errs).toHaveLength(1);
   });
 
   it("never throws when Secret Manager is unreachable", async () => {
+    // Still no exception — but the answer is "unusable", not "the firm pays".
+    // An outage on OUR side must not move a paying client's bill onto the firm.
     const errs: unknown[] = [];
     const r = await liveResolver({
       row: keyRow(),
       fetchKey: async () => { throw new Error("secretmanager unreachable"); },
       onResolveError: (i) => errs.push(i),
     })("t1", "Nestle");
-    expect(r).toBeNull();
+    expect(r.kind).toBe("unusable");
     expect(errs).toHaveLength(1);
   });
 });
