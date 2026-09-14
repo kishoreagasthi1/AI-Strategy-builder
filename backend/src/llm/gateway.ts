@@ -234,11 +234,21 @@ export class LlmGateway {
      */
     let byokAdapters: ResolvedByok["adapters"] = EMPTY_ADAPTERS;
     let byokBacking: ResolvedByok["backing"] = EMPTY_BACKING;
+    /*
+     * v5.34.69. Keys ON FILE that cannot be spent — see ResolvedByok.unusable.
+     *
+     * Without this, v5.34.64's confinement protected exactly one call: the
+     * refusal marked the key `failed`, the next lookup found no ACTIVE key,
+     * reported a client with no key at all, and the firm's chain ran silently
+     * from then on. The protection has to survive the thing it protects against.
+     */
+    let byokUnusable: ResolvedByok["unusable"] = [];
     if (this.opts.byok) {
       try {
         const resolved = await this.opts.byok({ tenantId: ctx.tenantId, clientName: ctx.clientName });
         byokAdapters = resolved.adapters;
         byokBacking = resolved.backing;
+        byokUnusable = resolved.unusable ?? [];
       } catch {
         // Deliberately swallowed — the resolver reports its own failures
         // through onResolveError, and this path must degrade, not throw.
@@ -293,7 +303,7 @@ export class LlmGateway {
      * invoice nobody approved. Now it fails, and says whose key failed.
      */
     let fallbackGranted = false;
-    if (byokAdapters.size && this.opts.fallbackGrant) {
+    if ((byokAdapters.size || byokUnusable.length) && this.opts.fallbackGrant) {
       try {
         fallbackGranted = await this.opts.fallbackGrant({
           tenantId: ctx.tenantId, clientName: ctx.clientName,
@@ -302,7 +312,26 @@ export class LlmGateway {
         // No grant on error — a failed lookup must not authorise spending.
       }
     }
-    const confined = byokAdapters.size && !fallbackGranted;
+    const confined = (byokAdapters.size > 0 || byokUnusable.length > 0) && !fallbackGranted;
+
+    /*
+     * A client whose ONLY credentials are unusable has nothing left to try, so
+     * there is no chain to walk — refuse here rather than falling through to a
+     * chain that would be the firm's. The message names the key's own reason
+     * (recorded on the row by v5.34.61) rather than a generic failure.
+     */
+    if (!byokAdapters.size && byokUnusable.length && !fallbackGranted) {
+      const u = byokUnusable[0];
+      throw new GatewayError(
+        402,
+        `${u.clientName} runs on their own API key, and ${u.reason}. ` +
+        `Nothing was charged to your account. Fix the key on the Client API keys screen — ` +
+        `or turn on the fallback grant for this client if you would rather cover their work ` +
+        `while their key is down.`,
+        // detail is server-side only, which is where raw upstream text belongs.
+        byokUnusable.map((x) => `${x.provider}: ${x.reason}${x.detail ? ` — ${x.detail}` : ""}`).join(" | ")
+      );
+    }
     const chain = confineToClientCredentials(
       interleaved, new Set(byokAdapters.keys()), { granted: fallbackGranted }
     );

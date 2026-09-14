@@ -213,16 +213,197 @@
     return hi + 1;
   }
 
-  /* Unweighted mean ACROSS dimensions — role weights rank people within a
-   * dimension and say nothing about how dimensions compare to each other. */
-  function overallOf(scores) {
-    if (!scores) return null;
-    var acc = 0, n = 0;
-    for (var i = 0; i < DIMS.length; i++) {
-      var v = finite(scores[DIMS[i]]);
-      if (v === null || v <= 0) continue;
-      acc += v; n++;
+  /* ── v5.34.92: how much each DIMENSION counts toward the overall ───────────
+   *
+   * Role weights rank PEOPLE within one dimension. They deliberately say
+   * nothing about how dimensions compare, so the overall was a plain mean
+   * across the seven — and a 1.7 on a dimension the engagement barely cared
+   * about counted exactly as much as a 1.7 on its central one.
+   *
+   * The weights are NOT a new input. Pre-Engagement already asks the
+   * consultant to tier every dimension per role — lead / cover / light, and a
+   * dimension in none of them is excluded — and that tiering is the statement
+   * of what this engagement is actually about. Summing it across the roles who
+   * were interviewed gives a per-dimension weight for free.
+   *
+   * Three properties this shape was chosen for:
+   *
+   *  · It is a SNAPSHOT. Each interview carries the tiers that governed it
+   *    (interview_agent.html writes ivRecord.dimTiers at completion), so the
+   *    weights cannot drift from what the interviews actually did, and editing
+   *    Pre-Engagement later does not silently restate a delivered score.
+   *
+   *  · It degrades to today's number. An interview recorded before v5.34.92
+   *    has no dimTiers; if ANY scored interview in the round is missing them
+   *    this returns null and overallOf falls back to the plain mean. Every
+   *    existing engagement therefore reads exactly as it did before — no
+   *    client's delivered maturity level moves retroactively.
+   *
+   *  · A dimension excluded by every role weighs 0 and leaves the mean
+   *    entirely, which is what "we turned it off in Pre-Engagement" means.
+   *
+   * A note on what this does NOT buy, because the number matters: on a roster
+   * of three the derived weights are fairly flat (roughly 1.6–2.3 on the
+   * example in docs/SCORING_EXPLAINED.md), so the overall typically moves by
+   * about 0.1. It is a correctness fix, not a re-scoring.
+   */
+  var TIER_WEIGHT = { lead: 1.0, cover: 0.6, light: 0.3 };
+
+  /* ── v5.34.96: THE MATURITY BANDS, ONCE ────────────────────────────────────
+   *
+   * These thresholds and these five words are what a client is actually told.
+   * They existed in four places, all agreeing by luck rather than by anything:
+   *
+   *   backend/src/routes/scorecard.ts   MATURITY      (/api/scorecard, the deck)
+   *   frontend/interview_agent.html     MATURITY      (live panel, export sheet)
+   *   frontend/synthesis.html  :2067    inline ternary (dashboard headline)
+   *   frontend/synthesis.html  ml()     inline ternary (the Word document)
+   *
+   * — plus a fifth, frontend/scorecard.html, holding a COLOUR map keyed by the
+   * label strings, which silently loses its colours if a label is reworded.
+   *
+   * No test compared any of them. scorecard.test.ts hardcodes the five expected
+   * labels and never reads the frontend, so editing the browser table alone
+   * left the suite green; scoreMeaningAndWeight.test.ts stubs its own bands
+   * entirely. A consultant renaming "AI Capable" in one file would have shipped
+   * a client deck and a dashboard that disagreed about the client's maturity.
+   *
+   * Nothing about the bands changes here. This is de-duplication: one table,
+   * mirrored in backend/src/tenant/scoring.ts, pinned by scoringParity.test.ts.
+   * Colours stay in the pages — those are presentation and legitimately differ
+   * between a dark side-panel and a light portfolio card — but they are keyed
+   * by these labels, and maturityBandParity.test.ts checks the key sets match.
+   */
+  var MATURITY_BANDS = [
+    { min: 4.5, label: "AI-Native" },
+    { min: 3.5, label: "AI-Led" },
+    { min: 2.5, label: "AI Capable" },
+    { min: 1.5, label: "AI Exploring" },
+    { min: 0,   label: "AI Unaware" }
+  ];
+
+  /** The band a score falls in. Always returns one; 0 is "AI Unaware". */
+  function maturityBand(score) {
+    var v = finite(score);
+    if (v === null) return MATURITY_BANDS[MATURITY_BANDS.length - 1];
+    for (var i = 0; i < MATURITY_BANDS.length; i++) {
+      if (v >= MATURITY_BANDS[i].min) return MATURITY_BANDS[i];
     }
+    return MATURITY_BANDS[MATURITY_BANDS.length - 1];
+  }
+
+  /**
+   * The band's label, or null when there is no score to band.
+   *
+   * null and 0 are different answers and both callers of this matter: a round
+   * with no scores at all has no maturity (null → the caller says "Pending" or
+   * "Not assessed"), while a round measured at 0 genuinely is AI Unaware.
+   */
+  function maturityLabel(score) {
+    var v = finite(score);
+    return v === null ? null : maturityBand(v).label;
+  }
+
+  /* ── v5.34.96: THE ⚡ MARKER WAS WRITTEN AT THE WRONG LEVEL ────────────────
+   *
+   * synthesis.html marks a dimension whose score moved because of an external
+   * event — a breach, a funding round, a new CTO — so the shift is explainable
+   * rather than mysterious. It reads `round.eventDriven` and
+   * `round.eventCoveredDims` (synthesis.html:818 and :1043).
+   *
+   * NOTHING HAS EVER WRITTEN THOSE. Both builders set eventDriven /
+   * eventCoveredDims / eventContext on the INTERVIEW record
+   * (interview_agent.html writeInterviewToEngagement, engagementMerge.ts
+   * mergeSessionIntoEngagement); no code anywhere assigns them to a round. So
+   * the `&&` at :1043 could never be true and the marker has never rendered —
+   * written on both sides of the boundary and consumed by nobody, which is the
+   * isRefresh/isRefreshMode defect with a level substituted for a spelling.
+   *
+   * Fixed by DERIVING the round's flags from its interviews rather than by
+   * adding a fourth place that writes them. A derivation cannot drift from the
+   * data it is derived from; a copy can, and this codebase has the scars.
+   *
+   * A round is event-driven if any interview in it was, and the covered
+   * dimensions are the union — several interviews in one round can each be
+   * tagged with the same event and re-score different dimensions.
+   */
+  function roundEventRollup(interviews) {
+    var list = [];
+    if (Object.prototype.toString.call(interviews) === "[object Array]") {
+      for (var q = 0; q < interviews.length; q++) if (interviews[q]) list.push(interviews[q]);
+    }
+    var driven = false, ctx = null, dims = [], i, j;
+    for (i = 0; i < list.length; i++) {
+      var iv = list[i];
+      if (!iv.eventDriven) continue;
+      driven = true;
+      if (!ctx && iv.eventContext) ctx = iv.eventContext;
+      var cov = Object.prototype.toString.call(iv.eventCoveredDims) === "[object Array]"
+        ? iv.eventCoveredDims : [];
+      for (j = 0; j < cov.length; j++) {
+        var d = String(cov[j]);
+        if (DIMS.indexOf(d) >= 0 && dims.indexOf(d) < 0) dims.push(d);
+      }
+    }
+    // Stable order, so a round record does not churn on every recompute.
+    dims.sort();
+    return { eventDriven: driven, eventContext: ctx, eventCoveredDims: dims };
+  }
+
+  /**
+   * Per-dimension weights for a round, or null when the round cannot supply
+   * them (no interviews, a legacy interview with no tiers, or tiers that
+   * exclude everything).
+   *
+   * All-or-nothing on purpose: weighting a round from the two interviews that
+   * happen to carry tiers, while ignoring the third, is a number nobody can
+   * explain and nobody would notice was wrong.
+   */
+  function dimensionWeights(interviews) {
+    var list = [];
+    if (Object.prototype.toString.call(interviews) === "[object Array]") {
+      for (var q = 0; q < interviews.length; q++) if (interviews[q]) list.push(interviews[q]);
+    }
+    if (!list.length) return null;
+    var w = {}, i, d;
+    for (i = 0; i < DIMS.length; i++) w[DIMS[i]] = 0;
+    for (i = 0; i < list.length; i++) {
+      var t = list[i].dimTiers;
+      if (!t || typeof t !== "object") return null;
+      for (d = 0; d < DIMS.length; d++) {
+        var tier = t[DIMS[d]];
+        var tw = Object.prototype.hasOwnProperty.call(TIER_WEIGHT, tier) ? TIER_WEIGHT[tier] : 0;
+        w[DIMS[d]] += tw;
+      }
+    }
+    var any = false;
+    for (d = 0; d < DIMS.length; d++) if (w[DIMS[d]] > 0) any = true;
+    return any ? w : null;
+  }
+
+  /**
+   * Overall across dimensions. With `weights`, a weighted mean; without them,
+   * the plain mean this has always been.
+   *
+   * The second argument is optional so that every existing call site keeps its
+   * exact current behaviour — a caller opts in by passing weights, never by
+   * accident.
+   */
+  function overallOf(scores, weights) {
+    if (!scores) return null;
+    var acc = 0, n = 0, wacc = 0, wsum = 0, i, v, w;
+    for (i = 0; i < DIMS.length; i++) {
+      v = finite(scores[DIMS[i]]);
+      if (v === null || v <= 0) continue;
+      if (weights) {
+        w = finite(weights[DIMS[i]]);
+        if (w === null || w <= 0) continue;   // excluded by every role
+        wacc += v * w; wsum += w;
+      } else {
+        acc += v; n++;
+      }
+    }
+    if (weights) return wsum > 0 ? round1(wacc / wsum) : null;
     return n ? round1(acc / n) : null;
   }
 
@@ -283,6 +464,114 @@
    * scoringRubricParityCheck in the test suite asserts interview_agent.html
    * still carries this exact line, so the two cannot drift apart silently.
    */
+  /* ── v5.34.92: WHOSE answers each dimension score rests on ─────────────────
+   *
+   * The round score for a dimension is a role-weighted mean across the people
+   * who answered — and it is arithmetically correct whoever those people were.
+   * What the number cannot say is that the person the weight table trusts most
+   * on that dimension was never in the room.
+   *
+   * The worked example in docs/SCORING_EXPLAINED.md is the case: D6 Governance
+   * & Risk comes out at 1.7, the lowest score in the engagement and the one the
+   * deck will lead with, from a CTO (0.8) and a CFO (0.6). The General Counsel
+   * carries 1.0 on D6 and was not interviewed. Nothing anywhere in the product
+   * said so, and the weighting added in this same version makes it matter MORE,
+   * not less — D6 now pulls harder on the overall precisely because two of the
+   * three roles led on it.
+   *
+   * So this is a roster audit, not a scoring change. It reads the same weight
+   * table the scores were computed with and reports, per dimension, the highest
+   * authority that actually answered against the highest authority that exists.
+   * It changes no number.
+   *
+   * Pure and table-injected for the same reason computeRoundScores is: the
+   * weight table lives in vyne-client.js (browser) and engagementMerge.ts
+   * (server) and this file must not acquire a third copy.
+   *
+   * @param interviews  round.interviews — each {role, scores}
+   * @param table       VYNE_ROLE_WEIGHTS-shaped {D1:{CTO:0.8,...},...}
+   * @param roleKeyFn   optional normaliser for display-label roles
+   *                    ("COO / VP Operations" → "COO")
+   * @returns one entry per dimension, in DIMS order
+   */
+  function rosterCoverage(interviews, table, roleKeyFn) {
+    var list = [];
+    if (Object.prototype.toString.call(interviews) === "[object Array]") {
+      for (var q = 0; q < interviews.length; q++) if (interviews[q]) list.push(interviews[q]);
+    }
+    var tbl = table || {};
+    var norm = typeof roleKeyFn === "function" ? roleKeyFn : function (r) {
+      /* Mirrors vyneRoleWeight's last-resort match so a display label does not
+       * silently read as an unknown role weighing the 0.5 default — which would
+       * report every dimension as thinly covered on exactly the engagements
+       * whose rosters came from synthetic data or an import. */
+      var s = String(r || "").trim();
+      return s.split(/[\/(—-]/)[0].trim().replace(/\s+/g, "_");
+    };
+
+    var out = [];
+    for (var i = 0; i < DIMS.length; i++) {
+      var d = DIMS[i];
+      var row = tbl[d] || {};
+
+      // The highest authority that EXISTS for this dimension.
+      var best = 0, bestRoles = [], r;
+      for (r in row) {
+        if (!Object.prototype.hasOwnProperty.call(row, r)) continue;
+        var v = finite(row[r]);
+        if (v === null) continue;
+        if (v > best) { best = v; bestRoles = [r]; }
+        else if (v === best && v > 0) bestRoles.push(r);
+      }
+
+      // The highest authority that actually ANSWERED on this dimension.
+      var have = 0, haveRole = null, contributors = [], seen = {};
+      for (var k = 0; k < list.length; k++) {
+        var iv = list[k];
+        var sc = finite(iv.scores ? iv.scores[d] : undefined);
+        if (sc === null || sc <= 0) continue;          // 0 = no evidence
+        var key = norm(iv.role);
+        var w = finite(row[key]);
+        if (w === null) w = 0.5;                       // same default as vyneRoleWeight
+        contributors.push({ role: key, weight: w, score: sc });
+        if (!seen[key] || w > seen[key]) seen[key] = w;
+        if (w > have) { have = w; haveRole = key; }
+      }
+
+      /* `missing` is only meaningful when the roster FALLS SHORT of the best
+       * available authority. Several roles can tie at the top — D7 is CEO 1.0
+       * and CHRO 1.0 — and interviewing either one covers the dimension; a
+       * naive "top roles not in the roster" list then named the CEO on a
+       * dimension the CHRO had already answered authoritatively, so the panel
+       * flagged "well covered" and explained that the key voice was missing, in
+       * the same row. */
+      var missing = [];
+      if (have < best) {
+        for (var b = 0; b < bestRoles.length; b++) {
+          if (!Object.prototype.hasOwnProperty.call(seen, bestRoles[b])) missing.push(bestRoles[b]);
+        }
+      }
+
+      /* Severity. `none` is not a warning about WHO answered — nobody did, and
+       * the coverage map already says so; it is here so the two panels cannot
+       * disagree about which dimensions have evidence. */
+      var status;
+      if (!contributors.length) status = "none";
+      else if (have < 0.5 || (best - have) >= 0.4) status = "gap";
+      else if (have < best) status = "thin";
+      else status = "ok";
+
+      out.push({
+        dim: d, status: status,
+        have: round2(have), haveRole: haveRole,
+        best: round2(best), bestRoles: bestRoles,
+        missing: missing,
+        contributors: contributors
+      });
+    }
+    return out;
+  }
+
   var SCALE = '1=Not Started, 2=Early/Ad Hoc, 3=Developing, 4=Advanced, 5=Leading/Optimized';
 
   /** The benchmark-calibration instruction the interviewer scores under. */
@@ -291,6 +580,13 @@
 
   return {
     DIMS: DIMS,
+    TIER_WEIGHT: TIER_WEIGHT,
+    MATURITY_BANDS: MATURITY_BANDS,
+    maturityBand: maturityBand,
+    maturityLabel: maturityLabel,
+    dimensionWeights: dimensionWeights,
+    roundEventRollup: roundEventRollup,
+    rosterCoverage: rosterCoverage,
     SCALE: SCALE,
     BENCHMARK_CALIBRATION: BENCHMARK_CALIBRATION,
     DEFAULT_COVERAGE_WEIGHT: DEFAULT_COVERAGE_WEIGHT,

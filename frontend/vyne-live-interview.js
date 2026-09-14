@@ -52,13 +52,93 @@
    * Scoring runs at most this often, no matter how fast turns arrive.
    *
    * v5.32.44: was 20s. A short exchange produced a scoring call every couple of
-   * turns, and the call count on the statement was dominated by them. Scoring
-   * sees the whole running transcript, so a longer gap loses nothing — the next
-   * pass still covers everything said in between.
+   * turns, and the call count on the statement was dominated by them.
+   *
+   * v5.34.73 — this comment used to end: "Scoring sees the whole running
+   * transcript, so a longer gap loses nothing — the next pass still covers
+   * everything said in between." That is false and always was.
+   * transcriptText() below is `turns.slice(-TRANSCRIPT_WINDOW)` — the last 24
+   * turns, not the whole transcript.
+   *
+   * Nothing is lost TODAY only because the window is wider than the interval:
+   * 24 turns is roughly 4.75 minutes of a real interview (measured over the
+   * 30-minute run of 2026-09-13: 152 turns in 1805 seconds) against a 60-second
+   * gap, so consecutive passes overlap about fivefold. But the false sentence
+   * was the justification anyone would lean on to RAISE the interval, and at a
+   * brisk three seconds a turn the window is 72 seconds and the margin is
+   * essentially gone. Evidence would then fall between passes silently, and a
+   * dimension nobody ever scored looks exactly like a dimension nobody
+   * discussed.
+   *
+   * If you raise this, raise TRANSCRIPT_WINDOW with it and keep the window at
+   * least three times the interval in turns.
    */
-  var SCORE_MIN_INTERVAL_MS = 60000;
+  /*
+   * v5.34.86 — 60s → 20s, because the scorecard is a LIVE meter.
+   *
+   * The interview screen shows seven dimension bars beside the conversation,
+   * and they move only when a scoring pass lands. At a 60-second floor a
+   * dimension could be discussed, evidenced and left behind before the meter
+   * acknowledged it existed — the panel read as broken rather than as an
+   * assessment forming while you watch. That matters more now that a dead
+   * scorer ends the sitting (v5.34.85): the meter moving IS the signal that
+   * scoring is alive.
+   *
+   * Priced before changing it rather than after. A pass sends the 24-turn
+   * window (~3k tokens in) and returns a small JSON (~150 out), on flash-lite
+   * at $0.10/M in and $0.40/M out — about $0.00036 a pass. Across a 60-minute
+   * interview that is ~$0.02 at the old floor and ~$0.07 at this one. Four
+   * cents an interview for a meter that responds to the conversation is not a
+   * trade worth hesitating over.
+   *
+   * This is a FLOOR, not a schedule: passes are driven by completed turns and
+   * skipped when the window has not changed (_lastScored), so a quiet stretch
+   * still costs nothing.
+   */
+  var SCORE_MIN_INTERVAL_MS = 20000;
   /** Enough recent conversation for scoring context, bounded for cost. */
   var TRANSCRIPT_WINDOW = 24;
+
+  /*
+   * When scoring is dead enough to stop the interview. (v5.34.85)
+   *
+   * A pass runs at most once a minute (SCORE_MIN_INTERVAL_MS), so these are
+   * minutes, not seconds — deliberately slow to fire. Ending a sitting in front
+   * of an executive is a real cost; it is simply a smaller one than an hour
+   * that yields no evidence.
+   *
+   * The two thresholds differ because the two situations differ. Three failures
+   * AFTER a success is a provider that has gone down mid-interview: unambiguous,
+   * and three minutes of unscored conversation is already a material hole in
+   * the evidence. Never having scored is more often a thin opening than an
+   * outage — the model is right to report no evidence from two sentences of
+   * pleasantries — so that one waits longer before concluding the pipe is
+   * broken rather than the conversation young.
+   */
+  var STOP_AFTER_CONSECUTIVE = 3;
+  var STOP_IF_NEVER_SCORED_BY = 5;
+  /*
+   * ── v5.34.88: AND a duration, because a count alone is not a duration ──────
+   *
+   * The counts above were chosen in v5.34.85 reasoning "a pass runs at most
+   * once a minute, so these are minutes". v5.34.86 then lowered
+   * SCORE_MIN_INTERVAL_MS from 60s to 20s to make the live meter responsive,
+   * and never revisited them — so "five passes without a score" quietly became
+   * a hundred seconds instead of five minutes, and the interview could be
+   * ended, in front of a client, over a ninety-second provider wobble.
+   *
+   * Two correct changes that are wrong together. Tying the thresholds to a
+   * cadence constant declared elsewhere in the same file is what made that
+   * possible, so they are no longer tied to it: a stop requires the count AND
+   * a wall-clock stretch of continuous failure. Retune the cadence freely now
+   * — the stop still means what it says.
+   *
+   * Ending a sitting is right when scoring is genuinely dead and wrong when it
+   * is merely slow, and the only thing that distinguishes those is elapsed
+   * time.
+   */
+  var STOP_AFTER_MS = 180000;          // 3 minutes of failing, having worked
+  var STOP_IF_NEVER_SCORED_AFTER_MS = 300000;  // 5 minutes never having worked
 
   function esc(s) {
     return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;')
@@ -82,20 +162,71 @@
       '',
       'D1 Data & Data Management | D2 Technology & Infrastructure | D3 AI Strategy & Vision',
       'D4 People & Skills | D5 Process & Operations | D6 Governance & Risk | D7 Culture & Change Readiness',
-      'Scale: 1=Not Started, 2=Early/Ad Hoc, 3=Developing, 4=Advanced, 5=Leading/Optimized',
+      /*
+       * v5.34.85 — the SHARED scale and calibration, not a private copy.
+       *
+       * This line was a hand-written duplicate of VyneScoring.SCALE, and the
+       * benchmark calibration the text path carries was missing entirely.
+       * scoringRubricParity.test.ts pins interview_agent.html against the
+       * shared definition for exactly this reason and never looked at this
+       * file — so the path that now produces most of the scores was the one
+       * free to drift.
+       *
+       * It matters beyond tidiness: computeRoundScores averages voice and text
+       * interviews into ONE round score. Two rubrics behind one number means
+       * the number means neither.
+       *
+       * The literals stay as a fallback because vyne-scoring.js is page
+       * furniture that not every context loads, and a scoring pass with a
+       * slightly stale scale is worth more than no scoring pass at all.
+       */
+      'Scale: ' + ((window.VyneScoring && window.VyneScoring.SCALE) ||
+        '1=Not Started, 2=Early/Ad Hoc, 3=Developing, 4=Advanced, 5=Leading/Optimized'),
+      (window.VyneScoring && window.VyneScoring.BENCHMARK_CALIBRATION) || null,
       '',
       'FINDING ATTRIBUTION: write any finding as a CONDITION of the function or organisation,',
       'never as a named individual\'s act or fault. Not "the CRO blocked deployments" but',
       '"deployments have been paused pending explainability evidence."',
       '',
+      /*
+       * v5.34.85 — COVERAGE, which the voice path never reported.
+       *
+       * On a follow-up round tenant/scoring.ts blends each dimension against the
+       * prior round in proportion to how much this conversation actually
+       * re-evidenced it. applyScoreData reads that from scoreData.coverage — and
+       * this template had no coverage key, so every voice refresh fell through
+       * to the 0.3 default no matter how thoroughly a dimension was re-covered.
+       * The whole delta-scoring feature was inert for voice, which is now most
+       * interviews.
+       *
+       * Asked for only in refresh mode: on a first assessment there is nothing
+       * to blend against, and a key the scorer must invent is a key it will
+       * invent badly.
+       */
       'Return ONLY this JSON, no prose, no fences:',
-      '{"scores":{"D1":0,"D2":0,"D3":0,"D4":0,"D5":0,"D6":0,"D7":0},"finding":{"dimension":"D3","text":""},"questionsAsked":0}',
+      (state.isRefreshMode
+        ? '{"scores":{"D1":0,"D2":0,"D3":0,"D4":0,"D5":0,"D6":0,"D7":0},' +
+          '"coverage":{"D1":0,"D2":0,"D3":0,"D4":0,"D5":0,"D6":0,"D7":0},' +
+          '"finding":{"dimension":"D3","text":""},"questionsAsked":0}'
+        : '{"scores":{"D1":0,"D2":0,"D3":0,"D4":0,"D5":0,"D6":0,"D7":0},' +
+          '"finding":{"dimension":"D3","text":""},"questionsAsked":0}'),
+      (state.isRefreshMode
+        ? '"coverage" is how fully THIS conversation re-examined each dimension, 0 to 1: ' +
+          '0 if it never came up, 0.5 if it was touched, 1 if it was gone through properly. ' +
+          'It decides how much of the earlier round\'s score is kept, so guessing high erases ' +
+          'evidence the firm already has.'
+        : null),
       'Omit "finding" entirely if nothing significant emerged since the last scoring pass.',
       '',
       '--- TRANSCRIPT ---',
       transcript,
       '--- END TRANSCRIPT ---'
-    ].join('\n');
+    /*
+     * null drops a conditional line; '' is a deliberate blank line and stays.
+     * The first version filtered '' too and silently collapsed every paragraph
+     * break in the prompt.
+     */
+    ].filter(function (l) { return l !== null; }).join('\n');
   }
 
   function LiveInterview(opts) {
@@ -124,6 +255,10 @@
      */
     this.scoreFailures = 0;
     this.scoreSuccesses = 0;
+    /* Fired at most once per sitting — see the scoring-dead block in _score. */
+    this._scoringDeadFired = false;
+    /* When the current unbroken run of failures began; null while healthy. */
+    this._failingSince = null;
     /** Renewals used so far — see MAX_RENEWALS. */
     this.renewals = 0;
   }
@@ -165,6 +300,9 @@
 
     this.scoring = true;
     this.lastScoreAt = now;
+    /* v5.34.86: the panel shows this, so a pass in flight reads as activity
+     * rather than as a frozen meter between updates. */
+    if (this.opts.onScoringState) { try { this.opts.onScoringState(true); } catch (e) {} }
 
     fetch('/api/llm/generate', {
       method: 'POST',
@@ -193,8 +331,25 @@
         var parsed = window.vyneParseJson ? window.vyneParseJson(d.text || '') : null;
         if (!parsed) throw Object.assign(new Error('unparseable_score_response'), { code: 'unparseable_score_response' });
         self.scoreFailures = 0;
+        self._failingSince = null;   // a success breaks the run, count and clock
         self.scoreSuccesses++;
-        if (self.opts.onScore) { try { self.opts.onScore(parsed); } catch (e) {} }
+        /*
+         * v5.34.85 — a THROW in here used to vanish.
+         *
+         * This was `try { onScore(parsed); } catch(e) {}`. The page's handler
+         * applies the scores and re-renders the scorecard; if either threw, the
+         * pass was lost, the autosave alongside it was skipped, and
+         * scoreFailures stayed 0 — so nothing counted it, no badge lit, and
+         * everScored() still reported success. A scoring outage that looked
+         * like a clean interview is exactly the outcome this whole mechanism
+         * exists to prevent.
+         *
+         * Failing to APPLY a score is failing to score. It counts.
+         */
+        if (self.opts.onScore) {
+          try { self.opts.onScore(parsed); }
+          catch (e) { throw Object.assign(new Error('score_apply_failed'), { code: 'score_apply_failed', cause: e }); }
+        }
       })
       .catch(function (e) {
         self.scoreFailures++;
@@ -210,8 +365,61 @@
             });
           } catch (x) {}
         }
+        /*
+         * ── v5.34.85: A DEAD SCORER ENDS THE INTERVIEW ──────────────────────
+         *
+         * The interview exists to produce evidence. An hour of an executive's
+         * time that scores nothing is not a partial success, it is a waste of
+         * the one thing the firm cannot get back — so when scoring is
+         * demonstrably broken the honest thing is to stop, say so, and pick it
+         * up later, rather than keep talking and hand back a transcript nobody
+         * can turn into an assessment.
+         *
+         * Two triggers, both meaning "this is not a blip":
+         *   · STOP_AFTER_CONSECUTIVE failures in a row after it had been
+         *     working — the provider went down mid-interview;
+         *   · it has NEVER scored once by STOP_IF_NEVER_SCORED_BY attempts —
+         *     misconfiguration, a bad key, a budget refusal. Higher, because
+         *     the opening exchanges are genuinely thin and a model that
+         *     correctly reports "no evidence yet" must not look like an outage.
+         *
+         * The transcript is saved and the interview is resumable: this ends a
+         * SITTING, never the interview. onScoringDead lets the page close it
+         * gracefully through the interviewer rather than cutting the audio,
+         * because the interviewee deserves an explanation in a human voice.
+         */
+        /*
+         * Count AND duration. _failingSince is the first failure of the current
+         * unbroken run and is cleared by any success, so a single recovered
+         * blip can never accumulate toward a stop across an hour.
+         */
+        if (!self._failingSince) self._failingSince = Date.now();
+        var failingMs = Date.now() - self._failingSince;
+        var dead = (self.scoreSuccesses > 0 &&
+                    self.scoreFailures >= STOP_AFTER_CONSECUTIVE && failingMs >= STOP_AFTER_MS) ||
+                   (self.scoreSuccesses === 0 &&
+                    self.scoreFailures >= STOP_IF_NEVER_SCORED_BY && failingMs >= STOP_IF_NEVER_SCORED_AFTER_MS);
+        if (dead && !self._scoringDeadFired) {
+          self._scoringDeadFired = true;
+          vlog('LiveInterview: scoring is dead — ending the sitting', {
+            failures: self.scoreFailures, everSucceeded: self.scoreSuccesses > 0,
+            code: (e && e.code) || 'scoring_failed',
+          });
+          if (self.opts.onScoringDead) {
+            try {
+              self.opts.onScoringDead({
+                code: (e && e.code) || 'scoring_failed',
+                consecutive: self.scoreFailures,
+                everSucceeded: self.scoreSuccesses > 0,
+              });
+            } catch (x) {}
+          }
+        }
       })
-      .then(function () { self.scoring = false; });
+      .then(function () {
+        self.scoring = false;
+        if (self.opts.onScoringState) { try { self.opts.onScoringState(false); } catch (e) {} }
+      });
   };
 
   /**
@@ -241,6 +449,22 @@
    * enough that it is never the thing a real interview hits.
    */
   var MAX_INTERVIEW_MS = Number(window.VYNE_MAX_INTERVIEW_MS) || 3 * 60 * 60 * 1000;
+
+  /**
+   * How long before the planned end to tell the interviewer time is short.
+   * (v5.34.75)
+   *
+   * interviewerPersona.ts carries the rule — "If you are told that time is
+   * running short and you still have ground to cover, say so plainly before
+   * the end: tell them roughly what is left ... they can pick it up another
+   * time." That rule shipped in v5.34.73 with nothing to trigger it, which
+   * made it inert: a session simply hit its ceiling and stopped, with
+   * questions outstanding and nothing said about it.
+   *
+   * This is the trigger. It fires ONCE, and only when the caller says how long
+   * the interview was planned for — see plannedMinutes below.
+   */
+  var WRAPUP_LEAD_MS = Number(window.VYNE_WRAPUP_LEAD_MS) || 4 * 60 * 1000;
   var MAX_RENEWALS = Number(window.VYNE_MAX_RENEWALS) || 40;
   /** Consecutive 1007 CONTENT_TYPE_AUDIO closes before the live path gives up. */
   var MAX_AUDIO_REJECTIONS = 3;
@@ -359,7 +583,43 @@
       intervieweeRole: st.stakeholderDisplayLabel || st.stakeholderRole || undefined,
       interviewerName: this.opts.interviewerName || 'Vyn',
       voice: this.opts.voice || undefined,
+      /* v5.34.79: may be a function — resolved at mint time by vyne-live.js so
+       * each handover sees the interview as it stands. Passed straight through;
+       * resolving it here would re-freeze it one layer down. */
       context: this.opts.context || undefined,
+      /*
+       * ── v5.34.84: THESE THREE WERE NEVER FORWARDED ──────────────────────
+       *
+       * vyne-live.js has read self.opts.agenda and self.opts.mandatoryCount at
+       * mint time since v5.34.73, and interview_agent.html has passed both into
+       * vyneLiveInterview.create() since v5.34.73 — but this function, the one
+       * that builds what actually goes to vyneLive.start(), listed neither. So
+       * the values were resolved from an object that never carried them, and
+       * every mint sent agenda: undefined, mandatoryCount: undefined.
+       *
+       * What that silently disabled, in every live interview ever run:
+       *   · the seven-dimension agenda and the per-role weighting (v5.34.73);
+       *   · the whole mandatory-question block, which buildInterviewerInstruction
+       *     emits only `if (mandatoryCount > 0)` — so "ask it on its own turn,
+       *     never announce it" never reached the model either;
+       *   · the evidenced-dimensions "do not ask about those again" rule;
+       *   · the v5.34.79 no-repeat rule, gated on askedCount > 0.
+       *
+       * Every one of those has passing unit tests, because the tests call
+       * buildInterviewerInstruction directly. The voice harness also passed,
+       * because it renders its own instruction and supplies these three itself
+       * — so it proved the BUILDER works and never that the PAGE delivers. That
+       * is the harness's own documented trap ("measuring something else and
+       * labelling it the product") landing one layer further out than the layer
+       * it was written to catch.
+       *
+       * Passed through unresolved: vyne-live.js resolves a function at mint, so
+       * each handover sees the interview as it stands. Resolving here would
+       * re-freeze them, which is the v5.34.79 context bug one level down.
+       */
+      agenda: this.opts.agenda || undefined,
+      mandatoryCount: this.opts.mandatoryCount !== undefined ? this.opts.mandatoryCount : undefined,
+      askedCount: this.opts.askedCount !== undefined ? this.opts.askedCount : undefined,
       // v5.34.29: the previous connection's resumption handle, if it gave one.
       resumeHandle: this._resumeHandle || undefined,
       onResumeHandle: function (h) { if (h) self._resumeHandle = h; },
@@ -454,6 +714,22 @@
       onMicLevel: function (rms, peak) { if (self.opts.onMicLevel) { try { self.opts.onMicLevel(rms, peak); } catch (e) {} } },
       onMicSilent: function (info) { if (self.opts.onMicSilent) { try { self.opts.onMicSilent(info); } catch (e) {} } },
       onNoReply: function (n) { if (self.opts.onNoReply) { try { self.opts.onNoReply(n); } catch (e) {} } },
+      /* v5.34.94 — onNote was the onAgentText bug, still live in the product.
+       *
+       * vyne-live.js has emitted onNote('trying …') / onNote('connected via …')
+       * during transport negotiation, and interview_agent.html has registered a
+       * handler for it since it was written — but this allowlist never listed
+       * it, so the page's handler could not fire. The comment beside that
+       * handler says it exists "so the setup window never reads as a frozen or
+       * silent screen", and that progress messaging has never once rendered.
+       *
+       * Identical shape to onAgentText (v5.34.77): the name is a real
+       * vyne-live.js callback, so grepping for it in THAT file looks correct,
+       * and only the middle layer is missing. harnessHooksReal.test.ts catches
+       * this class for the voice harness but reads deploy/voice-record.mjs and
+       * never interview_agent.html, so the product page was unguarded —
+       * now covered by liveHookForwarding.test.ts. */
+      onNote: function (msg) { if (self.opts.onNote) { try { self.opts.onNote(msg); } catch (e) {} } },
       onUplinkIgnored: function (st) { if (self.opts.onUplinkIgnored) { try { self.opts.onUplinkIgnored(st); } catch (e) {} } },
       onApiMismatch: function () { if (self.opts.onApiMismatch) { try { self.opts.onApiMismatch(); } catch (e) {} } },
       onAudioRejected: function (reason) { if (self.opts.onAudioRejected) { try { self.opts.onAudioRejected(reason); } catch (e) {} } },
@@ -670,12 +946,46 @@
              * model starting a question whose audio never arrives — and are not
              * addressed here.
              */
+            /*
+             * v5.34.73 — scoped to THIS turn, because it was not.
+             *
+             * The previous wording said "In one short sentence say you are
+             * still here, then ... repeat your last question if I had not
+             * answered it yet." Both halves were meant for the renewal turn
+             * alone. Both became standing behaviour.
+             *
+             * Measured on the 30-minute recording of 2026-09-13
+             * (voice-runs/, and agent-turns.txt reconstructed from the page
+             * trace): three renewals produced FIFTY turns opening "I am still
+             * here", and one question asked forty times verbatim. From the
+             * interviewee's side that is an interviewer who keeps announcing it
+             * has not hung up, and cannot remember what it just asked.
+             *
+             * The repetition had help — the harness reads scripted answers that
+             * never answer the question, so "if I had not answered it yet" was
+             * always true. A real interviewee usually answers. But a nudge that
+             * relies on the other party behaving well to avoid a forty-fold
+             * loop is a nudge with no floor under it.
+             *
+             * So: "just for this one turn", stated first; "ask it once more" in
+             * place of an open-ended repeat; and an explicit instruction not to
+             * carry any of it forward. The v5.34.43 lesson is preserved — this
+             * still names ACTIONS rather than saying "please continue", which
+             * is what stopped the model echoing the nudge back.
+             *
+             * Not yet validated by a 90-minute run. The comment above says
+             * plainly that this wording should not change without one, and that
+             * remains true of this version too — see NEXT_SESSION_SPEC.md.
+             */
             self.open(resumed
-              ? 'Our connection was briefly renewed; you still have the whole conversation. In one short sentence '
-                + 'say you are still here, then either wait for the rest of my answer or repeat your last question '
-                + 'if I had not answered it yet. Do not greet me again.'
-              : 'The connection was renewed mid-interview. Continue exactly where you left off '
-                + 'with your next question — do not greet them again or mention the interruption.');
+              ? 'Just for this one turn: our connection was briefly renewed and you still have the whole '
+                + 'conversation. Say in one short sentence that you are still there, then either wait for the '
+                + 'rest of my answer or, if I had not started answering, ask your last question once more. '
+                + 'Do not greet me again. From your next turn onwards carry on as normal — do not mention the '
+                + 'connection again, and do not open any later turn by saying you are still there.'
+              : 'Just for this one turn: the connection was renewed mid-interview. Continue exactly where you '
+                + 'left off with your next question — do not greet them again and do not mention the '
+                + 'interruption, now or later.');
             self._watchRenewedSilence();
           };
           var onRenewalFail = function (e) {
@@ -827,7 +1137,81 @@
     // connection began. Renewals are bounded by this, so a deep dive gets as
     // many handovers as its duration needs.
     if (!this._startedAt) this._startedAt = Date.now();
+    this._armWrapUp();
     return this._openSession();
+  };
+
+  /**
+   * Tell the interviewer, once, that time is running short. (v5.34.75)
+   *
+   * ── Why this needs a planned length, and why the product has none yet ─────
+   *
+   * There is no ceiling to count down from otherwise. MAX_INTERVIEW_MS is a
+   * three-hour runaway guard, and the grant's maxSeconds is one ~10-minute
+   * connection inside a much longer interview — counting down from either
+   * would fire the wrap-up at the wrong moment, repeatedly.
+   *
+   * So this arms only when the CALLER supplies plannedMinutes. The voice
+   * harness passes its --minutes, which is why it is exercised. The product
+   * does not yet record how long an interview was booked for anywhere:
+   * interview_agent.html has no duration field, the invite carries none, and
+   * the engagement record has none. Wiring a number that does not exist would
+   * be worse than leaving the rule dormant, so when plannedMinutes is absent
+   * nothing fires and the interview behaves exactly as before.
+   *
+   * To turn it on in the product, give the consultant a planned length on the
+   * interview invite and pass it through vyneLiveInterview.create({
+   * plannedMinutes }). The rule on the far end is already written and tested.
+   */
+  LiveInterview.prototype._armWrapUp = function () {
+    var self = this;
+    var planned = Number(this.opts && this.opts.plannedMinutes) || 0;
+    if (!planned || this._wrapUpTimer || this._wrapUpSent) return;
+    var lead = Math.min(WRAPUP_LEAD_MS, planned * 60000 * 0.5);
+    var fireIn = planned * 60000 - lead - (Date.now() - this._startedAt);
+    if (fireIn <= 0) return;
+    vlog('LiveInterview: wrap-up notice armed',
+         { plannedMinutes: planned, firesInSec: Math.round(fireIn / 1000) });
+    this._wrapUpTimer = setTimeout(function () {
+      self._wrapUpTimer = null;
+      self._sendWrapUp();
+    }, fireIn);
+  };
+
+  /** Deliver the notice, waiting for a gap rather than talking over them. */
+  LiveInterview.prototype._sendWrapUp = function (_retry) {
+    var self = this;
+    if (this._wrapUpSent || this.stopped) return;
+    /*
+     * One chain only. The waiting path below re-enters this function on a
+     * timer, and _wrapUpSent is not set until the notice actually goes out —
+     * so without this a second caller (a retry, a second timer, a test) starts
+     * a SECOND chain, and both send. Caught by "sends it once, not once per
+     * handover", which saw two notices.
+     */
+    if (this._wrapUpSending && !_retry) return;
+    this._wrapUpSending = true;
+    /*
+     * Never mid-turn. Cutting across the interviewee to announce the time is
+     * the rudest possible way to deliver this, and cutting across the
+     * interviewer produces a half-asked question. Wait for a gap, but not
+     * forever — after a minute of neither party pausing, say it anyway.
+     */
+    var st = this.session && this.session._turnState;
+    var waited = this._wrapUpWaitedMs || 0;
+    if ((st === 'speaking' || st === 'thinking') && waited < 60000) {
+      this._wrapUpWaitedMs = waited + 2000;
+      setTimeout(function () { self._sendWrapUp(true); }, 2000);
+      return;
+    }
+    this._wrapUpSent = true;
+    vlog('LiveInterview: sending the wrap-up notice', { afterWaitMs: waited });
+    this.open(
+      'Just for this one turn: we are near the end of the time set aside for this conversation. ' +
+      'If you still have ground you need to cover, say so now in one or two sentences — roughly ' +
+      'what is left and that it would take a few more minutes — and offer to pick it up another ' +
+      'time if that suits them better. If you already have what you need, close the interview ' +
+      'properly instead. Do not mention the time again after this turn.');
   };
 
   /** Minutes of conversation so far, across every connection it took. */
@@ -1104,6 +1488,7 @@
     this.stopped = true;
     if (this._expiryTimer) { clearTimeout(this._expiryTimer); this._expiryTimer = null; }
     if (this._goAwayPoll) { clearInterval(this._goAwayPoll); this._goAwayPoll = null; }
+    if (this._wrapUpTimer) { clearTimeout(this._wrapUpTimer); this._wrapUpTimer = null; }
     this._flushPending();
     if (this.session) this.session.stop(reason || 'finished');
   };

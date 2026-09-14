@@ -6,8 +6,12 @@
  * only real if it appears HERE — in the column someone looks at — so it is
  * driven in a browser rather than asserted about the API.
  */
-import { describe, it, expect, afterEach } from "vitest";
+import { describe, it, expect, afterEach, vi } from "vitest";
 import { openPage, pageErrors, skipBrowser, type Harness } from "./harness.js";
+
+import { BROWSER_TEST_TIMEOUT_MS, BROWSER_HOOK_TIMEOUT_MS } from "./harness.js";
+/* Real browser work does not fit vitest's 5s default — see harness.ts. */
+vi.setConfig({ testTimeout: BROWSER_TEST_TIMEOUT_MS, hookTimeout: BROWSER_HOOK_TIMEOUT_MS });
 
 const SKIP = skipBrowser();
 

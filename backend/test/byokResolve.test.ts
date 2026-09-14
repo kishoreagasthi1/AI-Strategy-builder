@@ -31,7 +31,7 @@ function keyRow(over: Partial<ByokKeyRow> = {}): ByokKeyRow {
     status: "active", secretName: "projects/p/secrets/s/versions/3", keyHint: "aaaa",
     verifiedAt: new Date().toISOString(), paidTierAttested: true,
     attestedByEmail: "admin@nestle.example", attestedAt: new Date().toISOString(),
-    probe: null, ...over,
+    probe: null, lastError: null, lastErrorAt: null, ...over,
   };
 }
 

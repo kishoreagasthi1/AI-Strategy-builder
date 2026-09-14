@@ -61,7 +61,7 @@
   // partial deploy (one side redeployed, the other not — see v5.27's
   // postmortem, where a stale frontend folder got redeployed silently) is
   // visible from inside the running app.
-  var VYNE_VERSION = "5.34.64";
+  var VYNE_VERSION = "5.34.99";
   window.VYNE_VERSION = VYNE_VERSION;
 
   // ── Client identity norm (v5.32.26) ─────────────────────────
@@ -1105,19 +1105,70 @@
   // ("COO / VP Operations") from synthetic and imported engagements. Looking a
   // display label up in the table missed every time and silently returned the
   // 0.5 default, turning the whole weighting scheme into an unweighted mean.
+  /*
+   * v5.34.94 — THE TABLES WERE PINNED; THE LOOKUP WAS NOT.
+   *
+   * roleWeightParity.test.ts has always compared the two TABLES and never the
+   * two FUNCTIONS, so when v5.32.57 rewrote the server's lookup this one was
+   * left behind and the suite stayed green. Executed side by side they
+   * disagreed on twelve role/dimension pairs:
+   *
+   *   D5 "Operations / Frontline Manager"   browser 0.5   server 0.9
+   *   D3 "CEO – Group"  (en dash)           browser 0.5   server 1.0
+   *   D7 "Operations / Frontline Manager"   browser 0.5   server 0.8
+   *   …
+   *
+   * Which is the v5.32.25 defect one layer down: Synthesis computes from this
+   * function and /api/scorecard computes from the server's, so the same round
+   * read two different overalls depending on which door the reader came
+   * through. Display labels are how synthetic and imported engagements store
+   * roles, so this was the normal case for them, not an edge one.
+   *
+   * Two specific losses, both now restored:
+   *
+   *   · The head-only fallback cannot resolve "Operations / Frontline Manager"
+   *     → Operations_Manager. The server tries headWord + "_" + lastTailWord.
+   *   · The separator class omitted the EN dash, so "CEO – Group" was read as
+   *     one unrecognised name.
+   *
+   * The VyneRoleCanon branch is gone rather than repaired: roleKey(raw, maps)
+   * returns `raw` when maps is undefined, and it was called with one argument,
+   * so it had always been the identity function. Removing dead code beats
+   * keeping a line that looks like it canonicalises and does not.
+   *
+   * Mirrors backend/src/tenant/engagementMerge.ts roleWeight() step for step.
+   * backend/test/roleWeightFunctionParity.test.ts executes BOTH and fails on
+   * any disagreement — unlike the table-only test beside it.
+   */
   window.vyneRoleWeight = function (dim, role) {
     var table = VYNE_ROLE_WEIGHTS[dim] || {};
     var r = String(role || "").trim();
     if (Object.prototype.hasOwnProperty.call(table, r)) return table[r];
-    try {
-      if (window.VyneRoleCanon && typeof window.VyneRoleCanon.roleKey === "function") {
-        var k = window.VyneRoleCanon.roleKey(r);
-        if (k && Object.prototype.hasOwnProperty.call(table, k)) return table[k];
-      }
-    } catch (e) {}
-    // Last resort: match on the part before a separator ("COO / VP Ops" -> "COO").
-    var head = r.split(/[\/(—-]/)[0].trim().replace(/\s+/g, "_");
-    if (Object.prototype.hasOwnProperty.call(table, head)) return table[head];
+
+    var candidates = [];
+    var push = function (v) {
+      var k = String(v).trim().replace(/\s+/g, "_");
+      if (k && candidates.indexOf(k) === -1) candidates.push(k);
+    };
+    push(r);
+    var parts = r.split(/[/(—–-]/);
+    for (var i = 0; i < parts.length; i++) push(parts[i]);
+    // "VP Sales / Revenue" → "VP_Sales"; "Operations / Frontline Manager" →
+    // "Operations_Manager" needs the LAST word of the tail joined to the head.
+    var segs = [];
+    for (var j = 0; j < parts.length; j++) {
+      var t = parts[j].trim();
+      if (t) segs.push(t);
+    }
+    if (segs.length >= 2) {
+      var headWord = segs[0].split(/\s+/)[0];
+      var tailWords = segs[1].split(/\s+/);
+      push(headWord + "_" + tailWords[tailWords.length - 1]);
+    }
+    for (var c = 0; c < candidates.length; c++) {
+      if (Object.prototype.hasOwnProperty.call(table, candidates[c])) return table[candidates[c]];
+    }
+    // A genuinely unknown role has no defensible weight.
     return 0.5;
   };
 

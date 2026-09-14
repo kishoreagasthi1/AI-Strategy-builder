@@ -27,7 +27,8 @@ import { voiceRoutes } from "../src/routes/voice.js";
 import { LlmGateway } from "../src/llm/gateway.js";
 import type { Tts } from "../src/llm/tts.js";
 import type { TokenVerifier, VerifiedIdentity } from "../src/auth/verify.js";
-import type { ProviderAdapter, MeterEvent } from "../src/llm/types.js";
+import type { ProviderAdapter } from "../src/llm/types.js";
+import type { MeterEvent } from "../src/llm/gateway.js";
 import type { FastifyInstance } from "fastify";
 
 const ENABLED = process.env.RLS_TEST === "1";

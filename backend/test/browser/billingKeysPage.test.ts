@@ -5,8 +5,12 @@
  * today. Every static assertion still passed. A browser would have rendered the
  * rest of the file's JavaScript as visible text.
  */
-import { describe, it, expect, afterEach } from "vitest";
+import { describe, it, expect, afterEach, vi } from "vitest";
 import { openPage, pageErrors, skipBrowser, type Harness } from "./harness.js";
+
+import { BROWSER_TEST_TIMEOUT_MS, BROWSER_HOOK_TIMEOUT_MS } from "./harness.js";
+/* Real browser work does not fit vitest's 5s default — see harness.ts. */
+vi.setConfig({ testTimeout: BROWSER_TEST_TIMEOUT_MS, hookTimeout: BROWSER_HOOK_TIMEOUT_MS });
 
 const SKIP = skipBrowser();
 
@@ -22,8 +26,15 @@ const KEYS = [
     secretName: "projects/p/secrets/t", verifiedAt: null, attestedAt: null, probe: null },
 ];
 
+/** KEYS[0], for the single-row cases below. */
+const KEY = KEYS[0];
+
 const stub = (over: any = {}) => (req: { method: string; url: string; body: any }) => {
+    // v5.34.67: the client fields are pickers now, so the stub has to offer the
+    // client this test selects. Free text is gone — see keysTabGating.test.ts.
+    if (req.url.startsWith("/api/byok/clients")) return { body: { clients: [{ clientName: "Nestlé", registered: true }, { clientName: "Acme Industrial", registered: true }] } };
   if (req.url.startsWith("/api/byok/keys/disable")) return over.disable ?? { body: { ok: true } };
+  if (req.url.startsWith("/api/byok/keys/enable")) return over.enable ?? { body: { ok: true } };
   if (req.url.startsWith("/api/byok/keys")) return over.keys ?? { body: { keys: KEYS } };
   if (req.url.startsWith("/api/byok/invites")) {
     return over.invite ?? { body: {
@@ -68,20 +79,77 @@ describe.skipIf(SKIP)("v5.34.56 — billing.html Client API keys tab", () => {
     expect(pageErrors(h.page)).toEqual([]);
   });
 
-  it("a key that is not active says plainly that the firm is paying", async () => {
+  it("a REFUSED key says the client's work is stopping — not that the firm is paying", async () => {
+    /*
+     * v5.34.69 corrected this, and the old assertion is why it is worth a note.
+     *
+     * It read `/failed — running on your key/`, because that is what the screen
+     * said about every non-active status. For `disabled` it was true. For
+     * `failed` it became FALSE in v5.34.64: a refused key means the client's
+     * work STOPS unless a fallback grant covers them. So the one screen built
+     * to tell an Owner who is paying was telling them the opposite, and this
+     * test was holding it in place.
+     */
     h = await openKeys();
     await h.page.waitForSelector("#byok-list table tbody tr");
     const second = await h.page.$$eval("#byok-list tbody tr", (trs) =>
       trs[1].querySelectorAll("td")[2].textContent);
-    expect(second).toMatch(/failed — running on your key/);
+    expect(second).toMatch(/refused — their work is stopping/);
+    expect(second).not.toMatch(/running on your key/);
+    // And what to do about it, since "stopping" without a remedy is just alarm.
+    expect(second).toMatch(/new setup link|grant fallback/i);
+  });
+
+  it("a DISABLED key does say the firm is paying, because it is", async () => {
+    /*
+     * The other half of the distinction. `disabled` is the Owner's own "turn
+     * off" — a deliberate move back onto the firm's account — and the label
+     * must still say so, or the correction above would just be a new wrong
+     * answer applied more widely.
+     */
+    h = await openKeys({ keys: { body: { keys: [{ ...KEY, status: "disabled", lastError: null }] } } });
+    await h.page.waitForSelector("#byok-list table tbody tr");
+    const st = await h.page.$$eval("#byok-list tbody tr td",
+      (tds) => tds[2].textContent || "");
+    expect(st).toMatch(/disabled — running on your key/);
+  });
+
+  it("a disabled key can be turned back ON", async () => {
+    /*
+     * v5.34.69. "turn off" shipped without a "turn on": the only route back was
+     * a fresh setup link and the CLIENT's administrator pasting their key
+     * again — a round trip to the client to undo a click the firm made on its
+     * own screen. Nothing was ever destroyed, so this is the status flip it
+     * always should have been.
+     */
+    h = await openKeys({ keys: { body: { keys: [{ ...KEY, status: "disabled", lastError: null }] } } });
+    await h.page.waitForSelector("#byok-list table tbody tr");
+    await h.page.evaluate(() => { (window as any).confirm = () => true; });
+    await h.page.click("#byok-list tbody tr a");
+    await h.page.waitForTimeout(500);
+
+    const call = h.calls.find((c) => c.url === "/api/byok/keys/enable");
+    expect(call, "a disabled key offered no way back").toBeTruthy();
+    expect(call!.body).toMatchObject({ clientName: KEY.clientName, provider: KEY.provider });
+  });
+
+  it("a REFUSED key offers no 'turn on' — it has to be replaced", async () => {
+    // Re-enabling a credential the vendor rejected would show "active" for
+    // something that fails on the very next call.
+    h = await openKeys({ keys: { body: { keys: [{ ...KEY, status: "failed", lastError: "403 PERMISSION_DENIED" }] } } });
+    await h.page.waitForSelector("#byok-list table tbody tr");
+    const links = await h.page.$$eval("#byok-list tbody tr a",
+      (as) => as.map((a) => a.textContent?.trim()));
+    expect(links).not.toContain("turn on");
   });
 
   it("only an active key offers a way to turn it off", async () => {
     h = await openKeys();
     await h.page.waitForSelector("#byok-list table tbody tr");
-    const links = await h.page.$$eval("#byok-list tbody tr", (trs) =>
-      trs.map((tr) => !!tr.querySelector("a")));
-    expect(links).toEqual([true, false]);
+    const offs = await h.page.$$eval("#byok-list tbody tr", (trs) =>
+      trs.map((tr) => Array.from(tr.querySelectorAll("a"))
+        .some((a) => a.textContent?.trim() === "turn off")));
+    expect(offs).toEqual([true, false]);
   });
 
   it("turning a key off posts the right client and provider", async () => {
@@ -135,7 +203,7 @@ describe.skipIf(SKIP)("v5.34.56 — billing.html Client API keys tab", () => {
      */
     expect(h.calls.some((c) => c.method === "POST" && c.url.startsWith("/api/byok/invites"))).toBe(false);
 
-    await h.page.fill("#byok-client", "Nestlé");
+    await h.page.selectOption("#byok-client", "Nestlé");
     await h.page.click("#pane-keys button");
     await h.page.waitForSelector("#byok-invite input");
     expect(await h.page.inputValue("#byok-invite input")).toBe("https://app.example/byok.html?t=TOKEN123");

@@ -7,8 +7,12 @@
  * those confusions cost real time earlier in this release — the keys dropdown
  * described a routing policy the product did not have for five versions.
  */
-import { describe, it, expect, afterEach } from "vitest";
+import { describe, it, expect, afterEach, vi } from "vitest";
 import { openPage, pageErrors, skipBrowser, type Harness } from "./harness.js";
+
+import { BROWSER_TEST_TIMEOUT_MS, BROWSER_HOOK_TIMEOUT_MS } from "./harness.js";
+/* Real browser work does not fit vitest's 5s default — see harness.ts. */
+vi.setConfig({ testTimeout: BROWSER_TEST_TIMEOUT_MS, hookTimeout: BROWSER_HOOK_TIMEOUT_MS });
 
 const SKIP = skipBrowser();
 
@@ -22,6 +26,9 @@ const ROUTING = [
 
 const stub = (over: { routing?: unknown[] } = {}) =>
   (req: { method: string; url: string; body: any }) => {
+    // v5.34.67: the client fields are pickers now, so the stub has to offer the
+    // client this test selects. Free text is gone — see keysTabGating.test.ts.
+    if (req.url.startsWith("/api/byok/clients")) return { body: { clients: [{ clientName: "Nestlé", registered: true }, { clientName: "Acme Industrial", registered: true }] } };
     if (req.url.startsWith("/api/client-routing/clear")) return { body: { ok: true } };
     if (req.url.startsWith("/api/client-routing")) {
       if (req.method === "POST") return { body: { routing: req.body } };
@@ -81,7 +88,7 @@ describe.skipIf(SKIP)("v5.34.63 — model preference by client", () => {
 
   it("posts the client and vendor, then confirms what will happen", async () => {
     h = await openKeys();
-    await h.page.fill("#route-client", "Nestlé");
+    await h.page.selectOption("#route-client", "Nestlé");
     await h.page.selectOption("#route-vendor", "anthropic-api");
     await h.page.click("#pane-keys button:has-text('Save preference')");
     await h.page.waitForTimeout(500);

@@ -36,6 +36,18 @@ body{font-family:'Inter',sans-serif;background:var(--navy);color:var(--white);mi
 
 .grid-3{display:grid;grid-template-columns:repeat(3,1fr);gap:1rem;margin-bottom:1.5rem}
 .grid-2{display:grid;grid-template-columns:1fr 1fr;gap:1rem;margin-bottom:1.5rem}
+.grid-1{display:grid;grid-template-columns:1fr;gap:1rem;margin-bottom:1.5rem}
+/* v5.34.92 — roster coverage rows */
+.rc-row{display:grid;grid-template-columns:auto 1fr auto;gap:10px;align-items:baseline;padding:8px 0;border-bottom:1px solid rgba(1,32,61,0.06)}
+.rc-row:last-child{border-bottom:none}
+.rc-dim{font-size:11px;font-weight:700;color:#7A5C1E;letter-spacing:0.04em;white-space:nowrap}
+.rc-note{font-size:12px;color:#46535F;line-height:1.5}
+.rc-note b{color:#132433;font-weight:600}
+.rc-flag{font-size:9px;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;padding:3px 8px;border-radius:10px;white-space:nowrap}
+.rc-ok{background:rgba(16,185,129,0.14);color:#0F7A55}
+.rc-thin{background:rgba(245,158,11,0.16);color:#8A5A06}
+.rc-gap{background:rgba(239,68,68,0.14);color:#B3261E}
+.rc-none{background:rgba(1,32,61,0.08);color:#46535F}
 .card{background:var(--navy-light);border:1px solid rgba(1,32,61,0.15);border-radius:12px;padding:1.25rem}
 .card-title{font-size:12px;font-weight:600;color:#7A5C1E;letter-spacing:0.08em;text-transform:uppercase;margin-bottom:1rem;display:flex;align-items:center;gap:8px}
 .gold-bar{width:32px;height:2px;background:var(--gold);margin-bottom:0.75rem;border-radius:1px}
@@ -493,6 +505,15 @@ body{font-family:'Inter',sans-serif;background:var(--navy);color:var(--white);mi
       </div>
     </div>
 
+    <!-- Row 2b: Roster coverage — WHO answered, not how many (v5.34.92) -->
+    <div class="grid-1">
+      <div class="card" id="card-roster-coverage">
+        <div class="card-title">🎙 Roster Coverage — whose answers each score rests on</div>
+        <div class="gold-bar"></div>
+        <div id="roster-coverage"></div>
+      </div>
+    </div>
+
     <!-- Row 3: Confirmed / Contradicted / Gaps -->
     <div class="grid-3">
       <div class="card">
@@ -647,6 +668,31 @@ function revealMoreFindings(containerId){
 
 const DIMS=[{code:'D1',name:'Data & Data Management'},{code:'D2',name:'Technology & Infrastructure'},{code:'D3',name:'AI Strategy & Vision'},{code:'D4',name:'People & Skills'},{code:'D5',name:'Process & Operations'},{code:'D6',name:'Governance & Risk'},{code:'D7',name:'Culture & Change Readiness'}];
 const ROLE_WEIGHTS = (window.VYNE_ROLE_WEIGHTS||{}); // v5.32.25: was a local copy; see vyne-client.js
+
+/* ── v5.34.92: ONE overall for this page ──────────────────────────────────────
+ *
+ * There were three inline copies of the overall — the dashboard headline, the
+ * round-comparison footer and the Word document — each spelling out
+ * `Object.values(scores).filter(s=>s>0)` then averaging, each rounding at a
+ * slightly different point. They agreed only because none of them had been
+ * changed yet. Now all three call this, which calls the parity-tested formula.
+ *
+ * `interviews` supplies the per-dimension weighting: each interview carries the
+ * lead/cover/light tiering that governed it (interview_agent.html writes
+ * ivRecord.dimTiers since v5.34.92), summed across the round. If any interview
+ * predates that — every engagement scored before this version — dimensionWeights
+ * returns null and this is the plain mean it has always been, so no delivered
+ * client number moves retroactively. */
+function sxOverall(scores, interviews){
+  try{
+    var w = window.VyneScoring.dimensionWeights(interviews||[]);
+    var v = window.VyneScoring.overallOf(scores, w);
+    return (typeof v === 'number') ? v : 0;
+  }catch(e){
+    var vals = Object.values(scores||{}).filter(function(s){ return s > 0; });
+    return vals.length ? Math.round((vals.reduce(function(a,b){return a+b;},0)/vals.length)*10)/10 : 0;
+  }
+}
 const PRIORITY_ROLES_PER_DIM={D1:['CDO','CTO'],D2:['CTO','IT_Director'],D3:['CEO','CDO'],D4:['CHRO','CDO'],D5:['COO','Operations_Manager'],D6:['General_Counsel','CDO'],D7:['CEO','CHRO']};
 const FOLLOW_UP_QS={D1:["What is the single source of truth for key business metrics?","How long does a new data request take to fulfill?","Has a formal data quality audit been conducted?"],D2:["What percentage of workloads are cloud-based today?","How is an ML model deployed to production?","What is the oldest core system still running?"],D3:["Is there a written AI strategy with specific KPIs?","Who owns AI strategy and what is their budget authority?","Has any business case been developed for AI?"],D4:["How many dedicated ML engineers does the organization employ?","What formal AI upskilling exists for business users?","Is there an AI Center of Excellence with a charter and budget?"],D5:["Which operational KPIs are tracked weekly and who acts on them?","What has been automated in the last 3 years?","How is an operational decision typically made — data, experience, or instinct?"],D6:["Who is accountable when data quality causes a business error?","Has AI vendor contract language been reviewed by legal?","Is there a model registry for production AI?"],D7:["When data contradicts a leader's instinct, which wins?","Do employees trust dashboards or maintain shadow spreadsheets?","How does leadership talk about AI internally?"]};
 
@@ -1010,8 +1056,10 @@ function renderComparisonTable(eng){
   // Overall row
   html += '<tr style="border-top:2px solid rgba(184,151,42,0.3)"><td><strong>Overall</strong></td>';
   rounds.forEach(function(r){
-    var scores = Object.values(r.scores||{}).filter(function(s){ return s > 0; });
-    var avg    = scores.length ? parseFloat((scores.reduce(function(a,b){return a+b;},0)/scores.length).toFixed(1)) : null;
+    // v5.34.92: weighted by that round's own interviews — a round interviewed
+    // by a different roster is weighted by ITS roster, which is the only way
+    // the column-to-column comparison stays honest.
+    var avg = sxOverall(r.scores||{}, r.interviews||[]) || null;
     html += '<td><span class="comp-score" style="color:#7A5C1E">'+(avg||'-')+'</span></td>';
   });
   html += '</tr></tbody></table>';
@@ -1828,6 +1876,109 @@ var ROLE_DISPLAY_MAP={CEO:'Chief Executive Officer',CFO:'Chief Financial Officer
   Operations_Manager:'Operations Manager',IT_Director:'IT Director',VP_Sales:'VP Sales',VP_Operations:'VP Operations',
   Leadership:'Senior Leadership'};
 
+/* ── v5.34.92: ROSTER COVERAGE ────────────────────────────────────────────────
+ *
+ * The Coverage Map beside this counts HOW MANY interviews scored each
+ * dimension. Two is not the same as two useful: D6 scored by a CTO and a CFO
+ * reads "2 — good" there, while the General Counsel, who carries 1.0 on
+ * governance against their 0.8 and 0.6, was never interviewed.
+ *
+ * That gap is invisible in the number and became more consequential in this
+ * same version, because the overall is now weighted by how much of the
+ * interviewing was aimed at each dimension — so a dimension two roles LED on
+ * pulls harder on the headline while possibly resting on neither of the people
+ * the weight table trusts most.
+ *
+ * The analysis is VyneScoring.rosterCoverage (pure, unit-tested against the
+ * real weight table in backend/test/rosterCoverage.test.ts); this function only
+ * renders it. It changes no score — it is the sentence the score cannot say.
+ */
+function rcLabel(role){
+  return ROLE_DISPLAY_MAP[role] || String(role||'').replace(/_/g,' ');
+}
+/** Weights read as a set: "1.0" beside "0.8", never a bare "1". */
+function rcW(n){ return (typeof n==='number' && isFinite(n)) ? n.toFixed(1) : String(n); }
+function renderRosterCoverage(interviews){
+  var host=document.getElementById('roster-coverage');
+  if(!host) return;
+  var rows;
+  try{
+    rows=window.VyneScoring.rosterCoverage(interviews||[], window.VYNE_ROLE_WEIGHTS||{}, roleKeyForCoverage);
+  }catch(e){ host.textContent='Roster coverage unavailable.'; return; }
+
+  var dimName={};
+  DIMS.forEach(function(d){ dimName[d.code]=d.name; });
+
+  var FLAG={ok:['rc-ok','Well covered'],thin:['rc-thin','Thin'],gap:['rc-gap','Authority gap'],none:['rc-none','No evidence']};
+  var frag=document.createDocumentFragment();
+  var concerns=0;
+
+  rows.forEach(function(r){
+    if(r.status==='gap'||r.status==='thin') concerns++;
+    var row=document.createElement('div'); row.className='rc-row';
+
+    var dim=document.createElement('div'); dim.className='rc-dim';
+    dim.textContent=r.dim+' · '+(dimName[r.dim]||'');
+    row.appendChild(dim);
+
+    /* Built as text nodes rather than an innerHTML template. Role strings come
+     * from interview records, which are written by a browser the interviewee
+     * controls — and this file is already carrying eight unresolvable innerHTML
+     * sinks (innerHtmlSinks.test.ts) without adding a ninth for a panel that is
+     * three strings and a number. */
+    var note=document.createElement('div'); note.className='rc-note';
+    if(r.status==='none'){
+      note.textContent='No interview has scored this dimension yet. Best-placed to answer: '
+        + r.bestRoles.map(rcLabel).join(', ') + '.';
+    }else{
+      var who=r.contributors.map(function(c){ return rcLabel(c.role)+' ('+rcW(c.weight)+')'; }).join(', ');
+      var sentence='Scored by '+who+'.';
+      if(r.missing.length){
+        sentence+=' The highest-weighted voice on this dimension — '
+          + r.missing.map(function(m){ return rcLabel(m)+' ('+rcW(r.best)+')'; }).join(', ')
+          + ' — has not been interviewed.';
+      }else if(r.status==='ok'){
+        sentence+=' The highest-weighted voice for this dimension is in the roster.';
+      }
+      note.textContent=sentence;
+    }
+    row.appendChild(note);
+
+    var flag=document.createElement('span');
+    flag.className='rc-flag '+FLAG[r.status][0];
+    flag.textContent=FLAG[r.status][1];
+    row.appendChild(flag);
+
+    frag.appendChild(row);
+  });
+
+  host.innerHTML='';
+  host.appendChild(frag);
+
+  var foot=document.createElement('div');
+  foot.style.cssText='margin-top:12px;font-size:11px;color:var(--mid-gray);line-height:1.6';
+  foot.textContent = concerns
+    ? concerns+' of 7 dimensions rest on someone other than the role most qualified to answer. '
+      + 'The scores are correct as computed — this is about whose evidence they are built on, '
+      + 'and is worth resolving before the round is finalised or the deck is generated.'
+    : 'Every scored dimension includes the role most qualified to answer it.';
+  host.appendChild(foot);
+}
+
+/** Role normaliser for the coverage audit — the roleCatalog canon where the
+ *  briefing supplies one, so "COO / VP Operations" and "COO" are one role. */
+function roleKeyForCoverage(raw){
+  try{
+    var client=(typeof engagement!=='undefined' && engagement && engagement.client)
+      ? engagement.client
+      : ((document.getElementById('client-input')||{}).value||'').trim();
+    var br=loadBriefingContext(client);
+    return window.VyneRoleCanon.roleKey(raw, window.VyneRoleCanon.buildRoleMaps(br && br.roleCatalog));
+  }catch(e){
+    return String(raw||'').trim().split(/[\/(—-]/)[0].trim().replace(/\s+/g,'_');
+  }
+}
+
 function renderSuggestedRoles(){
   var content=document.getElementById('other-notes-content');
   if(!content) return;
@@ -1910,11 +2061,10 @@ function renderDashboard(){
       }
     }
   }
-  const overall=Object.values(scores).filter(s=>s>0);
-  const avgScore=overall.length?overall.reduce((a,b)=>a+b,0)/overall.length:0;
+  const avgScore=sxOverall(scores, iv);   // v5.34.92 — weighted; see sxOverall
 
   // Overall stats
-  const maturity=avgScore>=4.5?'AI-Native':avgScore>=3.5?'AI-Led':avgScore>=2.5?'AI Capable':avgScore>=1.5?'AI Exploring':'AI Unaware';
+  const maturity=window.VyneScoring.maturityLabel(avgScore)||'Pending';   // v5.34.96 — shared bands
   document.getElementById('overall-stats').innerHTML=`
     <div style="text-align:center;padding:1rem 0">
       <div style="font-family:'Space Grotesk','Inter',sans-serif;font-size:48px;color:#7A5C1E;line-height:1">${avgScore>0?avgScore.toFixed(1):'—'}</div>
@@ -1923,6 +2073,8 @@ function renderDashboard(){
       <div style="margin-top:12px;font-size:12px;color:var(--mid-gray)">${iv.length} interview${iv.length!==1?'s':''} completed</div>
       <div style="font-size:12px;color:var(--mid-gray)">${conflicts.length} conflict${conflicts.length!==1?'s':''} detected</div>
     </div>`;
+
+  renderRosterCoverage(iv);
 
   // Interview tracker
   // Build role list from actual interviews + briefing recommended order
@@ -3279,7 +3431,10 @@ function buildReport(synthesisText){
   var DIMS2=[{code:'D1',name:'Data & Data Management'},{code:'D2',name:'Technology & Infrastructure'},{code:'D3',name:'AI Strategy & Vision'},{code:'D4',name:'People & Skills'},{code:'D5',name:'Process & Operations'},{code:'D6',name:'Governance & Risk'},{code:'D7',name:'Culture & Change Readiness'}];
   var RW2 = (window.VYNE_ROLE_WEIGHTS||{}); // v5.32.25: was a local copy; see vyne-client.js
 
-  function ml(s){if(!s)return'Not assessed';if(s>=4.5)return'AI-Native';if(s>=3.5)return'AI-Led';if(s>=2.5)return'AI Capable';if(s>=1.5)return'AI Exploring';return'AI Unaware';}
+  /* v5.34.96 — shared bands. The !s guard stays: this document says
+   * "Not assessed" where the dashboard says a band, and that wording is the
+   * document's, not the scale's. */
+  function ml(s){if(!s)return'Not assessed';return window.VyneScoring.maturityLabel(s)||'Not assessed';}
   function tc(txt,w,bg,fg,bold){return new TableCell({borders:borders,margins:mar,width:{size:w,type:WidthType.DXA},shading:{fill:bg||'FFFFFF',type:ShadingType.CLEAR},children:[new Paragraph({children:[new TextRun({text:String(txt||''),bold:!!bold,size:18,color:fg||'333333',font:'Calibri'})]})]});}
   function h1(t){return new Paragraph({heading:HeadingLevel.HEADING_1,spacing:{before:400,after:120},children:[new TextRun({text:t,bold:true,size:28,color:NAVY,font:'Calibri'})]});}
   function h2(t){return new Paragraph({spacing:{before:240,after:80},children:[new TextRun({text:t,bold:true,size:20,color:GOLD,font:'Calibri'})]});}
@@ -3325,8 +3480,7 @@ function buildReport(synthesisText){
       });
     }
   } catch (e) {}
-  var ov=Object.values(scores).filter(function(s){return s>0;});
-  var overall=ov.length?parseFloat((ov.reduce(function(a,b){return a+b;},0)/ov.length).toFixed(1)):0;
+  var overall=sxOverall(scores, iv);   // v5.34.92 — weighted; see sxOverall
   var allFindings=iv.reduce(function(acc,i){return acc.concat((i.findings||[]).map(function(f){return Object.assign({},f,{role:i.role});}));}, []);
   var dimFindings={};
   allFindings.forEach(function(f){var d=f.dimension||'?';if(!dimFindings[d])dimFindings[d]=f.text;});

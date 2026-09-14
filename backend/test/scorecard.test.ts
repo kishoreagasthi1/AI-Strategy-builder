@@ -33,7 +33,7 @@ describe("buildScorecard", () => {
   it("reports the latest round's scores, overall, and maturity", () => {
     const [entry] = buildScorecard([{
       code: "ACME-1", client: "Acme", industry: "Manufacturing",
-      rounds: [{ roundNumber: 1, label: "Initial", date: "2026-01-01", scores: { D1: 3, D2: 3 }, interviews: [1, 2] }],
+      rounds: [{ roundNumber: 1, label: "Initial", date: "2026-01-01", scores: { D1: 3, D2: 3 }, interviews: [{}, {}] }],
     }]);
     expect(entry.overall).toBeCloseTo(3.0);
     expect(entry.maturity).toBe("AI Capable");

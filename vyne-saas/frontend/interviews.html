@@ -1,0 +1,613 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>VYNE™ Interview Tracker</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet"/>
+<script>window.VYNE_MODULE = "interview_tracker";</script>
+<script src="vyne-client.js"></script>
+<script src="vyne-rail.js"></script>
+<style>
+/* Foundry design system — light instrument, VYNE gold accent. */
+:root{
+  --navy:#01203D;--navy-2:#0A2E4D;--ink:#132433;--paper:#F3F1EB;--panel:#FFFFFF;
+  --panel-raised:#FAF8F3;--line:#E8E3D8;--line-strong:#D8D3C7;--quiet:#6C7783;--quiet-soft:#9AA4AE;
+  --gold:#A88553;--gold-2:#C6A46B;--signal-bg:#F4ECDD;--live:#2F7D4F;--live-bg:#E9F2EC;
+  --warn:#A9761C;--warn-bg:#F8EFDC;--danger:#B0324B;--danger-bg:#F7E7EB;
+  --r-sm:9px;--r-lg:14px;--r-pill:999px;
+  --shadow:0 1px 2px rgba(16,33,47,.05),0 10px 30px rgba(16,33,47,.06);
+}
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:var(--paper);color:var(--ink);font-family:'Inter',system-ui,sans-serif;font-size:14px;line-height:1.55;
+  -webkit-font-smoothing:antialiased;min-height:100vh;font-variant-numeric:tabular-nums}
+.page{max-width:1100px;margin:0 auto;padding:2rem}
+a{color:var(--gold);font-weight:600;text-decoration:none}
+a:hover{text-decoration:underline}
+/* Standard VYNORA header (matches pre_engagement.html) */
+.header{display:flex;align-items:center;justify-content:space-between;margin-bottom:26px;padding-bottom:1rem;border-bottom:1px solid rgba(184,151,42,0.3)}
+.logo-row{display:flex;align-items:center;gap:12px}
+.logo-hex{width:40px;height:40px}
+.logo-text{font-family:'Space Grotesk','Inter',sans-serif;font-size:18px;color:#132433;letter-spacing:0.08em}
+.logo-sub{font-size:10px;color:#7A5C1E;letter-spacing:0.2em;text-transform:uppercase;display:block}
+.header-title{font-family:'Space Grotesk','Inter',sans-serif;font-size:22px;color:#132433}
+.header-sub{font-size:12px;color:#46535F;margin-top:2px}
+.sub{font-size:12px;color:var(--quiet);margin-bottom:26px}
+.panel{background:var(--panel-raised);border:1px solid var(--line);border-radius:var(--r-lg);box-shadow:var(--shadow);padding:22px;margin-bottom:20px}
+.panel h2{font-size:11.5px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;margin-bottom:14px;color:var(--gold)}
+.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:12px}
+input,select{background:rgba(1,32,61,0.05);border:1px solid rgba(1,32,61,0.15);border-radius:8px;
+  padding:10px 14px;color:var(--ink);font-family:'Inter',sans-serif;font-size:14px;outline:none;width:100%;transition:border-color .2s}
+input:focus,select:focus{border-color:#7A5C1E}
+input::placeholder{color:#46535F;opacity:.75}
+button{background:var(--navy);color:#fff;border:none;border-radius:var(--r-sm);padding:10px 17px;
+  font-weight:600;font-size:13px;cursor:pointer;font-family:inherit;transition:background .15s,transform .08s}
+button:hover{background:var(--navy-2)}
+button:active{transform:translateY(1px)}
+button.ghost{background:transparent;color:var(--navy);border:1px solid var(--line-strong)}
+button.ghost:hover{background:rgba(1,32,61,0.05);border-color:var(--gold)}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{text-align:left;font-size:10.5px;text-transform:uppercase;letter-spacing:.07em;color:var(--quiet-soft);
+  font-weight:700;padding:8px 10px;border-bottom:1px solid var(--line)}
+td{padding:10px;border-bottom:1px solid var(--line);color:var(--ink)}
+tr:hover td{background:rgba(1,32,61,0.04)}
+.badge{display:inline-block;border-radius:var(--r-pill);padding:3px 11px;font-size:11px;font-weight:600}
+.badge.invited{background:#EEEBE3;color:var(--quiet)}
+.badge.in_progress{background:var(--warn-bg);color:var(--warn)}
+.badge.completed{background:var(--live-bg);color:var(--live)}
+.msg{font-size:12.5px;color:var(--quiet);margin-top:10px;min-height:16px;line-height:1.5}
+.msg.err{color:var(--danger)}
+.msg.ok{color:var(--live)}
+.hint{font-size:11.5px;color:var(--quiet-soft);line-height:1.6;margin-top:8px}
+</style>
+</head>
+<body>
+<div class="page">
+<div class="header">
+  <div class="logo-row">
+    <svg class="logo-hex" viewBox="0 0 40 40" fill="none">
+      <polygon points="20,2 36,10 36,30 20,38 4,30 4,10" fill="none" stroke="#C6A46B" stroke-width="1.8"/>
+      <circle cx="20" cy="20" r="9" fill="none" stroke="#C6A46B" stroke-width="1.4"/>
+      <line x1="14" y1="26" x2="26" y2="14" stroke="#C6A46B" stroke-width="1.4"/>
+    </svg>
+    <div>
+      <div class="logo-text">VYNORA</div>
+      <span class="logo-sub">Interview Tracker</span>
+    </div>
+  </div>
+  <div style="text-align:right">
+    <div class="header-title">VYNE™ Framework™ — Interview Tracker</div>
+    <div class="header-sub">Invite interviewees and monitor every session — invited, in progress, completed</div>
+  </div>
+</div>
+<div class="sub vyne-home-btn"><a href="index.html">← Back to modules</a></div>
+
+<div class="panel">
+  <h2>Invite an interviewee — the client's team</h2>
+  <div class="hint" style="margin:0 0 10px">
+    This is the roster of <b>client-side stakeholders</b> (their CEO, CFO, COO…). Each invite creates a
+    login that takes that person straight into the Interview Agent, tailored to their role for this
+    client. (Your own Vynora consultants are managed below under Client access.)
+  </div>
+  <div class="grid">
+    <input id="iv-client" placeholder="Client company (e.g. Acme Industrial)" oninput="refreshRoleOptions()"/>
+    <input id="iv-name" placeholder="Interviewee name (e.g. Sarah John)"/>
+    <select id="iv-role"><option value="">Select role…</option></select>
+    <input id="iv-email" placeholder="Their login email / dev id"/>
+  </div>
+  <div class="grid" id="iv-role-custom-row" style="display:none;grid-template-columns:1fr 3fr">
+    <input id="iv-role-custom" placeholder="Custom role title (e.g. Head of Franchising)"/>
+    <div class="hint">Custom roles get a generic interview scope — for role-tuned questioning, add the role in Pre-Engagement first.</div>
+  </div>
+  <div class="grid" id="pw-row" style="grid-template-columns:1fr 3fr">
+    <input id="iv-password" type="password" placeholder="Initial password (Identity Platform mode)"/>
+    <div class="hint" id="mode-hint"></div>
+  </div>
+  <button onclick="createInvite()">Create invite</button>
+  <div class="msg" id="create-msg"></div>
+</div>
+
+<div class="panel" id="access-panel">
+  <h2>🔐 Client access</h2>
+  <div class="hint" id="access-summary" style="margin:0 0 12px">Loading access…</div>
+  <div id="access-owner" style="display:none">
+    <div style="font-size:12px;color:var(--quiet);line-height:1.6;margin-bottom:10px">
+      Consultants only see the clients you assign to them — enforced on the server for the tracker,
+      interviews, briefings, synthesis, and roadmap data. Owners always see all clients.
+    </div>
+
+    <div style="font-size:11px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;color:#7A5C1E;margin:14px 0 8px">1 · Team — consultant logins</div>
+    <div class="grid" style="grid-template-columns:2fr 1.5fr 1.5fr 1fr">
+      <input id="tm-email" placeholder="Consultant email / dev id"/>
+      <input id="tm-name" placeholder="Name (optional)"/>
+      <input id="tm-password" type="password" placeholder="Initial password"/>
+      <button onclick="addTeamMember()">Add consultant</button>
+    </div>
+    <table style="margin-top:10px">
+      <thead><tr><th>Member</th><th>Role</th><th style="width:80px"></th></tr></thead>
+      <tbody id="tm-rows"><tr><td colspan="3" style="color:var(--quiet-soft)">Loading…</td></tr></tbody>
+    </table>
+    <div class="msg" id="tm-msg"></div>
+
+    <div style="font-size:11px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;color:#7A5C1E;margin:18px 0 8px">2 · Assign clients to consultants</div>
+    <div class="grid" style="grid-template-columns:2fr 2fr 1fr">
+      <input id="as-email" placeholder="Consultant email / dev id"/>
+      <input id="as-client" placeholder="Client company (e.g. Acme Industrial)"/>
+      <button onclick="addAssignment()">Assign</button>
+    </div>
+    <table style="margin-top:10px">
+      <thead><tr><th>Consultant</th><th>Client</th><th style="width:80px"></th></tr></thead>
+      <tbody id="as-rows"><tr><td colspan="3" style="color:var(--quiet-soft)">Loading…</td></tr></tbody>
+    </table>
+
+    <div style="margin-top:18px;padding-top:14px;border-top:1px solid var(--line)">
+      <div style="font-size:11px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;color:var(--danger)">3 · Danger zone — delete a client</div>
+      <div style="font-size:12px;color:var(--quiet);line-height:1.6;margin:8px 0 10px">
+        Permanently removes <strong>everything</strong> for a client: briefing, engagements, all interviews
+        and their sessions, synthesis and roadmap data, consultant assignments, and interviewee logins that
+        only existed for this client. This cannot be undone.
+      </div>
+      <div class="grid" style="grid-template-columns:3fr 1fr">
+        <input id="del-client" placeholder="Client company name (exact)"/>
+        <button style="background:var(--danger)" onclick="deleteClient()">Delete client</button>
+      </div>
+      <div class="msg" id="del-msg"></div>
+    </div>
+  </div>
+  <div class="msg" id="as-msg"></div>
+</div>
+
+<div class="panel">
+  <h2>🧪 Synthetic test data</h2>
+  <div style="font-size:12px;color:var(--quiet);line-height:1.6;margin-bottom:12px">
+    Generate a complete fake engagement for the client — built from that client's <strong>Pre-Engagement
+    setup</strong>: its selected roles (one interview per role, biased to each role's priority dimensions),
+    its industry, and its hypotheses, with seeded contradictions and a governance blind spot. Synthetic
+    interviews are appended to the real engagement without touching your briefing; regenerating replaces
+    them. Falls back to a standard 5-executive set when no briefing exists yet. Takes 1–3 minutes.
+  </div>
+  <div class="grid" style="grid-template-columns:2fr 2fr 1.5fr 1fr">
+    <input id="syn-client" placeholder="Client name"/>
+    <input id="syn-industry" placeholder="Industry (optional — from briefing)"/>
+    <label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--quiet)">
+      <input type="checkbox" id="syn-refresh" checked style="width:auto"/> Include refresh round
+    </label>
+    <button id="syn-btn" onclick="generateSynthetic()">Generate</button>
+  </div>
+  <div class="msg" id="syn-msg"></div>
+</div>
+
+<div class="panel">
+  <h2>All interviews <button class="ghost" style="float:right;padding:5px 12px" onclick="refresh()">Refresh</button></h2>
+  <table>
+    <thead><tr><th>Client</th><th>Interviewee</th><th>Role</th><th>Login</th><th>Status</th><th>Started</th><th>Completed</th><th></th></tr></thead>
+    <tbody id="rows"><tr><td colspan="8" style="color:var(--quiet-soft)">Loading…</td></tr></tbody>
+  </table>
+  <div class="msg" id="list-msg"></div>
+</div>
+</div><!-- /.page -->
+
+<script>
+var API_BASE = window.VYNE_API_BASE || "";
+function hdrs(extra){
+  var s = vyneAuth.session();
+  var h = { authorization: "Bearer " + (s ? s.token : "") };
+  if (extra) for (var k in extra) h[k] = extra[k];
+  return h;
+}
+
+// Consultants only — bounce interviewees back.
+(function(){
+  var s = vyneAuth.session();
+  if (s && s.role === "interviewee") window.location.href = "interview_agent.html";
+})();
+
+fetch(API_BASE + "/api/config").then(function(r){return r.json();}).then(function(cfg){
+  document.getElementById("mode-hint").textContent = cfg.devAuth
+    ? "Dev mode: password not needed — the interviewee signs in on the landing page with just the id you enter here."
+    : "Identity Platform: the interviewee signs in with your firm tenant ID + this email and password.";
+  if (cfg.devAuth) document.getElementById("iv-password").style.display = "none";
+});
+
+function esc(t){ var d=document.createElement('div'); d.textContent=t==null?'':String(t); return d.innerHTML; }
+function fmt(ts){ return ts ? new Date(ts).toLocaleString() : "—"; }
+
+/* ── Client access (Phase 5) ──────────────────────────────────────────────── */
+async function loadAccess(){
+  var sum = document.getElementById("access-summary");
+  try{
+    var r = await fetch(API_BASE + "/api/my-clients", { headers: hdrs() });
+    if(!r.ok) throw new Error("HTTP " + r.status);
+    var d = await r.json();
+    if(d.role === "owner"){
+      sum.innerHTML = "You are a firm <strong>owner</strong> — you can see every client. Add consultant logins, then assign them to clients.";
+      document.getElementById("access-owner").style.display = "block";
+      loadTeam();
+      loadAssignments();
+      // Dev mode: no passwords — hide the password field.
+      fetch(API_BASE + "/api/config").then(function(r){return r.json();}).then(function(cfg){
+        if(cfg.devAuth) document.getElementById("tm-password").style.display = "none";
+      });
+    } else {
+      sum.innerHTML = d.clients.length
+        ? "You are assigned to: <strong>" + d.clients.map(esc).join("</strong>, <strong>") + "</strong>. You only see these clients' data."
+        : "⚠ You have <strong>no assigned clients</strong> — you will not see any client data until a firm owner assigns you.";
+    }
+  }catch(e){ sum.textContent = "Could not load client access (" + e.message + ")."; }
+}
+
+async function loadTeam(){
+  var tb = document.getElementById("tm-rows");
+  try{
+    var r = await fetch(API_BASE + "/api/team", { headers: hdrs() });
+    var d = await r.json();
+    if(!r.ok) throw new Error(d.error || ("HTTP " + r.status));
+    if(!d.members || !d.members.length){
+      tb.innerHTML = '<tr><td colspan="3" style="color:var(--quiet-soft)">No members yet.</td></tr>';
+      return;
+    }
+    tb.innerHTML = d.members.map(function(m){
+      var who = esc(m.email || m.id) + (m.name ? " · " + esc(m.name) : "");
+      var remove = m.role === "consultant"
+        ? '<button class="ghost" style="padding:4px 10px;font-size:11px" onclick="removeTeamMember(\'' + esc(m.email || "") + '\')">Remove</button>'
+        : "";
+      return "<tr><td>" + who + "</td><td><span class=\"badge " + (m.role === "owner" ? "completed" : "in_progress") + "\">" + esc(m.role) + "</span></td><td>" + remove + "</td></tr>";
+    }).join("");
+  }catch(e){ tb.innerHTML = '<tr><td colspan="3" class="msg err">Failed: ' + esc(e.message) + '</td></tr>'; }
+}
+
+async function addTeamMember(){
+  var msg = document.getElementById("tm-msg");
+  var email = document.getElementById("tm-email").value.trim();
+  var name = document.getElementById("tm-name").value.trim();
+  var password = document.getElementById("tm-password").value;
+  if(!email){ msg.className="msg err"; msg.textContent="Enter the consultant's email (or dev id)."; return; }
+  var body = { email: email };
+  if(name) body.name = name;
+  if(password) body.password = password;
+  try{
+    var r = await fetch(API_BASE + "/api/team", {
+      method:"POST", headers: hdrs({ "Content-Type":"application/json" }),
+      body: JSON.stringify(body)
+    });
+    var d = await r.json();
+    if(!r.ok) throw new Error(d.detail || d.error || ("HTTP " + r.status));
+    msg.className="msg ok"; msg.textContent = "Consultant added. " + (d.loginHint || "");
+    document.getElementById("tm-email").value = ""; document.getElementById("tm-name").value = ""; document.getElementById("tm-password").value = "";
+    document.getElementById("as-email").value = email;   // convenience: pre-fill the assign row
+    loadTeam();
+  }catch(e){ msg.className="msg err"; msg.textContent = e.message; }
+}
+
+async function removeTeamMember(email){
+  var msg = document.getElementById("tm-msg");
+  if(!confirm("Remove " + email + " from the team? Their client assignments are removed too.")) return;
+  try{
+    var r = await fetch(API_BASE + "/api/team", {
+      method:"DELETE", headers: hdrs({ "Content-Type":"application/json" }),
+      body: JSON.stringify({ email: email })
+    });
+    var d = await r.json();
+    if(!r.ok) throw new Error(d.detail || d.error || ("HTTP " + r.status));
+    msg.className="msg ok"; msg.textContent = "Removed " + email + ".";
+    loadTeam(); loadAssignments();
+  }catch(e){ msg.className="msg err"; msg.textContent = e.message; }
+}
+
+async function loadAssignments(){
+  var tb = document.getElementById("as-rows");
+  try{
+    var r = await fetch(API_BASE + "/api/assignments", { headers: hdrs() });
+    var d = await r.json();
+    if(!d.assignments || !d.assignments.length){
+      tb.innerHTML = '<tr><td colspan="3" style="color:var(--quiet-soft)">No assignments yet — consultants currently see no client data.</td></tr>';
+      return;
+    }
+    tb.innerHTML = d.assignments.map(function(a){
+      return "<tr><td>" + esc(a.email || a.user_id) + (a.name ? " · " + esc(a.name) : "") + "</td>" +
+        "<td>" + esc(a.client_name) + "</td>" +
+        '<td><button class="ghost" style="padding:4px 10px;font-size:11px" onclick="removeAssignment(\'' +
+        esc(a.email || "") + '\',\'' + esc(a.client_name).replace(/'/g, "&#39;") + '\')">Remove</button></td></tr>';
+    }).join("");
+  }catch(e){ tb.innerHTML = '<tr><td colspan="3" class="msg err">Failed: ' + esc(e.message) + '</td></tr>'; }
+}
+
+async function addAssignment(){
+  var msg = document.getElementById("as-msg");
+  var email = document.getElementById("as-email").value.trim();
+  var client = document.getElementById("as-client").value.trim();
+  if(!email || !client){ msg.className="msg err"; msg.textContent="Enter both the consultant's email and the client name."; return; }
+  try{
+    var r = await fetch(API_BASE + "/api/assignments", {
+      method:"POST", headers: hdrs({ "Content-Type":"application/json" }),
+      body: JSON.stringify({ email: email, clientName: client })
+    });
+    var d = await r.json();
+    if(!r.ok) throw new Error(d.detail || d.error || ("HTTP " + r.status));
+    msg.className="msg ok"; msg.textContent="Assigned " + email + " → " + client + ".";
+    document.getElementById("as-client").value = "";
+    loadAssignments();
+  }catch(e){ msg.className="msg err"; msg.textContent = e.message; }
+}
+
+async function removeAssignment(email, client){
+  var msg = document.getElementById("as-msg");
+  try{
+    var r = await fetch(API_BASE + "/api/assignments", {
+      method:"DELETE", headers: hdrs({ "Content-Type":"application/json" }),
+      body: JSON.stringify({ email: email, clientName: client })
+    });
+    var d = await r.json();
+    if(!r.ok) throw new Error(d.detail || d.error || ("HTTP " + r.status));
+    msg.className="msg ok"; msg.textContent="Removed " + email + " → " + client + ".";
+    loadAssignments();
+  }catch(e){ msg.className="msg err"; msg.textContent = e.message; }
+}
+async function deleteClient(){
+  var msg = document.getElementById("del-msg");
+  var client = document.getElementById("del-client").value.trim();
+  if(!client){ msg.className="msg err"; msg.textContent="Enter the client's exact company name."; return; }
+  var typed = prompt('This permanently deletes ALL data for "' + client + '" and cannot be undone.\n\nType the client name to confirm:');
+  if(typed === null) return;
+  if(typed.trim() !== client){ msg.className="msg err"; msg.textContent="Name didn't match — nothing was deleted."; return; }
+  msg.className="msg"; msg.textContent="Deleting " + client + "…";
+  try{
+    var r = await fetch(API_BASE + "/api/clients", {
+      method:"DELETE", headers: hdrs({ "Content-Type":"application/json" }),
+      body: JSON.stringify({ clientName: client })
+    });
+    var d = await r.json();
+    if(!r.ok) throw new Error(d.detail || d.error || ("HTTP " + r.status));
+    msg.className="msg ok";
+    msg.textContent = "Deleted " + client + ": " + d.interviews + " interview(s), " + d.workspaceKeys +
+      " data record(s), " + d.intervieweeLoginsRemoved + " interviewee login(s) removed.";
+    document.getElementById("del-client").value = "";
+    refresh(); loadAssignments();
+    // If this session was working on the deleted client, drop the context.
+    var active = (window.vyneAuth && typeof vyneAuth.activeClient === 'function') ? vyneAuth.activeClient() : undefined;
+    if(active && active.toLowerCase().replace(/[^a-z0-9]/g,'') === client.toLowerCase().replace(/[^a-z0-9]/g,'')){
+      setTimeout(function(){ vyneAuth.switchClient(); }, 1200);
+    }
+  }catch(e){ msg.className="msg err"; msg.textContent = e.message; }
+}
+
+loadAccess();
+
+// ── Carry-over from Pre-Engagement: prefill client fields from the last
+// briefing worked on so nobody retypes the company name.
+(function(){
+  try{
+    var active = (window.vyneAuth && typeof vyneAuth.activeClient === 'function') ? vyneAuth.activeClient() : undefined;
+    var last = null;
+    if(window.vyneStore){ try{ last = JSON.parse(vyneStore.getItem('vynora_last_briefing')||'null'); }catch(e){} }
+    var client = active || (last && last.client);
+    if(!client) return;
+    var iv = document.getElementById('iv-client');
+    if(iv && !iv.value) iv.value = client;
+    var syn = document.getElementById('syn-client');
+    if(syn) syn.value = client;
+  }catch(e){}
+  refreshRoleOptions();
+})();
+
+// ── Role dropdown (v5.20): the roles offered for an invite come from the
+// client's Pre-Engagement briefing (roleCatalog — the stakeholder map the
+// consultant built, incl. custom roles), so the interviewee's role EXACTLY
+// matches what the Interview Agent tailors questions to. Falls back to the
+// standard C-suite list when the client has no briefing yet.
+var STANDARD_ROLES = [
+  { value: 'CEO',                display: 'CEO / Executive Leadership' },
+  { value: 'CFO',                display: 'CFO / Finance Leadership' },
+  { value: 'CTO',                display: 'CTO / Technology Leadership' },
+  { value: 'CDO',                display: 'CDO / VP Data & Analytics' },
+  { value: 'COO',                display: 'COO / VP Operations' },
+  { value: 'CHRO',               display: 'CHRO / HR Leadership' },
+  { value: 'VP_Sales',           display: 'VP Sales / Revenue' },
+  { value: 'IT_Director',        display: 'IT Director / CISO' },
+  { value: 'Operations_Manager', display: 'Operations / Frontline Manager' },
+  { value: 'General_Counsel',    display: 'General Counsel / Legal' }
+];
+function refreshRoleOptions(){
+  var sel = document.getElementById('iv-role'); if(!sel) return;
+  var current = sel.value;
+  var clientName = (document.getElementById('iv-client')||{value:''}).value.trim();
+  var roles = null, fromBriefing = false;
+  if(clientName && window.vyneStore){
+    try{
+      var norm = clientName.toLowerCase().replace(/[^a-z0-9]/g,'').substring(0,30);
+      var br = JSON.parse(vyneStore.getItem('vynora_briefing_'+norm)||'null');
+      if(br && br.roleCatalog && br.roleCatalog.length){
+        roles = br.roleCatalog.map(function(r){ return { value:r.value, display:r.display+(r.custom?' (custom)':'') }; });
+        fromBriefing = true;
+      }
+    }catch(e){}
+  }
+  if(!roles) roles = STANDARD_ROLES;
+  sel.innerHTML = '<option value="">'+(fromBriefing?'Select role (from this client’s briefing)…':'Select role…')+'</option>'
+    + roles.map(function(r){ return '<option value="'+r.value.replace(/"/g,'&quot;')+'">'+r.display+'</option>'; }).join('')
+    + '<option value="__custom__">Other role…</option>';
+  if(current && (current==='__custom__' || roles.some(function(r){ return r.value===current; }))) sel.value = current;
+  toggleCustomRoleRow();
+}
+function toggleCustomRoleRow(){
+  var sel = document.getElementById('iv-role');
+  var row = document.getElementById('iv-role-custom-row');
+  if(row) row.style.display = (sel && sel.value==='__custom__') ? 'grid' : 'none';
+}
+(function(){
+  var sel = document.getElementById('iv-role');
+  if(sel) sel.addEventListener('change', toggleCustomRoleRow);
+})();
+
+async function generateSynthetic(){
+  var msg = document.getElementById("syn-msg");
+  var btn = document.getElementById("syn-btn");
+  var client = document.getElementById("syn-client").value.trim();
+  if(!client){ msg.className="msg err"; msg.textContent="Enter a client name."; return; }
+  btn.disabled = true;
+  msg.className = "msg";
+  msg.textContent = "Generating synthetic interviews… this takes 1–3 minutes (one AI call per persona). Leave this page open.";
+  try {
+    var r = await fetch(API_BASE + "/api/synthetic/engagement", {
+      method: "POST", headers: hdrs({ "content-type": "application/json" }),
+      body: JSON.stringify(Object.assign(
+        {
+          clientName: client,
+          includeRefresh: document.getElementById("syn-refresh").checked
+        },
+        document.getElementById("syn-industry").value.trim()
+          ? { industry: document.getElementById("syn-industry").value.trim() }
+          : {} // omitted → server uses the client's Pre-Engagement briefing
+      ))
+    });
+    var data = await r.json();
+    if(!r.ok) throw new Error(data.error || ("HTTP " + r.status));
+    msg.className = "msg ok";
+    msg.innerHTML = "✓ Generated " + data.interviews + " interviews across " + data.rounds +
+      " round(s) for " + esc(data.clientName) + ". " +
+      "<a href='synthesis.html' style='color:var(--gold)'>Open the Synthesis Dashboard</a>, enter the client name, and click Load Engagement.";
+    refresh();
+  } catch (e) {
+    msg.className = "msg err";
+    msg.textContent = "Generation failed: " + e.message + " (free-tier rate limits can interrupt long runs — try again, or uncheck the refresh round for fewer calls)";
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function createInvite(){
+  var msg = document.getElementById("create-msg");
+  msg.className = "msg"; msg.textContent = "Creating…";
+  try {
+    var roleSel = document.getElementById("iv-role").value;
+    var role = roleSel === "__custom__"
+      ? document.getElementById("iv-role-custom").value.trim()
+      : roleSel;
+    if (!role) { msg.className = "msg err"; msg.textContent = "Pick the interviewee's role (or enter a custom one)."; return; }
+    var body = {
+      clientName: document.getElementById("iv-client").value.trim(),
+      intervieweeName: document.getElementById("iv-name").value.trim(),
+      intervieweeRole: role,
+      email: document.getElementById("iv-email").value.trim()
+    };
+    var pw = document.getElementById("iv-password").value;
+    if (pw) body.password = pw;
+    var r = await fetch(API_BASE + "/api/interviews", {
+      method: "POST", headers: hdrs({ "content-type": "application/json" }),
+      body: JSON.stringify(body)
+    });
+    var data = await r.json();
+    if (!r.ok) throw new Error(data.error || ("HTTP " + r.status));
+    msg.className = "msg ok";
+    msg.textContent = "✓ Invite created. " + (data.loginHint || "");
+    refresh();
+  } catch (e) {
+    msg.className = "msg err"; msg.textContent = e.message;
+  }
+}
+
+async function refresh(){
+  var tbody = document.getElementById("rows");
+  var msg = document.getElementById("list-msg");
+  msg.textContent = "";
+  try {
+    var r = await fetch(API_BASE + "/api/interviews", { headers: hdrs() });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    var data = await r.json();
+    if (!data.interviews.length) {
+      tbody.innerHTML = '<tr><td colspan="8" style="color:var(--quiet-soft)">No interviews yet — create the first invite above.</td></tr>';
+      return;
+    }
+    window._ivRows = {};
+    tbody.innerHTML = data.interviews.map(function(iv){
+      window._ivRows[iv.id] = iv;
+      return "<tr id='row-" + iv.id + "'>" +
+        "<td>" + esc(iv.client_name) + "</td>" +
+        "<td>" + esc(iv.interviewee_name) + "</td>" +
+        "<td>" + esc(iv.interviewee_role) + "</td>" +
+        "<td style='color:var(--quiet)'>" + esc(iv.email || "") + "</td>" +
+        "<td><span class='badge " + esc(iv.status) + "'>" + esc(iv.status.replace("_"," ")) + "</span></td>" +
+        "<td style='color:var(--quiet)'>" + fmt(iv.started_at) + "</td>" +
+        "<td style='color:var(--quiet)'>" + fmt(iv.completed_at) + "</td>" +
+        "<td style='white-space:nowrap'>" +
+          "<button class='ghost' style='padding:4px 10px;font-size:11px' onclick=\"viewSession('" + iv.id + "','" + esc(iv.interviewee_name).replace(/'/g,"") + "')\">Session</button> " +
+          "<button class='ghost' style='padding:4px 10px;font-size:11px' onclick=\"editRow('" + iv.id + "')\">Edit</button> " +
+          "<button class='ghost' style='padding:4px 10px;font-size:11px;color:var(--danger)' onclick=\"deleteRow('" + iv.id + "')\">Delete</button>" +
+        "</td>" +
+      "</tr>";
+    }).join("");
+  } catch (e) {
+    msg.className = "msg err"; msg.textContent = e.message;
+  }
+}
+
+function editRow(id){
+  var iv = window._ivRows[id];
+  if(!iv) return;
+  var tr = document.getElementById("row-" + id);
+  var inp = function(v){ return "<input style='width:95%;padding:5px 8px;font-size:12px' value='" + esc(v).replace(/'/g,"&#39;") + "'/>"; };
+  tr.innerHTML =
+    "<td>" + inp(iv.client_name) + "</td>" +
+    "<td>" + inp(iv.interviewee_name) + "</td>" +
+    "<td>" + inp(iv.interviewee_role) + "</td>" +
+    "<td style='color:var(--quiet-soft)'>" + esc(iv.email||"") + "</td>" +
+    "<td><select style='padding:5px;font-size:12px'>" +
+      ["invited","in_progress","completed"].map(function(s){
+        return "<option value='" + s + "'" + (s===iv.status?" selected":"") + ">" + s.replace("_"," ") + "</option>";
+      }).join("") + "</select></td>" +
+    "<td colspan='2' style='color:var(--quiet-soft);font-size:11px'>login id can't be changed — delete &amp; re-invite instead</td>" +
+    "<td style='white-space:nowrap'>" +
+      "<button style='padding:4px 12px;font-size:11px' onclick=\"saveRow('" + id + "')\">Save</button> " +
+      "<button class='ghost' style='padding:4px 10px;font-size:11px' onclick='refresh()'>Cancel</button>" +
+    "</td>";
+}
+
+async function saveRow(id){
+  var tr = document.getElementById("row-" + id);
+  var inputs = tr.querySelectorAll("input");
+  var sel = tr.querySelector("select");
+  try{
+    var r = await fetch(API_BASE + "/api/interviews/" + id, {
+      method: "PATCH", headers: hdrs({ "content-type": "application/json" }),
+      body: JSON.stringify({
+        clientName: inputs[0].value.trim(),
+        intervieweeName: inputs[1].value.trim(),
+        intervieweeRole: inputs[2].value.trim(),
+        status: sel.value
+      })
+    });
+    if(!r.ok) throw new Error("HTTP " + r.status);
+    refresh();
+  }catch(e){ alert("Save failed: " + e.message); }
+}
+
+async function deleteRow(id){
+  var iv = window._ivRows[id];
+  if(!confirm("Delete the interview for " + (iv ? iv.interviewee_name : "this interviewee") + "?\n\nTheir session data is permanently removed and their login loses access. This cannot be undone.")) return;
+  try{
+    var r = await fetch(API_BASE + "/api/interviews/" + id, { method: "DELETE", headers: hdrs() });
+    if(!r.ok) throw new Error("HTTP " + r.status);
+    refresh();
+  }catch(e){ alert("Delete failed: " + e.message); }
+}
+
+async function viewSession(id, name){
+  try {
+    var r = await fetch(API_BASE + "/api/interviews/" + id + "/state", { headers: hdrs() });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    var data = await r.json();
+    var keys = Object.keys(data.state);
+    if (!keys.length) { alert("No session data yet for " + name + "."); return; }
+    // Download the raw session state as JSON for review / import into Synthesis.
+    var blob = new Blob([JSON.stringify(data.state, null, 2)], { type: "application/json" });
+    var a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "VYNE_Interview_" + name.replace(/[^A-Za-z0-9]+/g, "_") + ".json";
+    a.click();
+  } catch (e) { alert("Could not load session: " + e.message); }
+}
+
+refresh();
+</script>
+</body>
+</html>

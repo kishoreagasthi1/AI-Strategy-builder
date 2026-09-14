@@ -5,8 +5,10 @@
  *   · one client can bring a Google key and NOT an Anthropic one;
  *   · a client with no key falls back to the platform credential and their
  *     invoice, rather than failing;
- *   · a lapsed key falls back too — an interview must never die because a
- *     client's credential expired;
+ *   · a REFUSED key is reported as refused, not as absent — v5.34.64 made a
+ *     client with a key on file run on that key alone, so "lapsed" and "never
+ *     supplied" stopped being the same answer (this file said otherwise until
+ *     v5.34.70);
  *   · a key cannot go live without the CLIENT's attestation on record.
  */
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
@@ -162,15 +164,41 @@ describe.skipIf(!ENABLED)("v5.34.53 — one key per client, per provider", () =>
     expect(g).toMatch(/\/versions\/\d+$/);
   });
 
-  it("a lapsed key falls back instead of killing the interview", async () => {
+  it("a refused key is RETURNED, marked failed — not hidden as if absent", async () => {
+    /*
+     * Rewritten in v5.34.70. This used to assert null, with the comment "the
+     * firm eats it until someone fixes it, which is the right way round".
+     *
+     * v5.34.64 decided that was the wrong way round and reversed it: a client
+     * with a key on file runs on that key alone, and if it cannot be spent the
+     * call fails rather than quietly moving the charge to the firm. Nobody came
+     * back to this test, so it went on asserting the old philosophy — and
+     * because activeKeyFor() really did return null, it kept passing while
+     * v5.34.64 and v5.34.69 were both inert past the first refused call. A
+     * green test asserting a retired rule is worse than no test.
+     *
+     * The fall-back-or-fail decision now lives in the CALLERS (resolve.ts,
+     * resolveLive.ts), which is the only layer that knows about fallback
+     * grants. This function's job is to report what is on file, accurately.
+     */
     await attach("Nestlé", "gemini-aistudio");
     await deactivateKey(tenant, "Nestlé", "gemini-aistudio", "failed", undefined, "key rejected by Google");
 
-    // Falls back to the platform credential: the firm eats it until someone
-    // fixes it, which is the right way round.
-    expect(await activeKeyFor(tenant, "Nestlé", "gemini-aistudio")).toBeNull();
+    const row = await activeKeyFor(tenant, "Nestlé", "gemini-aistudio");
+    expect(row, "a refused key read as 'no key', which puts the firm back on the hook")
+      .not.toBeNull();
+    expect(row!.status).toBe("failed");
     const rows = await listKeys(tenant);
     expect(rows[0].status).toBe("failed");          // still visible on the settings screen
+  });
+
+  it("a key the Owner switched off IS hidden — that decision stands", async () => {
+    // The other half of the rule, and the reason the predicate is
+    // `IN ('active','failed')` and not simply unfiltered. `disabled` means the
+    // Owner deliberately put this client back on the firm's account.
+    await attach("Nestlé", "gemini-aistudio");
+    await deactivateKey(tenant, "Nestlé", "gemini-aistudio", "disabled", undefined, "owner turned it off");
+    expect(await activeKeyFor(tenant, "Nestlé", "gemini-aistudio")).toBeNull();
   });
 
   it("rotating replaces the key rather than creating a second row", async () => {

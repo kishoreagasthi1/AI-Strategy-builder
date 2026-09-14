@@ -6,7 +6,18 @@ services:
       POSTGRES_PASSWORD: vyne
       POSTGRES_DB: vyne
     ports:
-      - "5432:5432"
+      # v5.34.99 — the HOST port is configurable; the container port never is.
+      #
+      # A fixed "5432:5432" cannot be published on a machine already running
+      # Postgres.app or Homebrew postgres, and docker does not fail loudly: the
+      # container starts, pg_isready succeeds INSIDE it, and every connection to
+      # localhost:5432 reaches the local server instead. The suite then migrates
+      # into the developer's own database and 77 tests fail as "new row violates
+      # row-level security policy", because vyne is a superuser in the container
+      # and an ordinary owner locally.
+      #
+      # VYNE_PG_PORT moves the host side out of the way:  VYNE_PG_PORT=5433 ...
+      - "${VYNE_PG_PORT:-5432}:5432"
     volumes:
       - vyne_pgdata:/var/lib/postgresql/data
     healthcheck:

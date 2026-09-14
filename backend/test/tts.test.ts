@@ -36,7 +36,7 @@ describe("makeTts — key transport (v5.32.3)", () => {
       };
       return new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
     };
-    const tts = makeTts({ apiKey: "AQ.fake-key-value", fetchImpl });
+    const tts = makeTts({ apiKey: "AQ.fake-key-value", fetchImpl: fetchImpl as unknown as typeof fetch });
     await tts.synthesize("hello");
     expect(capturedUrl).not.toContain("key=");
     expect(capturedHeaders?.["x-goog-api-key"]).toBe("AQ.fake-key-value");

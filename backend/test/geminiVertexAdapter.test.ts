@@ -20,7 +20,7 @@ function captureFetch() {
     capturedUrl = url;
     return new Response(JSON.stringify(OK_BODY), { status: 200, headers: { "content-type": "application/json" } });
   };
-  return { fetchImpl, getUrl: () => capturedUrl };
+  return { fetchImpl: fetchImpl as unknown as typeof fetch, getUrl: () => capturedUrl };
 }
 
 describe("gemini-vertex adapter — model/location defaults", () => {

@@ -217,12 +217,43 @@ try {
   await client.query(`SELECT set_config('app.tenant_id', $1, false)`, [TENANT]);
   console.log("");
 
+  /*
+   * Live-session RESERVATIONS, which are bookkeeping rather than consumption.
+   * Kept in step with NON_BILLABLE_TASKS in backend/src/llm/liveSession.ts — if
+   * that list grows, this one has to grow with it.
+   */
+  const NON_BILLABLE = [
+    "live_session_hold", "live_session_hold_release",
+    "live_session_reserve", "live_session_refund",
+  ];
+
+  /*
+   * Reported in BOTH shapes, because they answer different questions and the
+   * first version of this script only answered the one nobody checks.
+   *
+   * It printed every row it touched — "107 calls / $2.5433" for Nissan on
+   * 2026-09-13 — while the Cost by Client dashboard and the client statement
+   * both read 68 / $0.1808 for the same client at the same moment. Neither was
+   * wrong: routes/billing.ts filters NON_BILLABLE_TASKS out of every statement,
+   * and Nissan carried 39 unreconciled live-session hold rows worth $2.3625
+   * (the same residue deploy/correct_legacy_live_ledger.sql was written for).
+   *
+   * But an ops tool whose totals match no screen the operator can open is a
+   * tool that makes a correct merge look like a broken one. The MOVED count is
+   * every row; the BILLABLE count is what anyone will actually see afterwards.
+   */
   const ledger = async (n) => (await client.query(
-    `SELECT client_name, count(*)::int AS calls, sum(cost_est_usd)::numeric AS usd,
+    `SELECT client_name,
+            count(*)::int                                    AS calls,
+            sum(cost_est_usd)::numeric                       AS usd,
+            count(*) FILTER (WHERE NOT (task = ANY($3::text[])))::int
+                                                             AS billable_calls,
+            coalesce(sum(cost_est_usd) FILTER (WHERE NOT (task = ANY($3::text[]))), 0)::numeric
+                                                             AS billable_usd,
             min(created_at)::date::text AS first_seen, max(created_at)::date::text AS last_seen
        FROM usage_events
       WHERE tenant_id = $1 AND client_norm = $2
-      GROUP BY client_name ORDER BY client_name`, [TENANT, n])).rows;
+      GROUP BY client_name ORDER BY client_name`, [TENANT, n, NON_BILLABLE])).rows;
 
   /** Every product surface a client can appear on — i.e. what /api/my-clients reads. */
   const surfaces = async (n) => (await client.query(
@@ -315,8 +346,20 @@ try {
   const movingUsd = srcLedger.reduce((a, r) => a + Number(r.usd), 0);
   const afterCalls = movingCalls + dstLedger.reduce((a, r) => a + r.calls, 0);
   const afterUsd = movingUsd + dstLedger.reduce((a, r) => a + Number(r.usd), 0);
-  console.log(`Would move ${movingCalls} call(s) / ${usd(movingUsd)} onto "${DST_NAME}",`);
-  console.log(`leaving it at ${afterCalls} call(s) / ${usd(afterUsd)}.`);
+  const sum = (rows, f) => rows.reduce((a, r) => a + Number(r[f]), 0);
+  const afterBillCalls = sum(srcLedger, "billable_calls") + sum(dstLedger, "billable_calls");
+  const afterBillUsd = sum(srcLedger, "billable_usd") + sum(dstLedger, "billable_usd");
+
+  console.log(`Would move ${movingCalls} row(s) / ${usd(movingUsd)} onto "${DST_NAME}",`);
+  console.log(`leaving ${afterCalls} row(s) / ${usd(afterUsd)} in the table.`);
+  console.log("");
+  console.log(`On the Cost by Client dashboard and the client statement — which`);
+  console.log(`exclude live-session reservations — "${DST_NAME}" will read:`);
+  console.log(`  ${afterBillCalls} billable call(s) / ${usd(afterBillUsd)}`);
+  if (afterCalls !== afterBillCalls) {
+    console.log(`  (${afterCalls - afterBillCalls} reservation row(s) / ` +
+                `${usd(afterUsd - afterBillUsd)} are moved but never shown)`);
+  }
 
   if (!APPLY) {
     console.log("\nDry run — nothing was written. Re-run with --apply to perform the move.");
@@ -348,7 +391,13 @@ try {
 
   const after = await ledger(DST);
   console.log(`\nMoved ${upd.rowCount} row(s). Destination now reads:`);
-  for (const r of after) console.log(`  ${r.client_name} — ${r.calls} call(s), ${usd(r.usd)}`);
+  for (const r of after) {
+    console.log(`  ${r.client_name} — ${r.calls} row(s), ${usd(r.usd)} in the table`);
+    // What the operator will see when they open the screen, which is the only
+    // number they can check this against.
+    console.log(`  ${" ".repeat(r.client_name.length)}   ${r.billable_calls} billable ` +
+                `call(s), ${usd(r.billable_usd)} on the dashboard and statement`);
+  }
   const leftover = await ledger(SRC);
   console.log(leftover.length
     ? `\nWARNING: ${leftover.length} source group(s) remain — investigate.`

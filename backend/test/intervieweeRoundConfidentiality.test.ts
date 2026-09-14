@@ -74,7 +74,7 @@ const ENGAGEMENT = {
 const sanitize = (own: number | null) =>
   JSON.parse(sanitizeEngagementForInterviewee(JSON.stringify(ENGAGEMENT), own));
 const round = (out: { rounds: { roundId: string }[] }, id: string) =>
-  out.rounds.find((r) => r.roundId === id) as {
+  out.rounds.find((r) => r.roundId === id) as unknown as {
     scores?: Record<string, number>; findingsByDimension: Record<string, string>;
   };
 

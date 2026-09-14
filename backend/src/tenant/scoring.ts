@@ -58,6 +58,14 @@ export interface ScoringInterview {
   role?: string;
   scores?: Record<string, number> | null;
   coverageByDim?: Record<string, number> | null;
+  /** v5.34.92: the lead/cover/light tiering that governed this interview, as a
+   *  snapshot. Absent on every interview recorded before v5.34.92. */
+  dimTiers?: Record<string, string> | null;
+  /** v5.34.96: external-event attribution, rolled up to the round by
+   *  roundEventRollup(). Set by both builders; read by Synthesis's ⚡ marker. */
+  eventDriven?: boolean | null;
+  eventContext?: unknown;
+  eventCoveredDims?: string[] | null;
   isRefresh?: boolean;
   [key: string]: unknown;
 }
@@ -366,17 +374,182 @@ export function nextRoundNumber<T extends RoundLike>(rounds: T[] | null | undefi
   return hi + 1;
 }
 
-/** Overall = unweighted mean ACROSS dimensions (role weights rank people
- *  within a dimension; they say nothing about how dimensions compare). */
-export function overallOf(scores: Record<string, number> | null | undefined): number | null {
+/* ── v5.34.92: how much each DIMENSION counts toward the overall ─────────────
+ *
+ * Role weights rank PEOPLE within one dimension. They deliberately say nothing
+ * about how dimensions compare, so the overall was a plain mean across the
+ * seven — and a 1.7 on a dimension the engagement barely cared about counted
+ * exactly as much as a 1.7 on its central one.
+ *
+ * The weights are NOT a new input. Pre-Engagement already tiers every dimension
+ * per role — lead / cover / light, and a dimension in none of them is excluded
+ * — and that tiering is the statement of what this engagement is about. Summing
+ * it across the roles who were interviewed gives a per-dimension weight for
+ * free.
+ *
+ * Each interview carries the tiers that governed it (interview_agent.html
+ * writes ivRecord.dimTiers at completion), so the weights are a snapshot that
+ * cannot drift from what the interviews actually did, and editing
+ * Pre-Engagement later does not silently restate a delivered score. An
+ * interview recorded before v5.34.92 has no dimTiers, and if ANY scored
+ * interview in the round is missing them this returns null and overallOf falls
+ * back to the plain mean — so no existing client's maturity level moves
+ * retroactively.
+ *
+ * Byte-for-byte counterpart: frontend/vyne-scoring.js. test/scoringParity.test.ts
+ * runs both against the same randomised battery, weighted path included.
+ */
+export const TIER_WEIGHT: Record<string, number> = { lead: 1.0, cover: 0.6, light: 0.3 };
+
+/* ── v5.34.96: THE MATURITY BANDS, ONCE ──────────────────────────────────────
+ *
+ * The five words a client is actually told, and the thresholds between them.
+ * They lived in four places — routes/scorecard.ts, interview_agent.html and
+ * twice inline in synthesis.html — agreeing by luck, with no test comparing
+ * any of them, plus a fifth colour map in scorecard.html keyed by the label
+ * strings. Renaming a band in one file would have shipped a deck and a
+ * dashboard that disagreed about the client's maturity.
+ *
+ * Byte-for-byte counterpart: frontend/vyne-scoring.js. Pinned by
+ * scoringParity.test.ts, like everything else in this file.
+ */
+/* ── v5.34.96: THE ⚡ MARKER WAS WRITTEN AT THE WRONG LEVEL ───────────────────
+ *
+ * synthesis.html reads `round.eventDriven` and `round.eventCoveredDims` to mark
+ * a dimension whose score moved because of an external event. Both builders set
+ * those fields on the INTERVIEW record and nothing has ever set them on a
+ * round, so the marker could not render — written on both sides of the boundary
+ * and consumed by nobody, which is the isRefresh/isRefreshMode defect with a
+ * level substituted for a spelling.
+ *
+ * DERIVED, not copied: a derivation cannot drift from the data it describes.
+ * Byte-for-byte counterpart in frontend/vyne-scoring.js.
+ */
+export function roundEventRollup(
+  interviews: ScoringInterview[] | null | undefined,
+): { eventDriven: boolean; eventContext: unknown; eventCoveredDims: string[] } {
+  const list: ScoringInterview[] = [];
+  if (Array.isArray(interviews)) for (const iv of interviews) if (iv) list.push(iv);
+  let driven = false;
+  let ctx: unknown = null;
+  const dims: string[] = [];
+  for (const iv of list) {
+    if (!iv.eventDriven) continue;
+    driven = true;
+    if (!ctx && iv.eventContext) ctx = iv.eventContext;
+    const cov = Array.isArray(iv.eventCoveredDims) ? (iv.eventCoveredDims as unknown[]) : [];
+    for (const c of cov) {
+      const d = String(c);
+      if ((DIMS as readonly string[]).indexOf(d) >= 0 && dims.indexOf(d) < 0) dims.push(d);
+    }
+  }
+  // Stable order, so a round record does not churn on every recompute.
+  dims.sort();
+  return { eventDriven: driven, eventContext: ctx, eventCoveredDims: dims };
+}
+
+export const MATURITY_BANDS: ReadonlyArray<{ min: number; label: string }> = [
+  { min: 4.5, label: "AI-Native" },
+  { min: 3.5, label: "AI-Led" },
+  { min: 2.5, label: "AI Capable" },
+  { min: 1.5, label: "AI Exploring" },
+  { min: 0, label: "AI Unaware" },
+];
+
+/** The band a score falls in. Always returns one; 0 is "AI Unaware". */
+export function maturityBand(score: number | null | undefined): { min: number; label: string } {
+  const v = finite(score);
+  if (v === null) return MATURITY_BANDS[MATURITY_BANDS.length - 1];
+  for (const b of MATURITY_BANDS) if (v >= b.min) return b;
+  return MATURITY_BANDS[MATURITY_BANDS.length - 1];
+}
+
+/**
+ * The band's label, or null when there is no score to band.
+ *
+ * null and 0 are different answers: a round with no scores has no maturity
+ * (the caller renders "Pending"), while a round measured at 0 is AI Unaware.
+ */
+export function maturityLabel(score: number | null | undefined): string | null {
+  const v = finite(score);
+  return v === null ? null : maturityBand(v).label;
+}
+
+/**
+ * The only field dimensionWeights() needs — but an index signature, because
+ * every caller passes a REAL interview record carrying role, scores, findings
+ * and a dozen more fields. Without it, tsconfig.test.json rejects
+ * `{ role: "CTO", dimTiers: {...} }` as an excess property, which is a type
+ * error about the test rather than about the code.
+ */
+export type TieredInterview = {
+  dimTiers?: Record<string, string> | null;
+  [key: string]: unknown;
+};
+
+/**
+ * Per-dimension weights for a round, or null when the round cannot supply them
+ * (no interviews, a legacy interview with no tiers, or tiers that exclude
+ * everything).
+ *
+ * All-or-nothing on purpose: weighting a round from the two interviews that
+ * happen to carry tiers, while ignoring the third, is a number nobody can
+ * explain and nobody would notice was wrong.
+ */
+export function dimensionWeights(
+  interviews: TieredInterview[] | null | undefined,
+): Record<string, number> | null {
+  const list: TieredInterview[] = [];
+  if (Array.isArray(interviews)) for (const iv of interviews) if (iv) list.push(iv);
+  if (!list.length) return null;
+  const w: Record<string, number> = {};
+  for (const d of DIMS) w[d] = 0;
+  for (const iv of list) {
+    const t = iv.dimTiers;
+    if (!t || typeof t !== "object") return null;
+    for (const d of DIMS) {
+      const tier = t[d];
+      const tw = Object.prototype.hasOwnProperty.call(TIER_WEIGHT, tier as string)
+        ? TIER_WEIGHT[tier as string]
+        : 0;
+      w[d] += tw;
+    }
+  }
+  let any = false;
+  for (const d of DIMS) if (w[d] > 0) any = true;
+  return any ? w : null;
+}
+
+/**
+ * Overall across dimensions. With `weights`, a weighted mean; without them, the
+ * plain mean this has always been.
+ *
+ * The second argument is optional so that every existing call site keeps its
+ * exact current behaviour — a caller opts in by passing weights, never by
+ * accident.
+ */
+export function overallOf(
+  scores: Record<string, number> | null | undefined,
+  weights?: Record<string, number> | null,
+): number | null {
   if (!scores) return null;
   let acc = 0;
   let n = 0;
+  let wacc = 0;
+  let wsum = 0;
   for (const d of DIMS) {
     const v = finite(scores[d]);
     if (v === null || v <= 0) continue;
-    acc += v;
-    n++;
+    if (weights) {
+      const w = finite(weights[d]);
+      if (w === null || w <= 0) continue; // excluded by every role
+      wacc += v * w;
+      wsum += w;
+    } else {
+      acc += v;
+      n++;
+    }
   }
+  if (weights) return wsum > 0 ? round1(wacc / wsum) : null;
   return n ? round1(acc / n) : null;
 }

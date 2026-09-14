@@ -30,7 +30,7 @@ import { withTenant } from "../db/pool.js";
 import { normClient } from "../auth/clients.js";
 import { DIMENSION_NAMES, overallOf, maturityLabel } from "../routes/scorecard.js";
 import { corroborateFindings, findingsOf, type RawFinding } from "./findings.js";
-import { latestScoredRound } from "./scoring.js";
+import { latestScoredRound, dimensionWeights } from "./scoring.js";
 
 interface RawInterview {
   role?: string;
@@ -249,12 +249,20 @@ export async function loadClientEvidence(tenantId: string, clientName: string): 
          * /api/scorecard, which sorted by number, showed round 3's for the same
          * client. Both now go through latestScoredRound(). */
         const scoredRound = latestScoredRound(rounds as never);
+        let evWeights: Record<string, number> | null = null;
         if (scoredRound) {
           ev.scores = scoredRound.scores as Record<string, number>;
           ev.benchmarks = (scoredRound as unknown as RawRound).benchmarks;
+          /* v5.34.92: the same weighting /api/scorecard applies. This number is
+           * quoted to the model as the client's measured maturity, so a
+           * disagreement with the portfolio card would be a disagreement the
+           * Solution Design then reasons from. */
+          evWeights = dimensionWeights(
+            (scoredRound as unknown as { interviews?: unknown[] }).interviews as never,
+          );
         }
         if (ev.scores) {
-          const o = overallOf(ev.scores);
+          const o = overallOf(ev.scores, evWeights);
           if (o !== null) { ev.overall = o; ev.maturity = maturityLabel(o) ?? undefined; }
         }
         // v5.32.25: this summed interviews across EVERY round, so five

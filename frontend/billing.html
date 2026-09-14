@@ -151,7 +151,7 @@ tr.unattributed td{color:var(--quiet-soft);font-style:italic}
       inbox.
     </div>
     <div class="grid" style="grid-template-columns:2fr 1fr 1fr;margin-bottom:6px">
-      <input type="text" id="byok-client" placeholder="Client name (exactly as on the engagement)"/>
+      <select id="byok-client"><option value="">Choose a client…</option></select>
       <select id="byok-provider">
         <!--
           v5.34.62. These labels used to read "Google AI — voice interviews"
@@ -202,8 +202,7 @@ tr.unattributed td{color:var(--quiet-soft);font-style:italic}
       about $2 for 90 minutes — so this is worth granting deliberately rather than broadly.
     </p>
     <div class="row" style="gap:10px;flex-wrap:wrap">
-      <input type="text" id="grant-client" placeholder="Client name (exactly as on the engagement)"
-             style="flex:1;min-width:240px"/>
+      <select id="grant-client" style="flex:1;min-width:240px"><option value="">Choose a client…</option></select>
       <input type="text" id="grant-reason" placeholder="Why (optional) — e.g. pilot, procurement pending"
              style="flex:1;min-width:200px"/>
       <button class="btn" onclick="saveGrant()">Grant fallback</button>
@@ -245,8 +244,7 @@ tr.unattributed td{color:var(--quiet-soft);font-style:italic}
       at any provider your policy allows.
     </p>
     <div class="row" style="gap:10px;flex-wrap:wrap">
-      <input type="text" id="route-client" placeholder="Client name (exactly as on the engagement)"
-             style="flex:1;min-width:240px"/>
+      <select id="route-client" style="flex:1;min-width:240px"><option value="">Choose a client…</option></select>
       <select id="route-vendor">
         <option value="gemini-aistudio">Prefer Google (Gemini)</option>
         <option value="anthropic-api">Prefer Anthropic (Claude)</option>
@@ -273,7 +271,62 @@ tr.unattributed td{color:var(--quiet-soft);font-style:italic}
  *
  * They are independent panels and now load independently.
  */
+/**
+ * The client pickers. (v5.34.67)
+ *
+ * These three were free-text boxes reading "Client name (exactly as on the
+ * engagement)" — an instruction that exists only because the field could get it
+ * wrong. It regularly did: the name is typed by the Owner here and by a
+ * consultant in Pre-Engagement, joined only by normClient(), so "Newell Brands"
+ * and "Newell Brands Inc" are different clients and the key attached to the one
+ * that does not exist. It stored fine, showed as active, and was never used.
+ *
+ * A list of the clients that actually exist removes the whole class. The server
+ * refuses an unknown client too (requireEngagement) — this is the half that
+ * means nobody has to meet that refusal.
+ */
+async function loadClientOptions(){
+  var ids = ["byok-client", "grant-client", "route-client"];
+  try{
+    /*
+     * /api/byok/clients, not /api/engagements.
+     *
+     * The first version of this used the engagement list, and live testing
+     * found the hole immediately: a client with an active key and a grant but
+     * no engagement row — "ZZ BYOK Test" — kept working and vanished from every
+     * picker, so their configuration could no longer be changed. The endpoint
+     * returns both sets and says which is which.
+     */
+    var r = await fetch(API_BASE + "/api/byok/clients", { headers: hdrs() });
+    if(!r.ok) return;
+    var d = await r.json();
+    var list = (d.clients || []).filter(function(c){ return c && c.clientName; });
+    ids.forEach(function(id){
+      var sel = document.getElementById(id);
+      if(!sel) return;
+      var keep = sel.value;
+      sel.textContent = "";
+      var blank = document.createElement("option");
+      blank.value = "";
+      blank.textContent = list.length ? "Choose a client…" : "No clients yet — create one in Pre-Engagement";
+      sel.appendChild(blank);
+      list.forEach(function(c){
+        var o = document.createElement("option");
+        // textContent, never innerHTML: the name comes from the database.
+        o.value = c.clientName;
+        // An unregistered client is shown, because their key already exists and
+        // has to stay manageable — but it is labelled, because the state is one
+        // somebody should fix rather than one to leave alone.
+        o.textContent = c.registered ? c.clientName : c.clientName + "  (not a registered client)";
+        sel.appendChild(o);
+      });
+      if (keep) sel.value = keep;
+    });
+  }catch(e){ /* the panels below still work; the server is the real guard */ }
+}
+
 async function loadKeys(){
+  await loadClientOptions();
   await renderKeyList();
   loadOpenInvites();
   loadRouting();
@@ -426,10 +479,25 @@ async function renderKeyList(){
        * column someone actually looks at, with the reason underneath.
        */
       var broken = live && k.lastError;
+      /*
+       * v5.34.69 — the three non-active states now mean different things, and
+       * the label said the same thing about all of them.
+       *
+       * It read "<status> — running on your key" for every one. That was true
+       * for `disabled` (the Owner's own decision) and FALSE for `failed`: since
+       * v5.34.64 a refused key means the client's work STOPS unless a fallback
+       * grant covers them. An Owner reading "failed — running on your key" would
+       * believe the opposite of what was happening, on the screen built to tell
+       * them who is paying.
+       */
+      var refused = k.status === "failed";
       var st = cell(
-        broken ? "active — but not working"
-               : (live ? "active" : k.status + " — running on your key"));
-      st.style.color = broken ? "var(--danger)" : (live ? "var(--live)" : "var(--warn)");
+        broken   ? "active — but not working"
+        : live   ? "active"
+        : refused ? "refused — their work is stopping"
+                  : k.status + " — running on your key");
+      st.style.color = (broken || refused) ? "var(--danger)"
+                     : (live ? "var(--live)" : "var(--warn)");
       if (broken) {
         var why = document.createElement("div");
         why.className = "hint";
@@ -439,12 +507,46 @@ async function renderKeyList(){
           " — this client's work is running on your keys until it is fixed.";
         st.appendChild(why);
       }
+      if (refused) {
+        var rwhy = document.createElement("div");
+        rwhy.className = "hint";
+        rwhy.style.marginTop = "3px";
+        rwhy.textContent = (k.lastError ? k.lastError + " — " : "")
+          + "their documents, decks and interviews are failing. Send a new setup link, "
+          + "or grant fallback below to carry them on your key meanwhile.";
+        st.appendChild(rwhy);
+      }
       st.style.fontWeight = "600";
 
       cell(k.keyHint ? "\u2022\u2022\u2022\u2022" + k.keyHint : "\u2014");
       cell(k.attestedByEmail || "\u2014");
 
       var act = document.createElement("td");
+      /*
+       * v5.34.69 — "turn off" shipped without a "turn on".
+       *
+       * The only way back was a fresh setup link and the CLIENT's administrator
+       * pasting their key again: a round trip to the client, to undo a click the
+       * firm made on its own screen, with nothing warning it was one-way.
+       * Nothing was ever destroyed — the secret is still in Secret Manager — so
+       * this is the status flip it always should have been.
+       *
+       * Only a `disabled` key gets the link. A `failed` one was refused by its
+       * vendor; turning it back on would show "active" for a credential that
+       * fails on the next call, so those must be replaced.
+       */
+      if (k.status === "disabled") {
+        var on = document.createElement("a");
+        on.href = "#";
+        on.textContent = "turn on";
+        on.dataset.client = k.clientName;
+        on.dataset.provider = k.provider;
+        on.addEventListener("click", function(ev){
+          ev.preventDefault();
+          enableKey(this.dataset.client, this.dataset.provider);
+        });
+        act.appendChild(on);
+      }
       if (live) {
         var a = document.createElement("a");
         a.href = "#";
@@ -684,6 +786,19 @@ async function makeInvite(){
   }
 }
 
+async function enableKey(clientName, provider){
+  if(!confirm("Turn " + clientName + "'s key back on?\n\nTheir work will run on their own key and be billed to them again.")) return;
+  try{
+    var r = await fetch(API_BASE + "/api/byok/keys/enable", {
+      method: "POST", headers: Object.assign({"content-type":"application/json"}, hdrs()),
+      body: JSON.stringify({ clientName: clientName, provider: provider })
+    });
+    var d = await r.json().catch(function(){ return {}; });
+    if(!r.ok){ alert(d.detail || ("Could not turn it back on: " + (d.error || r.status))); return; }
+    loadKeys();
+  }catch(e){ alert("Could not turn it back on: " + e.message); }
+}
+
 async function disableKey(clientName, provider){
   if(!confirm("Stop using " + clientName + "'s own key for " + provider + "?\n\nTheir work will run on your keys again and appear on their statement.")) return false;
   try{
@@ -750,6 +865,25 @@ function dateRangeQS(fromId, toId){
 (function(){
   var s = vyneAuth.session();
   if (s && s.role === "interviewee") window.location.href = "interview_agent.html";
+  /*
+   * v5.34.67 — the Client API keys tab is OWNER-ONLY, and until now only the
+   * server knew that.
+   *
+   * Every route behind this tab returns 403 to a consultant, and all three
+   * loaders swallow their errors. So a consultant clicked it and read "No
+   * client is using their own key yet" and "No client has fallback" — which are
+   * not empty states, they are forbidden states. A consultant could tell a
+   * client "you are not on your own key" while looking at a screen that was
+   * never allowed to show them one.
+   *
+   * Hidden rather than disabled: there is nothing here for them to act on, and
+   * a greyed-out tab invites a question the answer to which is just "ask the
+   * Owner".
+   */
+  if (s && s.role !== "owner") {
+    var t = document.getElementById("tab-btn-keys");
+    if (t) t.style.display = "none";
+  }
 })();
 
 

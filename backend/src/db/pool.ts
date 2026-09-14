@@ -170,6 +170,17 @@ const REQUIRED_COLUMNS: { table: string; column: string; migration: string }[] =
   { table: "interview_transcripts", column: "synthetic", migration: "026_synthetic_flag_column.sql" },
   { table: "interviews",            column: "depth",     migration: "028_interview_depth_column.sql" },
   /*
+   * v5.34.67. Without engagement_id every BYOK lookup silently degrades to the
+   * pre-v5.34.67 behaviour — matching on the client's NAME — which is exactly
+   * the bug 037 exists to close: a rename detaches the key and the firm starts
+   * paying, with nothing on screen to say so. A missing column here is not a
+   * crash, it is a quiet return to the wrong answer, which is the class this
+   * guard exists to catch at boot rather than in an invoice.
+   */
+  { table: "byok_keys",           column: "engagement_id", migration: "037_byok_engagement_binding.sql" },
+  { table: "client_routing",      column: "engagement_id", migration: "037_byok_engagement_binding.sql" },
+  { table: "byok_fallback_grant", column: "engagement_id", migration: "037_byok_engagement_binding.sql" },
+  /*
    * v5.34.59. Without these the damage is worse than a broken screen:
    * admitLiveSession's INSERT names `payer`, so every live voice session fails
    * to open; dbMeter's INSERT names it too, and safeMeter SWALLOWS that failure

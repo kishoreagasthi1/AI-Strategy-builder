@@ -104,7 +104,14 @@ describe("v5.34.33 — an interview that ends early is not lost", () => {
     // Without this the interviewer walks back in with no memory and re-asks
     // ground already covered — the failure mode of "continue later".
     expect(src).toContain("function priorTranscriptBlock(budget){");
-    expect(fn("buildLiveContext")).toContain("var prior = priorTranscriptBlock(3200);");
+    /*
+     * v5.34.73 moved this call to the TOP of buildLiveContext and put it behind
+     * the budget allocator. It used to be appended last, which meant that on a
+     * long briefing the outer .slice(0, 5800) cut into the most recent
+     * exchanges — the opposite of what this test is protecting. Assert the call
+     * and its budget, not where in the function it sits.
+     */
+    expect(fn("buildLiveContext")).toContain("priorTranscriptBlock(3200)");
     const block = fn("priorTranscriptBlock");
     expect(block).toContain("S.displayMessages");
     expect(block).toContain("This interview is being CONTINUED");

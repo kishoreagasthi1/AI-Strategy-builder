@@ -158,7 +158,33 @@ describe.skipIf(!ENABLED)("Phase 2.5 role isolation", () => {
     await closePool();
     if (admin) {
       await admin.query(`DELETE FROM tenants WHERE id = $1`, [tenant]);
-      await admin.query(`DELETE FROM users WHERE identity_platform_uid LIKE '%client.com'`);
+      /*
+       * v5.34.65. This was `LIKE '%client.com'` — every user in the database
+       * whose uid ends in that domain, across every tenant and every other
+       * test file.
+       *
+       * Seven files use @client.com addresses. Running in parallel, whichever
+       * finished first deleted the others' interviewees mid-run: their
+       * module_state rows lost their owner, engagement adoption stopped
+       * finding records, and this teardown itself failed on
+       * module_state_updated_by_fkey when the rows were still referenced.
+       *
+       * That is the whole story behind the two mystery failures in the first
+       * Docker run — an extra `vynora_engagement_ACME-BB64` minted because
+       * the record it should have adopted had just been orphaned, and an
+       * engagement that came back undefined. Both looked like product bugs in
+       * the merge and were neither. They never reproduced on a 2-core machine,
+       * where four fewer workers meant the two files rarely overlapped.
+       *
+       * Scoped to the uids THIS file creates. A teardown must not be able to
+       * reach another file's data — the suite runs in parallel by default and
+       * every file owns only what it made.
+       */
+      await admin.query(
+        `DELETE FROM users WHERE identity_platform_uid = ANY($1::text[])`,
+        [["ada@client.com", "bob@client.com", "carol@client.com",
+          "dana@client.com", "eve@client.com", "frank@client.com"]]
+      );
       await admin.end();
     }
     delete process.env.DEV_AUTH;

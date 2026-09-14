@@ -498,9 +498,24 @@ describe.skipIf(!ENABLED)("interview identity: no interview may cross with anoth
     const readWs = async () => {
       await admin.query("BEGIN");
       await admin.query("SELECT set_config('app.tenant_id', $1, true)", [tenant]);
+      /*
+       * v5.34.65: an explicit tenant_id, NOT just the GUC.
+       *
+       * `admin` connects as the database owner, and in the Docker runner (and
+       * on most local setups) that role is a SUPERUSER — which bypasses
+       * row-level security entirely. So this read returned every tenant's
+       * engagement rows, and set_config above bought nothing.
+       *
+       * Running in parallel that meant this test saw engagement records minted
+       * by interviews.test.ts for its own Acme tenant, and reported them as a
+       * duplicate this file had created: `vynora_engagement_ACME-C95B` next to
+       * the expected ACMEHIST. It looked exactly like the adoption logic
+       * failing to adopt. The adoption logic was correct throughout.
+       */
       const r = await admin.query<{ key: string; value: { v: string } }>(
-        `SELECT key, value FROM module_state WHERE module = 'workspace'
-          AND key LIKE 'vynora_engagement_%'`);
+        `SELECT key, value FROM module_state
+          WHERE tenant_id = $1 AND module = 'workspace'
+            AND key LIKE 'vynora_engagement_%'`, [tenant]);
       await admin.query("COMMIT");
       return r.rows;
     };
@@ -509,8 +524,14 @@ describe.skipIf(!ENABLED)("interview identity: no interview may cross with anoth
     // completed round — and an index that has never heard of it.
     await admin.query("BEGIN");
     await admin.query("SELECT set_config('app.tenant_id', $1, true)", [tenant]);
+    // Same superuser/RLS trap as readWs above, and far worse here: without the
+    // tenant predicate this DELETE wiped EVERY tenant's engagement records —
+    // which is what emptied clients.test.ts's engagement index and made
+    // interviews.test.ts's ACME01 come back undefined, in the same run.
     await admin.query(
-      `DELETE FROM module_state WHERE module = 'workspace' AND key LIKE 'vynora_engagement_%'`);
+      `DELETE FROM module_state
+        WHERE tenant_id = $1 AND module = 'workspace'
+          AND key LIKE 'vynora_engagement_%'`, [tenant]);
     await admin.query("COMMIT");
     await setWs("vynora_engagement_index", JSON.stringify({}));
     await setWs("vynora_engagement_ACMEHIST", JSON.stringify({
@@ -581,7 +602,7 @@ describe("round separation: a later round must not overwrite an earlier one", ()
       sourceInterviewId: "iv-q1", kind: "initial",
     });
     expect(eng.rounds).toHaveLength(1);
-    expect(eng.rounds[0].interviews).toHaveLength(1);
+    expect(eng.rounds![0].interviews).toHaveLength(1);
 
     // Next quarter, same executive, same role — invited for round 2.
     eng = mergeSessionIntoEngagement(eng, "ACME01", session({ D1: 4, D3: 5 }) as never, {
@@ -589,12 +610,12 @@ describe("round separation: a later round must not overwrite an earlier one", ()
     });
 
     expect(eng.rounds).toHaveLength(2);
-    const r1 = eng.rounds.find((r) => r.roundNumber === 1)!;
-    const r2 = eng.rounds.find((r) => r.roundNumber === 2)!;
+    const r1 = eng.rounds!.find((r) => r.roundNumber === 1)!;
+    const r2 = eng.rounds!.find((r) => r.roundNumber === 2)!;
     // Round 1 is untouched — this is the assertion the whole change exists for.
     expect(r1.interviews).toHaveLength(1);
-    expect(r1.interviews[0].scores!.D1).toBe(2);
-    expect(r2.interviews[0].scores!.D1).toBe(4);
+    expect((r1.interviews[0].scores as Record<string, number>).D1).toBe(2);
+    expect((r2.interviews[0].scores as Record<string, number>).D1).toBe(4);
     // And the delta the client is shown is now real.
     expect(r2.scores!.D1).toBeGreaterThan(r1.scores!.D1);
   });
@@ -610,8 +631,8 @@ describe("round separation: a later round must not overwrite an earlier one", ()
     // Same person, same role, no round given: still an upsert, as before. A
     // consultant correcting a botched interview relies on this.
     expect(eng.rounds).toHaveLength(1);
-    expect(eng.rounds[0].interviews).toHaveLength(1);
-    expect(eng.rounds[0].interviews[0].scores!.D1).toBe(3);
+    expect(eng.rounds![0].interviews).toHaveLength(1);
+    expect((eng.rounds![0].interviews[0].scores as Record<string, number>).D1).toBe(3);
   });
 
   it("a replaced record is archived, not destroyed", async () => {
@@ -625,7 +646,7 @@ describe("round separation: a later round must not overwrite an earlier one", ()
     // The engagement record is the ONLY copy of a completed interview's scores
     // and findings. Overwriting stays the default, but the previous version is
     // recoverable rather than gone.
-    const round = eng.rounds[0] as unknown as Record<string, unknown>;
+    const round = eng.rounds![0] as unknown as Record<string, unknown>;
     const archived = round.superseded as Array<Record<string, unknown>>;
     expect(archived).toHaveLength(1);
     expect((archived[0].scores as Record<string, number>).D1).toBe(2);
@@ -640,9 +661,9 @@ describe("round separation: a later round must not overwrite an earlier one", ()
     eng = mergeSessionIntoEngagement(eng, "ACME04", session({ D1: 4 }) as never, {
       sourceInterviewId: "iv-x", kind: "initial",
     });
-    const round = eng.rounds[0] as unknown as Record<string, unknown>;
-    expect(eng.rounds[0].interviews).toHaveLength(1);
-    expect(eng.rounds[0].interviews[0].scores!.D1).toBe(4);
+    const round = eng.rounds![0] as unknown as Record<string, unknown>;
+    expect(eng.rounds![0].interviews).toHaveLength(1);
+    expect((eng.rounds![0].interviews[0].scores as Record<string, number>).D1).toBe(4);
     expect(round.superseded).toBeUndefined();
   });
 });
@@ -667,13 +688,13 @@ describe("round scores must not borrow from the future or discount a role", () =
     e = mergeSessionIntoEngagement(e, "A", sess({ D1: 3.0 }) as never,
       { sourceInterviewId: "r2", kind: "initial", roundNumber: 2 });
 
-    expect(e.rounds.map((r) => r.roundNumber)).toEqual([1, 3, 2]);   // array order IS out of order
-    const r2 = e.rounds.find((r) => r.roundNumber === 2)!;
+    expect(e.rounds!.map((r) => r.roundNumber)).toEqual([1, 3, 2]);   // array order IS out of order
+    const r2 = e.rounds!.find((r) => r.roundNumber === 2)!;
     // D2 was not scored in round 2. It must inherit round 1's 1.0 — NOT round
     // 3's 5.0, which is what walking the array by index produced.
     expect(r2.scores!.D2).toBe(1.0);
     // And nothing in a later round is disturbed by the backfill.
-    expect(e.rounds.find((r) => r.roundNumber === 3)!.scores!.D1).toBe(4.0);
+    expect(e.rounds!.find((r) => r.roundNumber === 3)!.scores!.D1).toBe(4.0);
   });
 
   it("weights a role the same whether it arrives as a slug or a display label", async () => {

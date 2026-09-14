@@ -39,7 +39,7 @@ import { normClient } from "../auth/clients.js";
 import { probeKey, keyIsUsable, type KeyProbe } from "../llm/byok/verifyKey.js";
 import { putTenantKey, type SecretStoreOptions } from "../llm/byok/secretStore.js";
 import {
-  upsertActiveKey, listKeys, deactivateKey, listOpenInvites, revokeInvite,
+  upsertActiveKey, listKeys, deactivateKey, reactivateKey, listOpenInvites, revokeInvite,
   type ByokProvider,
 } from "../llm/byok/byokRepo.js";
 import { listRouting, setRouting, clearRouting } from "../llm/byok/clientRouting.js";
@@ -47,9 +47,58 @@ import {
   listFallbackGrants, grantFallback, revokeFallback,
 } from "../llm/byok/fallbackGrant.js";
 import { auditLog } from "../audit/log.js";
+import { engagementIdFor, byokClients } from "../llm/byok/engagementBinding.js";
 
 const PROVIDERS = ["gemini-aistudio", "anthropic-api"] as const;
 const INVITE_TTL_HOURS = 72;
+
+/**
+ * The client must EXIST before anything is attached to them. (v5.34.67)
+ *
+ * Every one of these forms used to take free text. The owner typed a client
+ * name into the setup-link form, a consultant typed one into Pre-Engagement,
+ * and the two were joined only by normClient() — so "Newell Brands" and
+ * "Newell Brands Inc" produced a key that was stored, shown as active, and
+ * never used, while the work quietly ran on the firm's credential.
+ *
+ * Requiring the engagement first is also the correct ORDER: the client comes
+ * into existence once, server-side, with a minted code (migration 025), and a
+ * credential attaches to that rather than to a string someone retypes.
+ */
+async function requireKnownClient(
+  tenantId: string, clientName: string, reply: any
+): Promise<boolean> {
+  const id = await engagementIdFor(tenantId, clientName);
+  if (id) return true;
+
+  /*
+   * v5.34.67, second pass. An engagement is not the only thing that makes a
+   * client real here.
+   *
+   * The first version of this guard required one, full stop — and live testing
+   * found what that costs within a minute: "ZZ BYOK Test" had an active key and
+   * a fallback grant and no engagement row, so its key kept working while every
+   * way to manage it disappeared. Refusing to let someone re-issue a grant for
+   * a client who demonstrably already has one is a worse failure than the typo
+   * this guard exists to catch, and the typo risk does not apply to a name that
+   * is already on file.
+   *
+   * A brand-new unknown name is still refused, which is the whole point.
+   */
+  const known = (await byokClients(tenantId))
+    .some((x) => normClient(x.clientName) === normClient(clientName));
+  if (known) return true;
+
+  reply.code(409).send({
+    error: "no_such_client",
+    detail:
+      `There is no client called "${clientName}" yet. Create them first — ` +
+      `Pre-Engagement, or assign the client to a consultant who will — then attach the key. ` +
+      `Attaching to a name that does not exist yet produces a key that is stored, ` +
+      `shows as active, and is never used.`,
+  });
+  return false;
+}
 
 /**
  * Vendor names as a consultant would say them (v5.34.64).
@@ -125,6 +174,19 @@ export async function byokRoutes(app: FastifyInstance, deps: ByokDeps): Promise<
     return true;
   };
 
+  /**
+   * The clients the key screens may act on (v5.34.67).
+   *
+   * Not /api/engagements: that lists only registered clients, and the three
+   * pickers must also be able to reach a client who already has a key or a
+   * grant without one — otherwise tightening what may be attached strands what
+   * already is. See byokClients().
+   */
+  app.get("/api/byok/clients", async (req, reply) => {
+    if (!ownerOnly(req, reply)) return;
+    return { clients: await byokClients(req.ctx!.tenantId) };
+  });
+
   app.get("/api/byok/keys", async (req, reply) => {
     if (!ownerOnly(req, reply)) return;
     return { keys: await listKeys(req.ctx!.tenantId) };
@@ -135,6 +197,7 @@ export async function byokRoutes(app: FastifyInstance, deps: ByokDeps): Promise<
     const parsed = CreateInvite.safeParse(req.body);
     if (!parsed.success) { reply.code(400).send({ error: "invalid_input" }); return; }
     const { clientName, provider, sentToEmail } = parsed.data;
+    if (!(await requireKnownClient(req.ctx!.tenantId, clientName, reply))) return;
 
     // The token is returned ONCE, here, and never stored in a readable form.
     const token = randomBytes(32).toString("base64url");
@@ -227,18 +290,35 @@ export async function byokRoutes(app: FastifyInstance, deps: ByokDeps): Promise<
      * preference among them is exactly the feature v5.34.63 shipped.
      */
     const tenantId = req.ctx!.tenantId;
+    if (!(await requireKnownClient(tenantId, parsed.data.clientName, reply))) return;
     const norm = normClient(parsed.data.clientName);
     const theirKeys = (await listKeys(tenantId))
       .filter((k) => k.clientNorm === norm && k.status === "active");
     if (theirKeys.length && !theirKeys.some((k) => k.provider === parsed.data.textVendor)) {
       const held = [...new Set(theirKeys.map((k) => VENDOR_LABEL[k.provider] ?? k.provider))];
+      const want = VENDOR_LABEL[parsed.data.textVendor];
+      /*
+       * v5.34.66. This message used to end "…or grant fallback for this client
+       * first", which was a remedy that does not exist: the check above looks
+       * only at which keys are on file, and a grant changes nothing about it.
+       * Verified in production on 2026-09-13 — granted fallback for ZZ BYOK
+       * Test, retried the preference, got the identical refusal telling me to
+       * grant fallback. A dead end that reads like a next step is worse than a
+       * flat no, because someone will spend time on it.
+       *
+       * The grant and the preference answer different questions on purpose: a
+       * grant says who pays when a key FAILS; a preference says which vendor
+       * runs the work. Offering one as the way around the other conflated them
+       * in the one sentence most likely to be read carefully.
+       */
       reply.code(409).send({
         error: "vendor_not_keyed",
         detail:
           `${parsed.data.clientName} supplies their own ${held.join(" and ")} key, so their work runs on ` +
           `${held.length > 1 ? "those providers" : "that provider"} and is billed to them. ` +
-          `Preferring ${VENDOR_LABEL[parsed.data.textVendor]} would mean running their work on your account instead. ` +
-          `Ask them for a ${VENDOR_LABEL[parsed.data.textVendor]} key, or grant fallback for this client first.`,
+          `Preferring ${want} would mean running their work on your account instead. ` +
+          `To move them to ${want}, ask them for ${/^[AEIOU]/.test(want) ? "an" : "a"} ${want} key — ` +
+          `a fallback grant does not change this, it only covers them when their own key fails.`,
       });
       return;
     }
@@ -274,6 +354,7 @@ export async function byokRoutes(app: FastifyInstance, deps: ByokDeps): Promise<
       reason: z.string().max(500).optional(),
     }).safeParse(req.body);
     if (!parsed.success) { reply.code(400).send({ error: "invalid_input" }); return; }
+    if (!(await requireKnownClient(req.ctx!.tenantId, parsed.data.clientName, reply))) return;
     const grant = await grantFallback({
       tenantId: req.ctx!.tenantId,
       clientName: parsed.data.clientName,
@@ -306,6 +387,37 @@ export async function byokRoutes(app: FastifyInstance, deps: ByokDeps): Promise<
     // Absent is the same answer as "there was nothing to clear": the client
     // simply follows the firm's policy either way.
     await clearRouting(req.ctx!.tenantId, parsed.data.clientName);
+    return { ok: true };
+  });
+
+  app.post("/api/byok/keys/enable", async (req, reply) => {
+    if (!ownerOnly(req, reply)) return;
+    const parsed = z.object({
+      clientName: z.string().min(1).max(200),
+      provider: z.enum(PROVIDERS),
+    }).safeParse(req.body);
+    if (!parsed.success) { reply.code(400).send({ error: "invalid_input" }); return; }
+    const out = await reactivateKey(req.ctx!.tenantId, parsed.data.clientName,
+                                    parsed.data.provider, req.ctx!.userId);
+    if (out === "not_disabled") {
+      reply.code(409).send({
+        error: "not_disabled",
+        detail:
+          `${parsed.data.clientName}'s key is not switched off. A key the provider REFUSED ` +
+          `cannot be turned back on — it has to be replaced, with a new setup link, because ` +
+          `re-enabling it would show "active" for a credential that fails on the next call.`,
+      });
+      return;
+    }
+    if (out === "no_secret") {
+      reply.code(409).send({
+        error: "no_secret",
+        detail:
+          `${parsed.data.clientName}'s key was never stored, so there is nothing to turn back on. ` +
+          `Send them a new setup link.`,
+      });
+      return;
+    }
     return { ok: true };
   });
 

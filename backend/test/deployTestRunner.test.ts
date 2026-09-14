@@ -24,7 +24,7 @@
  * situation that produced them.
  */
 import { describe, it, expect } from "vitest";
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, readdirSync, statSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -93,6 +93,56 @@ describe("v5.34.63 — the Docker regression runner", () => {
     const ignore = join(ROOT, ".dockerignore");
     expect(existsSync(ignore), "no .dockerignore — the host's node_modules would overwrite the image's").toBe(true);
     expect(readFileSync(ignore, "utf8")).toMatch(/node_modules/);
+  });
+
+  it("copies every repo directory the suite reads from", () => {
+    /*
+     * v5.34.64, found by the first real `docker compose run`. The image copied
+     * backend/ and frontend/ only, so five test files — every one that reads a
+     * deploy script — failed to LOAD: their readFileSync is at module top
+     * level, so vitest reported failed suites before a single test executed.
+     *
+     * Asserted by scanning the tests themselves rather than by listing
+     * directories here, so a new test that reaches for a sixth directory fails
+     * this immediately instead of in a container nobody runs for a month.
+     */
+    const testDir = join(ROOT, "backend", "test");
+    const read = (dir: string): string[] =>
+      readdirSync(dir, { withFileTypes: true }).flatMap((e) =>
+        e.isDirectory() ? read(join(dir, e.name))
+        : e.name.endsWith(".ts") ? [readFileSync(join(dir, e.name), "utf8")] : []);
+
+    const wanted = new Set<string>();
+    for (const src of read(testDir)) {
+      // join(ROOT, "deploy", …) and join(__dirname, "..", "..", "deploy", …)
+      for (const m of src.matchAll(/"\.\.",\s*"\.\.",\s*"([a-zA-Z0-9_.-]+)"/g)) wanted.add(m[1]);
+      for (const m of src.matchAll(/join\(\s*ROOT\s*,\s*"([a-zA-Z0-9_.-]+)"/g)) wanted.add(m[1]);
+      // securityAuditFixes wraps its own reader: ROOT(".gcloudignore"). Only the
+      // first path segment matters — ROOT("deploy/deploy.sh") needs deploy/.
+      for (const m of src.matchAll(/\bROOT\(\s*"([a-zA-Z0-9_.-]+)/g)) wanted.add(m[1]);
+    }
+    wanted.delete("..");          // ROOT itself
+    wanted.delete("backend");     // the WORKDIR
+
+    for (const dir of wanted) {
+      // The same patterns also match repo-root FILES — join(ROOT, ".dockerignore")
+      // — and a file is not something COPY needs a line of its own for. Ask the
+      // filesystem rather than maintaining a list of exceptions.
+      const p = join(ROOT, dir);
+      if (!existsSync(p)) continue;
+      /*
+       * Files and directories both matter, and both were missing: the first
+       * container run failed five suites on deploy/ and then two more on the
+       * repo-root dotfiles, which no directory COPY reaches. A file needs its
+       * name on a COPY line exactly as a directory does.
+       */
+      const isDir = statSync(p).isDirectory();
+      expect(
+        new RegExp(`^COPY\\s[^\\n]*(?<![\\w.-])${dir.replace(/\./g, "\\.")}(\\s|$)`, "m").test(dockerfile),
+        `the suite reads ${dir}${isDir ? "/" : ""} but the image never copies it — `
+        + `those tests cannot load inside the container`
+      ).toBe(true);
+    }
   });
 
   it("runs all three tiers, not just the one that needs nothing", () => {

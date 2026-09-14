@@ -297,15 +297,31 @@ describe("LiveInterview keeps ownership across a renewal", () => {
 /* ── v5.34.23 ─────────────────────────────────────────────────────────────── */
 
 function makeWorld23(flags: any = {}, extra: Record<string, unknown> = {}) {
+  const localStorage = { _s: {} as any, getItem(k: string) { return this._s[k] ?? null; }, setItem(k: string, v: string) { this._s[k] = v; }, removeItem(k: string) { delete this._s[k]; } };
   return makeWorld({
     VYNE_LIVE_FLAGS: flags,
     VYNE_UTTERANCE_GAP_MS: 30,
     VYNE_IGNORED_WATCHDOG_MS: 80,
     VYNE_MIC_SILENT_WARN_MS: 80,
-    localStorage: { _s: {} as any, getItem(k: string) { return this._s[k] ?? null; }, setItem(k: string, v: string) { this._s[k] = v; }, removeItem(k: string) { delete this._s[k]; } },
+    localStorage,
     ...extra,
   });
 }
+/**
+ * Poll until a condition holds, rather than sleeping and hoping. (v5.34.69)
+ *
+ * Fails with the caller's own sentence on timeout, so a genuine regression
+ * reads as what broke instead of as a bare timeout.
+ */
+async function waitFor(cond: () => boolean, what: string, ms = 2000): Promise<void> {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    if (cond()) return;
+    await new Promise((r) => setTimeout(r, 2));
+  }
+  throw new Error(`timed out after ${ms}ms waiting: ${what}`);
+}
+
 const audioOnly = (sent: any[]) => sent.filter((f) => f?.realtimeInput?.audio);
 const rtKeys = (sent: any[]) => sent.filter((f) => f?.realtimeInput).map((f) => Object.keys(f.realtimeInput)[0]);
 
@@ -326,7 +342,19 @@ describe("v5.34.23 — nothing on the uplink before setupComplete", () => {
     };
     const s = new w.win.vyneLive.Session({});
     const p = s.start();
-    await wait(15);                               // OPEN happened, setupComplete swallowed
+    /*
+     * v5.34.69: wait for the CONDITION, not for a duration.
+     *
+     * This was `await wait(15)` — a fixed 15ms bet that the socket had opened.
+     * It holds on an idle machine and loses under load: reproduced by running
+     * the suite with eight workers on two cores, where it failed while passing
+     * in isolation. A timing test that fails when the machine is busy teaches
+     * people to re-run rather than to look, which is how a real regression here
+     * would get waved through — and what this guards is that nothing reaches
+     * Google's uplink before setupComplete.
+     */
+    await waitFor(() => s.ws?.readyState === 1 && !!pending,
+                  "the socket never opened, or setupComplete was never swallowed");
     expect(s.ws.readyState).toBe(1);
     expect(s.state).toBe("connecting");
     feed(w, speechFrame(), 3);
@@ -633,7 +661,10 @@ describe("v5.34.29 — session continuity: resumption handle + goAway handover",
     // v5.34.43: and that nudge is a TRIGGER, not an instruction — the long
     // form made the native-audio model answer in text at the handover.
     const texts = w.sent.map((f) => f?.clientContent?.turns?.[0]?.parts?.[0]?.text || "").filter(Boolean);
-    expect(texts.some((t) => /briefly renewed; you still have the whole conversation/.test(t))).toBe(true);
+    // v5.34.73 reworded the nudge to scope it to the renewal TURN (it had become
+    // standing behaviour — 50 turns opening "I am still here"). Match the part
+    // that distinguishes the resumed variant, not its punctuation.
+    expect(texts.some((t) => /briefly renewed and you still have the whole conversation/.test(t))).toBe(true);
     expect(texts.some((t) => /renewed mid-interview/.test(t))).toBe(false);
     expect(w.trace()).toMatch(/resumedWithHandle":true/);
   });
@@ -1231,7 +1262,16 @@ describe("v5.34.44 — the nudge names an action, and a socket error is survivab
      */
     expect(nudge[0]).not.toBe("Please continue.");
     expect(nudge[0].length).toBeGreaterThan(60);
-    expect(nudge[0]).toMatch(/say you are still here/i);
+    // The v5.34.43 lesson is that the nudge must name ACTIONS. v5.34.73 kept
+    // that and added a scope, because both actions had become permanent: three
+    // renewals produced 50 turns opening "I am still here" and one question
+    // asked 40 times (voice-runs/, 2026-09-13). Assert the actions AND the
+    // scope — the scope is the new regression risk.
+    expect(nudge[0]).toMatch(/say .*you are still there/i);
+    expect(nudge[0]).toMatch(/ask your last question once more/i);
+    expect(nudge[0]).toMatch(/^Just for this one turn/i);
+    expect(nudge[0], "the nudge must say not to carry itself forward")
+      .toMatch(/do not open any later turn by saying you are still there/i);
     LI.stop("finished");
   });
 
@@ -1762,5 +1802,217 @@ describe("v5.34.52 — usage is accumulated per turn, not maxed across the sessi
     // through two releases.
     expect(FE_VOICE).toContain("bits.push('usage');");
     expect(FE_VOICE).toContain("detail.usageOut = msg.usageMetadata.responseTokenCount;");
+  });
+});
+
+/**
+ * v5.34.75 — a turn that GENERATES and never COMPLETES still ends.
+ *
+ * ── The defect ──────────────────────────────────────────────────────────────
+ *
+ * vyne-live.js closed a model turn in exactly one place, `if (f.turnComplete)`,
+ * and that branch is what banks the turn's usage, ends the playback run, clears
+ * the per-turn flags and returns the state machine to 'idle'.
+ * `generationComplete` was parsed into the frame object and then used for
+ * nothing but a log line.
+ *
+ * On models/gemini-3.1-flash-live-preview — what production serves — the server
+ * sometimes sends generationComplete and never follows it with turnComplete.
+ * Counted on the 30-minute recording of 2026-09-13:
+ *
+ *   voice-record.log  (3.1-flash-live-preview) : 26 generationComplete, 23 turnComplete
+ *   voice-runs/…      (2.5-flash-native-audio) : 102 generationComplete, 145 turnComplete
+ *
+ * Three turns generated and never closed, each pinning _turnState at 'speaking'
+ * for the rest of that session. The voice harness drives the whole conversation
+ * off the speaking → idle edge, so it died outright — half of a thirty-minute
+ * recording spent with a dead uplink, the model waiting for someone who had
+ * stopped talking. In the product the cost is quieter: onTurnState consumers
+ * believe the interviewer is mid-sentence, the goAway idle check defers a
+ * renewal that is not actually mid-turn, and usage.turns under-counts.
+ *
+ * Token totals survive either way — _turnUsage holds the max seen and stop()
+ * banks it — so this is not a billing fault and these tests do not claim one.
+ */
+describe("v5.34.75 — generationComplete closes a turn turnComplete abandoned", () => {
+  const GRACE = 60;   // the shipped default is 1200ms; shortened here
+  const w75 = () => makeWorld23({}, { VYNE_TURN_CLOSE_GRACE_MS: GRACE });
+
+  /** Start a session and get it speaking, the way a real turn begins. */
+  async function speaking(w: any) {
+    const states: string[] = [];
+    const LI = w.win.vyneLiveInterview.create({ onTurnState: (s: string) => states.push(s) });
+    await LI.start(); await wait(10);
+    w.sockets[0].speak();
+    await wait(5);
+    return { LI, ws: w.sockets[0], states };
+  }
+
+  it("the regression: the turn ends even though turnComplete never arrives", async () => {
+    const w = w75();
+    const { LI, ws, states } = await speaking(w);
+    expect(states).toContain("speaking");
+
+    ws.frame({ generationComplete: true });
+    await wait(GRACE * 5);
+
+    expect(states.at(-1), "the turn never closed — state stayed pinned at 'speaking'").toBe("idle");
+    expect(LI.session._salvagedTurns).toBe(1);
+    LI.stop("finished");
+  });
+
+  it("says so in the trace, with a !!! so it is not mistaken for routine", async () => {
+    const w = w75();
+    const { LI, ws } = await speaking(w);
+    ws.frame({ generationComplete: true });
+    await wait(GRACE * 5);
+    expect(w.trace()).toMatch(/!!! turnComplete never arrived after generationComplete/);
+    LI.stop("finished");
+  });
+
+  it("does NOT fire when turnComplete arrives normally", async () => {
+    /*
+     * The negative control, and the one that matters most: on every healthy
+     * turn both frames arrive together, so this must never double-close.
+     */
+    const w = w75();
+    const { LI, ws, states } = await speaking(w);
+    ws.frame({ generationComplete: true, turnComplete: true });
+    await wait(GRACE * 5);
+
+    expect(states.at(-1)).toBe("idle");
+    expect(LI.session._salvagedTurns || 0, "a healthy turn was counted as salvaged").toBe(0);
+    expect(w.trace()).not.toMatch(/!!! turnComplete never arrived/);
+    LI.stop("finished");
+  });
+
+  it("does not fire when turnComplete merely arrives LATE", async () => {
+    // Inside the grace window the ordinary path must still own the close.
+    const w = w75();
+    const { LI, ws } = await speaking(w);
+    ws.frame({ generationComplete: true });
+    await wait(GRACE / 3);
+    ws.turnComplete();
+    await wait(GRACE * 5);
+    expect(LI.session._salvagedTurns || 0).toBe(0);
+    LI.stop("finished");
+  });
+
+  it("a new turn starting cancels a pending salvage", async () => {
+    /*
+     * generationComplete followed by more audio means the model kept going.
+     * Closing the turn underneath it would end one that is still running.
+     */
+    const w = w75();
+    const { LI, ws, states } = await speaking(w);
+    ws.frame({ generationComplete: true });
+    await wait(GRACE / 3);
+    ws.speak();
+    await wait(GRACE * 5);
+    expect(LI.session._salvagedTurns || 0).toBe(0);
+    expect(states.at(-1)).toBe("speaking");
+    LI.stop("finished");
+  });
+
+  it("banks the turn's usage on the salvaged path, exactly once", async () => {
+    // _closeTurn is shared with turnComplete precisely so a salvaged turn and a
+    // healthy one leave identical state behind.
+    const w = w75();
+    const { LI, ws } = await speaking(w);
+    ws.onmessage?.({ data: JSON.stringify({ usageMetadata: { promptTokenCount: 120, responseTokenCount: 40 } }) });
+    await wait(5);
+    ws.frame({ generationComplete: true });
+    await wait(GRACE * 5);
+    expect(LI.session.usage.tokensIn).toBe(120);
+    expect(LI.session.usage.tokensOut).toBe(40);
+    expect(LI.session.usage.turns).toBe(1);
+    LI.stop("finished");
+  });
+});
+
+/**
+ * v5.34.75 — the interview says when time is running short.
+ *
+ * interviewerPersona.ts has carried the rule since v5.34.73: "If you are told
+ * that time is running short and you still have ground to cover, say so plainly
+ * before the end ... they can pick it up another time." It shipped with nothing
+ * to trigger it, which made it inert — a session hit its ceiling and simply
+ * stopped, with questions outstanding and nothing said about it.
+ *
+ * The trigger needs a PLANNED length, and the product does not record one
+ * anywhere (no duration on the invite, none on the engagement). So it arms only
+ * when a caller supplies plannedMinutes; the voice harness does, which is what
+ * these tests stand in for. Without it, nothing fires and behaviour is
+ * unchanged — which is why the "never arms" case below is load-bearing.
+ */
+describe("v5.34.75 — the wrap-up notice", () => {
+  const w75 = (extra: Record<string, unknown> = {}) => makeWorld23({}, extra);
+  /** Text this world has actually put on the wire (sentText is scoped elsewhere). */
+  const wireText = (w: any) =>
+    w.sent.map((f: any) => f?.clientContent?.turns?.[0]?.parts?.[0]?.text || "").filter(Boolean);
+  const notices = (w: any) => wireText(w).filter((t: string) => /time set aside/.test(t));
+
+  it("never arms when the caller did not say how long the interview is", async () => {
+    const w = w75();
+    const LI = w.win.vyneLiveInterview.create({});
+    await LI.start(); await wait(20);
+    expect(LI._wrapUpTimer, "armed a countdown against a length nobody set").toBeFalsy();
+    expect(w.trace()).not.toMatch(/wrap-up notice armed/);
+    LI.stop("finished");
+  });
+
+  it("arms when plannedMinutes is given, and says so in the trace", async () => {
+    const w = w75({ VYNE_WRAPUP_LEAD_MS: 60000 });
+    const LI = w.win.vyneLiveInterview.create({ plannedMinutes: 30 });
+    await LI.start(); await wait(20);
+    expect(w.trace()).toMatch(/wrap-up notice armed/);
+    LI.stop("finished");
+  });
+
+  it("sends a ONE-TURN notice naming the choice, not a bare 'time is up'", async () => {
+    /*
+     * Scoped to the turn for the same reason the renewal nudge is: the previous
+     * unscoped nudge became standing behaviour and produced fifty turns opening
+     * "I am still here". And it has to offer the alternative — an interview cut
+     * off with questions outstanding is the failure being fixed, not the cure.
+     */
+    const w = w75({ VYNE_WRAPUP_LEAD_MS: 20 });
+    const LI = w.win.vyneLiveInterview.create({ plannedMinutes: 0.02 });   // ~1.2s
+    await LI.start(); await wait(20);
+    await waitFor(() => notices(w).length > 0, "the wrap-up notice to be sent", 3000);
+
+    const notice = notices(w)[0];
+    expect(notice).toMatch(/^Just for this one turn/);
+    expect(notice).toMatch(/pick it up another time/);
+    expect(notice).toMatch(/close the interview properly instead/);
+    expect(notice).toMatch(/Do not mention the time again after this turn/);
+    LI.stop("finished");
+  });
+
+  it("sends it once, not once per handover", async () => {
+    const w = w75({ VYNE_WRAPUP_LEAD_MS: 20 });
+    const LI = w.win.vyneLiveInterview.create({ plannedMinutes: 0.02 });
+    await LI.start(); await wait(20);
+    await waitFor(() => notices(w).length > 0, "the wrap-up notice to be sent", 3000);
+    LI._sendWrapUp(); LI._sendWrapUp();
+    await wait(30);
+    /*
+     * Count the DECISION, not the frames. open() legitimately resends a line
+     * after 12s of total silence (that retry is why the opening lands at all),
+     * so asserting on wire frames would make this test a hostage to transport
+     * behaviour it is not about. What must happen once is the notice being
+     * decided on and logged.
+     */
+    const decided = (w.trace().match(/sending the wrap-up notice/g) || []).length;
+    expect(decided, "the wrap-up was decided more than once").toBe(1);
+    LI.stop("finished");
+  });
+
+  it("stopping clears the countdown", async () => {
+    const w = w75({ VYNE_WRAPUP_LEAD_MS: 60000 });
+    const LI = w.win.vyneLiveInterview.create({ plannedMinutes: 30 });
+    await LI.start(); await wait(20);
+    LI.stop("finished");
+    expect(LI._wrapUpTimer).toBeFalsy();
   });
 });

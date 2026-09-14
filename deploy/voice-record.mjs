@@ -47,6 +47,22 @@
  * deliberately, so that a cap refusal cannot be mistaken for a voice fault.
  * It also does not run the browser's real AudioContext: the playback QUEUE is
  * ours and is under test, the sound card is not.
+ *
+ * ── What it DOES prove, as of v5.34.74 ──────────────────────────────────────
+ *
+ * The interviewer itself. Until now this file pinned its own three-sentence
+ * system prompt, so the recording exercised the shipped TRANSPORT against a
+ * prompt that existed nowhere else in the product — and the .txt it wrote was
+ * then read as evidence about the product's interviewer. It was not. Question
+ * quality, coverage, repetition and when the interview wrapped up were all
+ * properties of that stub.
+ *
+ * With --instruction-file it runs the real buildInterviewerInstruction output:
+ * persona, dimension agenda, closing rules, and the engagement briefing. Both
+ * the banner and the verdict now state WHICH persona was used, because the
+ * failure this fixes was not a wrong answer — it was a right answer to a
+ * question nobody realised was being asked. Without the flag the stub still
+ * works, and labels itself as the stub everywhere it appears.
  */
 
 import { readFileSync, writeFileSync, appendFileSync, mkdirSync, existsSync,
@@ -75,11 +91,270 @@ const SELFTEST = has("selftest");
  * handover BEFORE a real run is believed. It proves nothing about Google.
  */
 const OFFLINE = has("offline");
+/*
+ * --loop: keep reading the eight scripted answers round and round until the
+ * clock runs out. That is what every run did before v5.34.78, and it is only
+ * honest for a deliberate soak — reaching the ~10-minute handover, or watching
+ * for drift over half an hour. It is NOT how to judge interview quality: past
+ * the first pass the interviewee is repeating itself, so any repetition in the
+ * verdict is the rig's, not the interviewer's. Self-test needs the soak.
+ */
+const LOOP = has("loop") || SELFTEST;
+/*
+ * --offline-close-after N: make the offline stub say a closing line on its Nth
+ * reply. The only way to prove the interview-close detector is wired to a hook
+ * that fires, without spending a paid live run to find out it is not — which is
+ * what v5.34.75 through .77 each did in turn.
+ */
+const OFFLINE_CLOSE_AFTER = Number(arg("offline-close-after", 0)) || 0;
+/*
+ * The closing pattern, at module scope so both the detector and the
+ * "too early to be a close" guard above it read the SAME one. They were one
+ * expression built inline; a guard testing a second copy is a guard that can
+ * silently drift out of agreement with what it guards.
+ *
+ * Deliberately narrow. It is confined to a TEST harness; nothing in the product
+ * keys off wording.
+ */
+const CLOSING_RE = new RegExp([
+  String.raw`(thanks|thank you)[^.?!]{0,40}\b(your time|taking the time)\b`,
+  String.raw`that concludes|concludes our interview`,
+  String.raw`covered everything (i|we)('ve| have)? ?(came|come) for`,
+  String.raw`appreciate[^.?!]{0,25}\b(your time|taking the time)\b`,
+].join("|"));
+/*
+ * Completed exchanges required before any closing language is believed.
+ * The shortest GENUINE close observed ran nine turns; a greeting is turn one.
+ */
+const MIN_TURNS_BEFORE_CLOSE = Number(process.env.VYNE_HARNESS_MIN_TURNS_BEFORE_CLOSE || 3);
+/* One line per run, not one per greeting fragment. */
+let closeIgnored = false;
+/*
+ * Counts replies across the WHOLE run, not per socket. The first version of
+ * this lived inside the stub's socket factory, so every handover reset it to
+ * zero — and offline handovers come every ~25 seconds, so it could never reach
+ * 4 and the stub never closed. Exactly the class of bug this flag exists to
+ * catch, committed while writing the flag.
+ */
+let stubReplies = 0;
 const MINUTES = SELFTEST ? 1.5 : Number(arg("minutes", 14));
 const OUT = arg("out", SELFTEST ? "voice-selftest" : "voice-record");
 const MODEL = arg("model", "models/gemini-2.5-flash-native-audio-latest");
 const VOICE = arg("voice", "Kore");
 const INTERVIEWER = arg("interviewer", "Jack Smith");
+/*
+ * v5.34.74 — the SHIPPED interviewer, not one this file invented.
+ *
+ * Until now mint() pinned its own three-sentence prompt. That made every
+ * judgement ever drawn from a recording about question quality, coverage,
+ * repetition or when the interview wrapped up a judgement about THAT prompt,
+ * while the .txt said "voice-record" and got read as the product. The header
+ * above warns that a broken rig and a broken product look identical; this was
+ * a working rig measuring the wrong subject, which is harder to notice.
+ *
+ * deploy/interviewer-instruction.ts renders the real thing —
+ * buildInterviewerInstruction, agenda, closing rules and a representative
+ * engagement briefing. run-voice-record.sh builds it before stage 4 and passes
+ * it here. PERSONA_SOURCE is reported in the banner and in the verdict, so a
+ * recording can never again be mistaken for something it is not.
+ */
+const INSTRUCTION_FILE = arg("instruction-file", "");
+/*
+ * v5.34.79: live rendering is the DEFAULT when an instruction file was asked
+ * for. --pinned-instruction restores the old behaviour — one instruction for
+ * the whole run — for the rare case where you want the prompt held still.
+ */
+const LIVE_INSTRUCTION = !!INSTRUCTION_FILE && !has("pinned-instruction");
+const HARNESS_PERSONA =
+  `You are ${INTERVIEWER}, conducting an AI-readiness interview. Ask ONE short question at a ` +
+  `time and then wait for the answer. Never summarise the conversation unless asked. Keep every ` +
+  `reply under three sentences.`;
+let SYSTEM_INSTRUCTION = HARNESS_PERSONA;
+let PERSONA_SOURCE = "HARNESS STUB (three sentences — NOT the product's interviewer)";
+if (INSTRUCTION_FILE) {
+  try {
+    const t = readFileSync(isAbsolute(INSTRUCTION_FILE) ? INSTRUCTION_FILE : join(ROOT, INSTRUCTION_FILE), "utf8").trim();
+    if (t.length < 200) throw new Error(`only ${t.length} chars — that is not the shipped persona`);
+    SYSTEM_INSTRUCTION = t;
+    PERSONA_SOURCE = `SHIPPED persona via interviewerPersona.ts (${t.length} chars)`;
+  } catch (e) {
+    console.error(`\n!! could not read --instruction-file: ${e.message}`);
+    console.error("!! refusing to record against the stub prompt and call it the product.\n");
+    process.exit(2);
+  }
+}
+/*
+ * ── LIVE instruction, re-rendered at EVERY mint (v5.34.79) ──────────────────
+ *
+ * --instruction-file renders the shipped persona ONCE, before the run, and
+ * pins it. That was faithful while the instruction was static. It is not any
+ * more.
+ *
+ * v5.34.79 made the product recompute the interview's state at every mint —
+ * which questions have been asked and answered, how many required ones are
+ * left — because a ~10-minute handover starts a session with NO memory of the
+ * conversation, and what it knows about the ground already covered comes only
+ * from the context sent with its grant. A harness that pins one instruction
+ * hands every session the same "nothing asked yet" snapshot: exactly the state
+ * the fix exists to prevent. It would have reported a clean pass on the bug.
+ *
+ * So the harness renders it live, through the SAME buildInterviewerInstruction
+ * the server uses. tsx's ESM loader is registered in-process, so this is a
+ * function call at mint time — no subprocess, nothing to stall a handover.
+ *
+ * If that import fails, the run does NOT quietly fall back to the pinned file
+ * and call itself live: it says which mode it is in, in the banner and in the
+ * verdict, because a harness that lies about what it measured is the one
+ * failure this file exists to make impossible.
+ */
+let renderInstruction = null;
+let liveFixture = null;
+if (LIVE_INSTRUCTION) {
+  try {
+    /*
+     * Import the PERSONA module directly, and read the fixture as JSON.
+     *
+     * Importing deploy/interviewer-instruction.ts from here instead produced
+     * "Cannot require() ES Module ... in a cycle" under the tsx loader. Going
+     * straight to the one function that matters avoids the module graph
+     * entirely, and the fixture both sides read is the same JSON file, so the
+     * harness and the CLI renderer cannot drift apart.
+     */
+    const { register } = await import("../backend/node_modules/tsx/dist/esm/api/index.mjs");
+    register();
+    const persona = await import("../backend/src/llm/interviewerPersona.ts");
+    const fx = JSON.parse(readFileSync(join(ROOT, "deploy", "interviewer-fixture.json"), "utf8"));
+    const isDim = (d) => persona.DIM_CODES.includes(d);
+    const dims = (a) => (a || []).filter(isDim);
+    renderInstruction = (f) => persona.buildInterviewerInstruction({
+      interviewerName: f.interviewerName, clientName: f.clientName, industry: f.industry,
+      intervieweeName: f.intervieweeName, intervieweeRole: f.intervieweeRole,
+      context: f.context, mandatoryCount: f.mandatoryCount, askedCount: f.askedCount,
+      agenda: f.agenda && { lead: dims(f.agenda.lead), cover: dims(f.agenda.cover),
+                            light: dims(f.agenda.light), evidenced: dims(f.agenda.evidenced) },
+    });
+    liveFixture = { ...fx };
+    SYSTEM_INSTRUCTION = renderInstruction({ ...liveFixture, askedCount: 0 });
+    PERSONA_SOURCE = `SHIPPED persona, RE-RENDERED at every mint (${SYSTEM_INSTRUCTION.length} chars at open)`;
+  } catch (e) {
+    console.error(`\n!! could not load the live instruction renderer: ${e.message}`);
+    console.error("!! this run would pin one instruction for the whole interview, which cannot");
+    console.error("!! exercise anything that changes across a handover. Pass --pinned-instruction");
+    console.error("!! to record that way deliberately.\n");
+    process.exit(2);
+  }
+}
+
+/*
+ * The harness's own record of the conversation, kept from onTurns. It is what
+ * the live fixture is derived from — the same two facts the page derives it
+ * from: which questions have been asked and answered, and which required ones
+ * are still outstanding.
+ */
+const askedQuestions = [];      // answered, deduped, oldest first
+const seenQuestion = Object.create(null);
+let pendingQuestion = null;     // asked, not yet answered
+let turnsSeen = 0;              // cursor into turns[], so answers are not skipped
+const mandatoryDone = new Set();
+
+/** The required questions the fixture's background lists, in order. */
+function fixtureMandatory() {
+  const m = /Questions that must be asked before the interview ends:\n([\s\S]*)$/.exec(liveFixture?.context || "");
+  if (!m) return [];
+  return m[1].split("\n").map((l) => l.replace(/^\s*\d+\.\s*/, "").trim()).filter(Boolean);
+}
+
+/*
+ * Same rule the page uses (markAskedMandatoryQuestions): a required question
+ * counts as done when a turn strongly overlaps it AND an answer follows.
+ * Reimplemented rather than shared because the page is a browser file with no
+ * module boundary — the OVERLAP THRESHOLD is the thing that must not drift, so
+ * it is named here rather than buried in an expression.
+ */
+const MQ_OVERLAP = 0.7;
+const MQ_STOP = new Set("the a an of to and or in on for is are you your have has do this that with we i it be as at by how what please confirm".split(" "));
+/*
+ * v5.34.83 — kept in step with interview_agent.html's mqStem/mqTokens/mqOverlap
+ * by interviewNoRepeat.test.ts, which runs the same fixtures through BOTH and
+ * requires identical answers. Two copies exist because one is browser script
+ * and one is Node with no module boundary between them; a test is the only
+ * thing that can stop them drifting, and drift here would make the harness
+ * report coverage the product does not see.
+ */
+const mqStem = (w) => w.replace(/(ies)$/, "y").replace(/(sses|shes|ches|xes)$/, (m) => m.slice(0, -2))
+  .replace(/(ing|ed|es|s)$/, "");
+const mqTokens = (text) => String(text || "").toLowerCase().replace(/[^a-z0-9\s]/g, " ").split(/\s+/)
+  .filter((w) => w.length > 3 && !MQ_STOP.has(w)).map(mqStem);
+function mqOverlap(turnText, questionText) {
+  const want = [...new Set(mqTokens(questionText))];
+  if (!want.length) return 0;
+  const got = new Set(mqTokens(turnText));
+  return want.filter((w) => got.has(w)).length / want.length;
+}
+function matchesMandatory(turnText, question) {
+  return mqTokens(question).length > 0 && mqOverlap(turnText, question) >= MQ_OVERLAP;
+}
+
+/** Fold one completed VYNE turn into the record. Answered-ness is resolved later. */
+function recordAgentTurn(text) {
+  const qs = String(text).split(/(?<=[?])\s+/)
+    .filter((s) => s.includes("?"))
+    .map((s) => s.replace(/\s+/g, " ").trim())
+    .filter((s) => s.length > 12);
+  if (!qs.length) return;
+  pendingQuestion = { text: qs[qs.length - 1], all: qs };
+}
+
+/** The interviewee answered, so everything still pending is now asked AND answered. */
+function settlePendingQuestion() {
+  if (!pendingQuestion) return;
+  for (const q of pendingQuestion.all) {
+    const k = q.toLowerCase().replace(/[^a-z0-9 ]/g, "").replace(/\s+/g, " ");
+    if (!seenQuestion[k]) { seenQuestion[k] = 1; askedQuestions.push(q.length > 220 ? q.slice(0, 220) + "…" : q); }
+    fixtureMandatory().forEach((mq, i) => { if (matchesMandatory(q, mq)) mandatoryDone.add(i); });
+  }
+  pendingQuestion = null;
+}
+
+/**
+ * The instruction for the session about to be minted.
+ *
+ * Mirrors buildLiveContext() in interview_agent.html: the asked list and the
+ * OUTSTANDING required questions, with the counts that match them. If the two
+ * ever disagree the interviewer is told a question is required and that it has
+ * not been asked, which is an instruction to ask it again — the exact fault
+ * this version fixes.
+ */
+function currentInstruction() {
+  if (!renderInstruction || !liveFixture) return SYSTEM_INSTRUCTION;
+  const all = fixtureMandatory();
+  const due = all.filter((_, i) => !mandatoryDone.has(i));
+  const base = String(liveFixture.context || "")
+    .replace(/Questions that must be asked before the interview ends:\n[\s\S]*$/, "").trimEnd();
+  const parts = [base];
+  if (askedQuestions.length || pendingQuestion) {
+    const block = [];
+    if (askedQuestions.length) {
+      block.push("", "Questions you have ALREADY asked in this interview, and which have been answered:");
+      askedQuestions.forEach((q, i) => block.push(`${i + 1}. ${q}`));
+    }
+    if (pendingQuestion) {
+      block.push("", "This one was asked but NOT answered — the interview was interrupted here. Ask it again:", pendingQuestion.text);
+    }
+    parts.push(block.join("\n"));
+  }
+  if (due.length) {
+    parts.push(["", "Questions that must be asked before the interview ends:"]
+      .concat(due.map((q, i) => `${i + 1}. ${q}`)).join("\n"));
+  }
+  return renderInstruction({
+    ...liveFixture,
+    context: parts.join("\n"),
+    mandatoryCount: due.length,
+    askedCount: askedQuestions.length,
+  });
+}
+
 const HOST = "generativelanguage.googleapis.com";
 const KEY = process.env.GEMINI_API_KEY || "";
 
@@ -386,10 +661,9 @@ async function mint(setupExtra) {
       responseModalities: ["AUDIO"],
       speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: VOICE } } },
     },
-    systemInstruction: { parts: [{ text:
-      `You are ${INTERVIEWER}, conducting an AI-readiness interview. Ask ONE short question at a ` +
-      `time and then wait for the answer. Never summarise the conversation unless asked. Keep every ` +
-      `reply under three sentences.` }] },
+    /* v5.34.79: computed HERE, not captured. Every mint — the opening one and
+     * every ~10-minute handover — gets the interview as it actually stands. */
+    systemInstruction: { parts: [{ text: currentInstruction() }] },
     inputAudioTranscription: {},
     outputAudioTranscription: {},
     contextWindowCompression: { triggerTokens: 25600, slidingWindow: { targetTokens: 12800 } },
@@ -476,9 +750,46 @@ if (OFFLINE) {
   win.fetch = async (url) => {
     const u = String(url);
     if (u.endsWith("/close")) return { ok: true, status: 200, json: async () => ({}) };
+    /*
+     * v5.34.78 — THIS STUB USED TO COUNT EVERY FETCH AS A GRANT MINT.
+     *
+     * It caught /api/llm/generate too. That never showed up because the offline
+     * stub sent no transcript, so vyne-live-interview.js never had two turns to
+     * score and the scoring call was never made. The moment the stub started
+     * speaking (see the reply() comment), the first score request at 15.5s was
+     * counted as grant attempt 2, ate one of the three injected transport
+     * faults, and shifted the whole retry-gap window — the fault check then
+     * reported 9.9s / 4.0s / 8.0s against an expected 4 / 8 / 16 and FAILED a
+     * backoff that was in fact exactly right.
+     *
+     * Which is the harness's own trap once more: a rig fault reported as a
+     * product fault, in the stage built to rule that out. Mints are the grant
+     * endpoint, and nothing else.
+     */
+    if (!/\/api\/voice\/live-session$/.test(u.split("?")[0])) {
+      // Any other product call — scoring, most of all. Succeed quietly; its
+      // body is not what this harness measures.
+      /*
+       * v5.34.83 — a score-shaped reply, so the page stops crying wolf.
+       *
+       * When the stub started speaking (v5.34.79) the page began making its real
+       * scoring call, and a "{}" answer made it log "scoring pass failed
+       * unparseable_score_response" on every offline run. The failure is
+       * swallowed by design and changed nothing, but a rig that prints a red
+       * line for its own stub trains you to ignore red lines.
+       */
+      return { ok: true, status: 200, json: async () => ({
+        text: JSON.stringify({ scores: {}, findings: [], rationale: "offline stub" }) }) };
+    }
     mintAttempts++;
     mintAt.push(now());
-    if (mintAttempts > 1 && mintFailuresLeft > 0) {
+    /*
+     * Refuse only DURING a handover. The injected fault is a transport fault on
+     * renewal, which is the code path that has retry logic; refusing a mint
+     * that no ladder is waiting on just removes a grant from the count and
+     * teaches nothing.
+     */
+    if (mintAttempts > 1 && mintFailuresLeft > 0 && renewingSince !== null) {
       mintFailuresLeft--;
       // Snapshot the handover count as the burst ends: every attempt in it
       // belonged to ONE handover, and .46 counted each as a new one.
@@ -509,7 +820,22 @@ if (OFFLINE) {
         const pcm = new Int16Array(b.buffer, b.byteOffset, b.length / 2);
         let peak = 0; for (let i = 0; i < pcm.length; i++) peak = Math.max(peak, Math.abs(pcm[i]));
         if (peak > 2000) { quiet = 0; spoke = true; }
-        else if (spoke && ++quiet > 8) { spoke = false; quiet = 0; setTimeout(reply, 600); }
+        else if (spoke && ++quiet > 8) {
+          spoke = false; quiet = 0;
+          /*
+           * v5.34.79 — the stub now transcribes the INTERVIEWEE too.
+           *
+           * It only ever emitted the agent side, so a "You" turn never reached
+           * vyne-live-interview.js and turns[] held one speaker. Everything
+           * that keys off an answer having been given — the asked-and-answered
+           * record the next mint's instruction is built from — was therefore
+           * untestable offline. That is how the greeting false positive got
+           * through: the offline check could not see the half of the
+           * conversation the bug lived in.
+           */
+          frame({ serverContent: { inputTranscription: { text: "That is a fair question, and here is the answer." } } });
+          setTimeout(reply, 600);
+        }
       }
       if (o.clientContent) setTimeout(reply, 700);       // a text nudge gets an answer too
     };
@@ -517,6 +843,53 @@ if (OFFLINE) {
     function reply() {
       if (closed) return;
       frame({ serverContent: { modelTurn: { parts: [{ text: "Thinking about that." }] } } });
+      /*
+       * v5.34.78 — THE STUB NOW SPEAKS A TRANSCRIPT.
+       *
+       * It never did, and that is why the offline self-check — the thing whose
+       * whole job is to prove the rig before a real run is believed — could not
+       * see that the harness's interview-close detector had never once fired.
+       * Everything downstream of outputTranscription was untestable offline, so
+       * a dead hook there looked identical to a clean run. That is the harness's
+       * own stated trap ("a broken rig and a broken product look identical")
+       * reappearing inside the tool built to escape it.
+       *
+       * Fragmented deliberately, the way the real API sends it, because the
+       * fragmentation is half of what the old detector got wrong: it matched
+       * multi-word patterns against sub-word pieces.
+       */
+      stubReplies++;
+      /*
+       * v5.34.79 — the stub now GREETS the way the real model greets.
+       *
+       * Verbatim from the 2026-09-14 03:40 run, whose opening was "Hello,
+       * Alex. I'm Jack Smith. Thanks for taking the time today." That matched
+       * the closing pattern and ended a live run at eleven seconds with zero
+       * replies. The offline check could not have caught it: the stub's first
+       * line was a question, so the one utterance in an interview most likely
+       * to trip a farewell pattern was the one utterance never simulated.
+       */
+      /*
+       * Reply 2 asks a REQUIRED question, verbatim from the fixture.
+       *
+       * Without it the offline check never exercises the path that takes a
+       * question off the outstanding list — the half of v5.34.79 that stops
+       * the interviewer asking "who signs off before a model affects a
+       * production line" three times in 43 seconds. The stub's generic
+       * "question N?" lines can never match a mandatory question, so the
+       * shrink was untestable without a paid run. Twice today a live run was
+       * spent discovering something the offline stub was simply not saying.
+       */
+      const mq = fixtureMandatory();
+      const line = stubReplies === 1
+        ? "Hello, Alex. I'm Jack Smith. Thanks for taking the time today. How is your data organised?"
+        : (stubReplies === 2 && mq.length)
+        ? mq[0]
+        : (OFFLINE_CLOSE_AFTER > 0 && stubReplies >= OFFLINE_CLOSE_AFTER)
+        ? "I think I've covered everything I came for. Thanks again for your time, Alex."
+        : `And what does that look like in practice, question ${stubReplies}?`;
+      line.split(/(?<=\s)/).forEach((w, i) => setTimeout(
+        () => closed || frame({ serverContent: { outputTranscription: { text: w } } }), 60 + i * 25));
       const dur = 2.2, n = Math.round(dur * OUT_RATE), pcm = new Int16Array(n);
       for (let i = 0; i < n; i++) {
         const env = Math.min(1, i / 2000, (n - i) / 2000);
@@ -545,6 +918,36 @@ if (OFFLINE) {
 const ctx = vm.createContext(win);
 vm.runInContext(FE("vyne-live.js"), ctx, { filename: "vyne-live.js" });
 vm.runInContext(FE("vyne-live-interview.js"), ctx, { filename: "vyne-live-interview.js" });
+
+/*
+ * ── The SCORING path needs one function from vyne-client.js (v5.34.83) ──────
+ *
+ * Every offline run since v5.34.79 printed "scoring pass failed
+ * unparseable_score_response". It reads as the scorer being broken. It is not:
+ * vyne-live-interview.js parses the scoring reply with window.vyneParseJson,
+ * which lives in vyne-client.js — a file the harness does not load, because it
+ * is page furniture. So `parsed` was null whatever the reply contained, and no
+ * payload from the stub could ever have satisfied it. The line was about a
+ * missing file in the RIG and said nothing about the product.
+ *
+ * The REAL function is lifted out of vyne-client.js rather than reimplemented.
+ * A hand-rolled JSON.parse here would be the harness grading itself against a
+ * parser the product does not use, which is the fault this whole file exists
+ * to avoid. If the extraction ever fails, say so once and carry on: scoring is
+ * not what a voice recording measures, and a missing parser must not stop a run.
+ */
+try {
+  const client = FE("vyne-client.js");
+  const a = client.indexOf("function vyneParseJsonDetailed(text) {");
+  const b = client.indexOf("function vyneParseJson(text)", a);
+  const end = client.indexOf("\n", b);
+  if (a < 0 || b < 0) throw new Error("vyneParseJson not found in vyne-client.js");
+  vm.runInContext(
+    `${client.slice(a, end)}\nwindow.vyneParseJson = vyneParseJson;`,
+    ctx, { filename: "vyne-client.js#vyneParseJson" });
+} catch (e) {
+  say(`(scoring replies will not be parsed: ${e.message} — this affects nothing a recording measures)`);
+}
 say(`loaded shipped frontend v${win.VYNE_VERSION} (vyne-live.js + vyne-live-interview.js)`);
 
 /* ── the uplink pump: real frames through the real ScriptProcessor path ───── */
@@ -587,6 +990,8 @@ function enqueueAnswer(pcm) {
 /* ── drive the interview ──────────────────────────────────────────────────── */
 
 const turns = [];
+/** When the interviewer said goodbye, in seconds. null = it never did. */
+let closedAt = null;
 let state = "idle";
 let speakingSince = null;
 let askedAt = null;
@@ -595,7 +1000,18 @@ let firstAudioAt = null;
 let ended = null;
 let renewals = 0;
 let renewRetries = 0;   // retries inside the CURRENT handover (v5.34.47)
+/* When the current handover began, or null between handovers. Read by the
+ * stall watchdog, which must not count a reconnect ladder as silence. */
+let renewingSince = null;
+/* Set once the scripted interviewee runs out of distinct material (v5.34.78). */
+let scriptExhaustedAt = null;
 let silentRenewals = 0;
+/* v5.34.94 — scoring, which this rig watched none of until now. See the
+ * onScore/onScoreError/onScoringDead handlers and the verdict lines. */
+let scoreCalls = 0;
+let scoreErrors = 0;
+let scoringDead = null;
+const scoredDims = new Set();
 let chokes = 0;                 // interrupted while we were not speaking
 let lastTurnCompleteAt = 0;
 /* Set the instant finish() starts. Guards the periodic trace flush, and makes
@@ -611,6 +1027,16 @@ const LI = win.vyneLiveInterview.create({
   intervieweeName: "Alex Interviewee",
   intervieweeRole: "Head of Technology and Data",
   industry: "Manufacturing",
+  /*
+   * v5.34.75 — the harness knows how long the interview was booked for, so it
+   * is what exercises the wrap-up notice. interviewerPersona.ts carries the
+   * rule ("if you are told time is running short, say what is left and offer to
+   * pick it up another time"); vyne-live-interview.js fires it at
+   * plannedMinutes minus WRAPUP_LEAD_MS. The product has no booked-length field
+   * yet, so this is currently the only caller — see _armWrapUp for what would
+   * need to exist to turn it on for real interviews.
+   */
+  plannedMinutes: MINUTES,
   onTurnState: (s) => {
     const prev = state; state = s;
     if (s === "speaking" && prev !== "speaking") {
@@ -646,6 +1072,7 @@ const LI = win.vyneLiveInterview.create({
     }
     renewals = n;
     renewRetries = 0;
+    renewingSince = Date.now();
     say(`— handover #${n} starting (this is the ~10-minute one) —`);
   },
   onRenewed: () => {
@@ -653,11 +1080,151 @@ const LI = win.vyneLiveInterview.create({
       ? `— handover complete after ${renewRetries} retr${renewRetries === 1 ? "y" : "ies"}, interview continues —`
       : `— handover complete, interview continues —`);
     renewRetries = 0;
+    renewingSince = null;
+    /*
+     * v5.34.78 — coming back from a handover is not a stall recovery.
+     *
+     * The watchdog is suppressed for the duration of the retry ladder, so the
+     * moment the handover completed it saw 38 seconds of accumulated silence
+     * and fired half a second later — logging "the uplink went quiet and the
+     * watchdog restarted it" about a handover that had just succeeded. That
+     * line is the run's alarm for a dead uplink; spending it on the normal case
+     * is how an alarm stops meaning anything.
+     *
+     * A real interviewee picks the conversation back up after a reconnect. So
+     * does this: restart the silence clock, and if nothing is in flight a beat
+     * later, cue the next answer as ordinary conversation rather than as a
+     * recovery. If the session is genuinely dead, nothing here helps and the
+     * watchdog fires on its own merits 25 seconds from now — which is the
+     * report we actually want.
+     */
+    lastCueAt = Date.now();
+    setTimeout(() => {
+      if (ended || answering || uplinkQueue.length) return;
+      if (state === "speaking" || state === "thinking") return;
+      nextAnswer();
+    }, 1200);
   },
   onRenewSilent: () => { silentRenewals++; say(`!! the renewed session did not speak — dropping the handle and reconnecting`); },
   onQuotaExhausted: () => { say(`!! GOOGLE IS RATE-LIMITING THIS PROJECT — the run below is INVALID FOR COMPARISON`); },
   onReplyWithoutAudio: () => { say(`!! a reply arrived as text with no voice`); },
-  onAgentText: () => {},
+  /*
+   * v5.34.75 — notice when the interviewer CLOSES, and stop.
+   *
+   * The shipped persona is told to end the interview once it has what it came
+   * for, and on 2026-09-13 it did: "I think I have a good picture of how things
+   * work across technology, data, and potential governance. Thanks for your
+   * time." The harness then kept reading scripted answers at it, so it closed
+   * again a few turns later, and the transcript showed two goodbyes — read at
+   * first glance as the closing rule failing when it was the rig refusing to
+   * leave.
+   *
+   * A real interviewee stops talking when the interview ends. So does this now.
+   * The pattern is deliberately narrow and sits in a TEST harness; nothing in
+   * the product keys off wording.
+   */
+  /*
+   * v5.34.78 — THIS HOOK HAD NEVER ONCE FIRED.
+   *
+   * It was written as onAgentText, which is a vyne-live.js callback.
+   * vyne-live-interview.js INTERCEPTS that name: it accumulates the fragment
+   * into pendingAgent and re-emits it as onPartialAgent. It does not forward
+   * onAgentText, so the harness's handler sat there, regex carefully widened
+   * twice, never called. "closed by agent: no" was not a measurement. It was
+   * a field that could only ever print "no".
+   *
+   * Two things had to be wrong together for that to survive review: the hook
+   * name was never checked against the module that actually calls it, and the
+   * one assertion that would have caught it — a run where the interviewer
+   * demonstrably closed, which is every run since v5.34.73 — was read from the
+   * transcript by eye instead of from the verdict.
+   *
+   * onTurns is the right hook and is the one the PRODUCT uses: it fires on
+   * turnComplete with the flushed turns array, so the text is a WHOLE turn.
+   * That also fixes a second latent bug — the old handler tested the regex
+   * against sub-word fragments (" your", " time"), which no multi-word pattern
+   * could ever match even if it had been called.
+   */
+  onTurns: (all) => {
+    if (!Array.isArray(all) || !all.length) return;
+    const last = all[all.length - 1];
+    /*
+     * v5.34.79 — keep the harness's own record of the conversation, because
+     * the instruction for the NEXT mint is derived from it. A "You" turn means
+     * whatever question was on the table has now been answered.
+     *
+     * Consume every turn since the last call, not just the newest. _flushPending
+     * pushes the interviewee's turn and THEN the interviewer's, so "You" is
+     * never the last element — reading only the tail saw the questions and none
+     * of the answers, and reported "0 asked and answered" after thirteen
+     * exchanges. turns[] is also capped at 200 and spliced from the front, so
+     * the cursor is clamped rather than trusted.
+     */
+    if (turnsSeen > all.length) turnsSeen = 0;
+    for (; turnsSeen < all.length; turnsSeen++) {
+      const t = all[turnsSeen];
+      if (!t || !t.text) continue;
+      if (t.who === "You") settlePendingQuestion();
+      else if (t.who === "VYNE") recordAgentTurn(t.text);
+    }
+    if (closedAt !== null) return;
+    if (!last || last.who !== "VYNE" || !last.text) return;
+    const t = last.text;
+    const s = String(t).toLowerCase();
+    /*
+     * v5.34.79 — AN INTERVIEW CANNOT CLOSE BEFORE IT HAS STARTED.
+     *
+     * The 2026-09-14 03:40 run ended at ELEVEN SECONDS with zero replies. The
+     * interviewer's greeting was "Hello, Alex. I'm Jack Smith. Thanks for
+     * taking the time today." — and "thanks ... taking the time" is the
+     * closing pattern, because at the end of an interview that is exactly what
+     * it means. The phrase is genuinely ambiguous; only its position is not.
+     *
+     * This became reachable in v5.34.78, which fixed the detector's hook. While
+     * the handler was dead a false positive was impossible, so widening the
+     * regex twice looked free. It was not — it was untested.
+     *
+     * A tighter pattern is the wrong answer: every wording that ends an
+     * interview also appears in pleasantries, and each narrowing trades a false
+     * stop for a missed one, which is the failure that wasted twenty-eight
+     * minutes. So gate on STRUCTURE instead. Three completed exchanges is well
+     * under any real close (the shortest genuine one so far ran nine turns) and
+     * well over any greeting.
+     */
+    if (turns.length < MIN_TURNS_BEFORE_CLOSE) {
+      if (!closeIgnored && CLOSING_RE.test(s)) {
+        closeIgnored = true;
+        say(`(ignoring closing language after only ${turns.length} repl${turns.length === 1 ? "y" : "ies"} — ` +
+            `an interview cannot close before it starts; this is almost certainly a greeting)`);
+        say(`  "${String(t).trim().slice(0, 120)}"`);
+      }
+      return;
+    }
+    /*
+     * v5.34.77 — widened, because it missed the real thing by one word.
+     *
+     * The 2026-09-14 run closed with "I think I've covered everything I came
+     * for. Thanks again for your time, Alex. Take care." The previous pattern
+     * required "thanks for your time" CONTIGUOUS, so "again" defeated it. The
+     * harness then read scripted answers at a finished interview for another
+     * twenty minutes, and that tail is what produced every bad number in the
+     * verdict: one question counted eleven times (it was the interviewer being
+     * talked over while trying to say goodbye), speech share 41% instead of the
+     * real 25%, and "closed by agent: no" about an interview that had closed at
+     * minute nine.
+     *
+     * So: allow words between the thanks and the time, and match the other
+     * shapes it actually uses. Still deliberately narrow — a false positive
+     * ends the run early, which is the more expensive mistake — and still
+     * confined to a TEST harness. Nothing in the product keys off wording.
+     */
+    if (!CLOSING_RE.test(s)) return;
+    closedAt = now();
+    say(`— the interviewer CLOSED the interview at ${closedAt.toFixed(0)}s —`);
+    say(`  "${String(t).trim().slice(0, 160)}"`);
+    // Let the last sentence finish playing before tearing the socket down.
+    setTimeout(() => finish("interviewer closed the interview"), 6000);
+  },
   /*
    * A DEAD INTERVIEW ENDS THE RUN. It does not sit recording silence.
    *
@@ -674,6 +1241,35 @@ const LI = win.vyneLiveInterview.create({
     setTimeout(() => finish(`the interview ended (${r}) — not waiting out the remaining time`), 3000);
   },
   onError: (r) => say(`onError: ${r}`),
+
+  /*
+   * ── v5.34.94: THE SCORING CALLBACKS, WHICH THIS RIG HAS NEVER SUBSCRIBED TO ─
+   *
+   * This is the only harness that runs the SHIPPED vyne-live.js and
+   * vyne-live-interview.js, and it registered onTurns/onEnded/onError but none
+   * of onScore, onScoreError or onScoringDead. So the entire v5.34.85–.88
+   * scoring machinery — the live meter, the consecutive-failure counters, the
+   * time-based stop, and the apology-then-stop the product owner specifically
+   * asked for — could not be exercised by any automated run. The one thing the
+   * interview exists to produce was the one thing the rig did not watch.
+   *
+   * Deliberately PASSIVE: these count and narrate, and change no control flow.
+   * A harness that reacts to a scoring failure would be testing the harness.
+   */
+  onScore: (payload) => {
+    scoreCalls++;
+    const dims = payload && payload.scores ? Object.keys(payload.scores).filter((d) => payload.scores[d] > 0) : [];
+    for (const d of dims) scoredDims.add(d);
+    say(`score pass #${scoreCalls}: ${dims.length ? dims.map((d) => `${d}=${payload.scores[d]}`).join(" ") : "no dimension had evidence yet"}`);
+  },
+  onScoreError: (e) => {
+    scoreErrors++;
+    say(`!! scoring pass FAILED (${scoreErrors}): ${(e && (e.code || e.message)) || e}`);
+  },
+  onScoringDead: (info) => {
+    scoringDead = info || true;
+    say(`!! SCORING DECLARED DEAD — the interview should now apologise and stop. ${JSON.stringify(info || {})}`);
+  },
 });
 
 /*
@@ -688,11 +1284,46 @@ const LI = win.vyneLiveInterview.create({
  * frame has gone out.
  */
 let answering = false;
+/* Set by nextAnswer() and by the watchdog; read only for the stall report. */
+let lastCueAt = Date.now();
+let stallRecoveries = 0;
 async function nextAnswer() {
   if (answering || ended || Date.now() - t0 > MINUTES * 60000) return;
   if (uplinkQueue.length) { say(`(skipping a duplicate answer cue — ${uplinkQueue.length} frames still on the uplink)`); return; }
   answering = true;
+  lastCueAt = Date.now();
   try {
+    /*
+     * v5.34.78 — STOP WHEN THE INTERVIEWEE RUNS OUT OF THINGS TO SAY.
+     *
+     * ANSWERS holds eight answers. A cycle costs about fourteen seconds, so
+     * the scripted interviewee has said everything it knows inside two
+     * minutes. Every run before this one then started the script again from
+     * the top and kept going to the wall clock: the 2026-09-14 run spent
+     * twenty-eight of its thirty minutes reading answers one to eight at an
+     * interviewer that had correctly finished the interview at 112 seconds and
+     * spent the rest of the half hour saying "we covered that already".
+     *
+     * That tail is not a weak measurement, it is an actively false one. It
+     * invents repetition that the product did not produce, and it is billed at
+     * the live model's output rate for the whole of it.
+     *
+     * So the default is now: one pass, then stop. --loop restores the old
+     * behaviour for a deliberate soak (the ~10-minute handover needs more
+     * conversation than eight answers can supply, and until the interviewee
+     * side is model-generated rather than scripted, a soak is the only way to
+     * reach it — see NEXT_SESSION_SPEC.md).
+     */
+    if (answerIndex >= ANSWERS.length && !LOOP) {
+      scriptExhaustedAt = now();
+      say(`— the scripted interviewee is out of material after ${ANSWERS.length} answers (${scriptExhaustedAt.toFixed(0)}s) —`);
+      say(`  Stopping here. Past this point the rig repeats itself and the`);
+      say(`  interviewer's replies measure the rig, not the product. Pass --loop`);
+      say(`  to soak past it (that is what reaches the ~10-minute handover).`);
+      answering = false;
+      finish("the scripted interviewee ran out of material");
+      return;
+    }
     const text = ANSWERS[answerIndex % ANSWERS.length];
     answerIndex++;
     const pcm = await speak(text, answerIndex - 1);
@@ -703,14 +1334,76 @@ async function nextAnswer() {
     // askedAt is set when the uplink has actually DRAINED, not on a timer that
     // assumes it did — a backed-up queue would otherwise shift every latency
     // after it and look exactly like the model getting slower.
+    /*
+     * v5.34.75 — BOUNDED. This was an unbounded setInterval, so a queue that
+     * never drained (the socket dropping mid-answer, which is what a handover
+     * is) pinned `answering` true forever, and every later cue returned at the
+     * guard above. The run was then dead and nothing said so.
+     */
+    const drainStartedAt = Date.now();
     const waitForDrain = setInterval(() => {
-      if (uplinkQueue.length === 0) { clearInterval(waitForDrain); askedAt = now(); answering = false; }
+      if (uplinkQueue.length === 0) {
+        clearInterval(waitForDrain); askedAt = now(); answering = false; return;
+      }
+      if (Date.now() - drainStartedAt > 30000) {
+        clearInterval(waitForDrain);
+        say(`!! the uplink never drained (${uplinkQueue.length} frames left) — dropping this answer and carrying on`);
+        uplinkQueue.length = 0;
+        askedAt = null; answering = false;
+      }
     }, 120);
   } catch (e) {
     say(`!! could not produce an answer: ${e.message}`);
     answering = false;
   }
 }
+
+/*
+ * ── The conversation watchdog (v5.34.75) ────────────────────────────────────
+ *
+ * nextAnswer() had exactly one caller: the model's speaking -> idle edge. So
+ * any single missed edge ended the interview permanently, in silence, with the
+ * run still counting down. That is what happened on 2026-09-13: the newer Live
+ * model sent generationComplete without turnComplete three times, the client
+ * never left 'speaking', no answer was ever cued again, and the recording spent
+ * roughly half of its thirty minutes with a dead uplink — rms 0, the model
+ * politely waiting for a person who had stopped existing.
+ *
+ * vyne-live.js now salvages that turn (TURN_CLOSE_GRACE_MS), which fixes the
+ * cause. This is the floor underneath it: whatever the reason, if nobody has
+ * said anything for a while, say something. A harness that can be killed by one
+ * dropped event cannot be trusted to report a thirty-minute result.
+ *
+ * Deliberately generous. A real pause between a question and an answer is a few
+ * seconds; twenty-five means something is wrong, not that someone is thinking.
+ */
+const STALL_MS = Number(process.env.VYNE_HARNESS_STALL_MS || 25000);
+/*
+ * v5.34.78 — a handover is not a stall.
+ *
+ * Stage 2 of the self-check injects transport faults on purpose and waits out
+ * a 4 + 8 + 16s retry ladder. At 26s the watchdog declared that nothing had
+ * happened and cued an answer into the middle of it — into the one stage whose
+ * entire subject is the timing of that ladder. Nothing broke, but the stage was
+ * measuring itself plus me.
+ *
+ * The ceiling matters as much as the guard. Suppressing the watchdog for the
+ * duration of a handover is right; suppressing it FOREVER because a handover
+ * never completed would restore exactly the failure this watchdog exists to
+ * catch — a dead uplink with the clock still running. So the pass is granted
+ * for one retry ladder plus slack, and then the watchdog takes over again.
+ */
+const RENEW_GRACE_MS = Number(process.env.VYNE_HARNESS_RENEW_GRACE_MS || 60000);
+setInterval(() => {
+  if (ended || answering || uplinkQueue.length) return;
+  if (renewingSince !== null && Date.now() - renewingSince < RENEW_GRACE_MS) return;
+  if (state === "speaking" || state === "thinking") return;
+  if (Date.now() - lastCueAt < STALL_MS) return;
+  stallRecoveries++;
+  say(`!! nothing has happened for ${Math.round((Date.now() - lastCueAt) / 1000)}s — cueing the next answer (recovery ${stallRecoveries})`);
+  lastCueAt = Date.now();
+  nextAnswer();
+}, 2000);
 
 /* The choke signature, measured rather than guessed: the model stops its own
  * playback while the interviewee is NOT speaking. That is the self-cancelling
@@ -785,10 +1478,96 @@ function finish(why) {
       + `\n  ${bad === 0 && recovered && labelOk ? "PASS" : "FAIL"}`;
   }
   say(`stopped because: ${why}${ended ? ` (interview ended: ${ended})` : ""}`);
+  /*
+   * v5.34.81 — say when the PROCESS was suspended, because every number below
+   * is then measuring the laptop, not the model.
+   *
+   * A Mac sleeping mid-run freezes the whole event loop: timers stop, the
+   * uplink never drains, latencies land wherever the clock resumed. On
+   * 2026-09-14 that produced a 2-minute run with a 6-minute wall clock, one
+   * reply, and a gate message blaming interview-close detection — sending a
+   * debugging session after code that was working correctly.
+   *
+   * Wall clock far beyond the booked ceiling can only mean the process stopped
+   * running, since every other way a run can overrun is bounded.
+   */
+  if (now() > MINUTES * 60 * 1.5 + 30) {
+    say(`!! this run took ${(now() / 60).toFixed(1)} minutes of wall clock for a ${MINUTES}-minute booking.`);
+    say(`   The process was suspended — on a laptop, that is the machine sleeping. Timers`);
+    say(`   stop while it is asleep, so the latencies, the stall recoveries and the reply`);
+    say(`   count below are NOT measurements of the model. Re-run with the machine awake:`);
+    say(`   caffeinate -i bash deploy/run-voice-record.sh ${MINUTES}`);
+  }
   say(`recording:       ${OUT_WAV}  (${(secs / 60).toFixed(1)} min, L=interviewer R=interviewee)`);
   say(`page trace:      ${OUT_LOG}`);
   say(`grants minted:   ${grantCount}   handovers: ${renewals}   mute handovers recovered: ${silentRenewals}`);
   say(`replies:         ${turns.length}`);
+  /* In the verdict too: this is the line that says what was actually measured. */
+  say(`persona:         ${PERSONA_SOURCE}`);
+  /*
+   * v5.34.94 — SCORING, IN THE VERDICT.
+   *
+   * "An interview without scoring is useless waste of time." A run that talked
+   * for fourteen minutes and scored nothing used to produce a verdict that read
+   * exactly like a good one, because nothing on this page looked at scoring at
+   * all. These four lines are the difference between "the conversation worked"
+   * and "the interview worked".
+   */
+  say(`scoring passes:  ${scoreCalls} succeeded, ${scoreErrors} failed` +
+      `${scoreCalls === 0 ? "  !! NOTHING WAS SCORED — this run produced no assessment" : ""}`);
+  say(`dimensions scored: ${scoredDims.size} of 7` +
+      `${scoredDims.size ? ` (${[...scoredDims].sort().join(", ")})` : ""}`);
+  if (scoringDead) {
+    say(`scoring declared DEAD: the stop path fired — check the transcript for the apology before the stop`);
+  } else if (scoreErrors && scoreCalls) {
+    say(`scoring recovered after ${scoreErrors} failure(s) — the stop path correctly did NOT fire`);
+  }
+  /*
+   * v5.34.79 — show that the no-repeat machinery actually RAN.
+   *
+   * Without these lines a run where the tracking silently did nothing looks
+   * identical to one where it worked: both print a clean verdict. These are
+   * the two numbers that say the instruction sent at the last mint differed
+   * from the one sent at the first.
+   */
+  if (renderInstruction) {
+    const outstanding = fixtureMandatory().filter((_, i) => !mandatoryDone.has(i)).length;
+    say(`questions tracked: ${askedQuestions.length} asked and answered` +
+        `${pendingQuestion ? ", 1 left unanswered at the end" : ""}`);
+    say(`required questions: ${mandatoryDone.size} of ${fixtureMandatory().length} covered` +
+        `${outstanding ? ` — ${outstanding} would still be sent as outstanding` : " — none re-sent as outstanding"}`);
+    const repeats = askedQuestions.length && turns.length > askedQuestions.length
+      ? turns.length - askedQuestions.length : 0;
+    if (repeats > 2) {
+      say(`!! ${turns.length} replies but only ${askedQuestions.length} distinct questions — the interviewer is repeating itself.`);
+    }
+    say(`instruction at last mint: ${currentInstruction().length} chars (was ${SYSTEM_INSTRUCTION.length} at open)`);
+  }
+  /*
+   * Three numbers that say whether the RIG behaved, so a reader never again has
+   * to infer it from a suspiciously low reply count.
+   */
+  /*
+   * v5.34.78 — say WHY it did not close, because "no" has three meanings and
+   * only one of them is a product fault. It can be: the interviewer genuinely
+   * kept going (a real finding); the run stopped first because the scripted
+   * interviewee ran dry (a rig limit, and the verdict must not be read as a
+   * finding); or the run was a --loop soak, where the interviewer is being
+   * talked at by a tape and closing rules are not what is under test.
+   */
+  say(`closed by agent: ${
+    closedAt !== null ? `yes, at ${(closedAt / 60).toFixed(1)} min`
+    : scriptExhaustedAt !== null ? `not reached — the rig ran out of answers at ${(scriptExhaustedAt / 60).toFixed(1)} min, before the question of closing arose`
+    : LOOP ? "no — but this was a --loop soak, so the interviewee was a tape and this line is not evidence"
+    : "no — ran to the time limit"}`);
+  if (LOOP && !SELFTEST) {
+    say(`!! --loop: the interviewee repeated its ${ANSWERS.length} answers ${Math.max(1, Math.ceil(answerIndex / ANSWERS.length))}x.`);
+    say(`   Judge transport and endurance from this run. Do NOT judge question`);
+    say(`   quality, repetition or coverage from it — after answer ${ANSWERS.length} the`);
+    say(`   interviewer is responding to a loop, and any repetition is the rig's.`);
+  }
+  say(`stall recoveries:${stallRecoveries === 0 ? " 0 (the conversation never stalled)" : ` ${stallRecoveries} !! the uplink went quiet and the watchdog restarted it`}`);
+  say(`salvaged turns:  ${(LI.session && LI.session._salvagedTurns) || 0}${(LI.session && LI.session._salvagedTurns) ? " !! generationComplete with no turnComplete — see TURN_CLOSE_GRACE_MS" : ""}`);
   if (OFFLINE_FAIL_MINTS) say(faultVerdict());
   if (lat.length) {
     say(`first reply:     ${lat[0].toFixed(1)}s`);
@@ -801,8 +1580,21 @@ function finish(why) {
     say("   for 'grant REFUSED', 'auth_tokens', or a rate-limit close — a broken harness and a");
     say("   broken product look identical from here, and this one has been wrong three times.");
   }
-  if (renewals === 0 && MINUTES >= 12) {
+  /*
+   * v5.34.78 — judge this against the run's REAL length, not its booked one.
+   *
+   * MINUTES is a ceiling now: the run ends when the interviewer closes or the
+   * script runs dry, both of which happen inside two minutes. Testing the
+   * booked figure printed "no handover happened in a run long enough to need
+   * one" under a two-minute run — an alarm about a path nothing could have
+   * reached, on the first run of the version that introduced the early stop.
+   */
+  const ranMin = now() / 60;
+  if (renewals === 0 && MINUTES >= 12 && ranMin >= 12) {
     say("!! no handover happened in a run long enough to need one — the ten-minute path was NOT exercised.");
+  } else if (renewals === 0 && MINUTES >= 12) {
+    say(`(the ~10-minute handover was not reached: the run ended at ${ranMin.toFixed(1)} min. ` +
+        `Use --loop for a soak if that path is what you want to exercise.)`);
   }
   say("Listen to the WAV. The things to judge by ear: does the voice stop and start mid-sentence,");
   say("is there a long hole after each handover, and does it still answer after minute ten.");
@@ -839,6 +1631,7 @@ setInterval(() => {
 }, 60000);
 
 say(`starting: ${MINUTES} minutes, model ${MODEL}, voice ${VOICE}, interviewer "${INTERVIEWER}"`);
+say(`interviewer persona: ${PERSONA_SOURCE}`);
 if (SELFTEST) say("SELFTEST: ~90 seconds, just enough to prove the harness hears a voice. No handover.");
 
 /*

@@ -281,6 +281,9 @@ export async function assignmentRoutes(app: FastifyInstance): Promise<void> {
       const legacy = legacyNormClient(clientName);
       const allNorms = [...new Set([norm, legacy])];
 
+      /** Keys switched off by this deletion, for the audit row and the reply. */
+      let byokDisabled: string[] = [];
+
       const result = await withTenant(ctx.tenantId, async (c) => {
         /* 1. Interviews (norm-matched) + their private state namespaces.
          *
@@ -359,6 +362,49 @@ export async function assignmentRoutes(app: FastifyInstance): Promise<void> {
         }
         // 3. Consultant assignments for this client.
         await c.query(`DELETE FROM client_assignments WHERE client_norm = ANY($1::text[])`, [allNorms]);
+
+        /*
+         * 3b. The client's OWN API key, their model preference and their
+         * fallback grant. (v5.34.68)
+         *
+         * None of these were touched before, and the consequence is worse than
+         * leftover rows: deleting a client removed their engagement, which set
+         * byok_keys.engagement_id to NULL (037's ON DELETE SET NULL), after
+         * which the key reverted to matching on the client's NAME. So the firm
+         * went on holding a live, active credential belonging to a client it
+         * had just deleted — and anyone who later created a client with the
+         * same name INHERITED it.
+         *
+         * The key row is kept and switched OFF rather than deleted. It carries
+         * the attestation: the words the client's administrator agreed to, who
+         * agreed, and when. That is the record behind charges the client has
+         * already paid, and deleting a client is not a reason to destroy it —
+         * the same reasoning that made 037's foreign key SET NULL rather than
+         * CASCADE. `disabled` is what makes it unusable: activeKeyFor() filters
+         * that status out, so the resolvers never see the row at all. (It
+         * returns `failed` rows as of v5.34.70 — a refused key still has to be
+         * distinguishable from no key — but `disabled` and `pending` stay
+         * filtered, which is exactly what this UPDATE relies on.)
+         *
+         * The preference and the grant carry no such record and are removed
+         * outright. A grant in particular must not survive: it is standing
+         * permission to spend the firm's money on that client.
+         */
+        const disabled = await c.query<{ client_name: string; provider: string }>(
+          `UPDATE byok_keys SET status = 'disabled', updated_at = now()
+            WHERE tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid
+              AND client_norm = ANY($1::text[]) AND status = 'active'
+            RETURNING client_name, provider`,
+          [allNorms]);
+        await c.query(
+          `DELETE FROM client_routing
+            WHERE tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid
+              AND client_norm = ANY($1::text[])`, [allNorms]);
+        await c.query(
+          `DELETE FROM byok_fallback_grant
+            WHERE tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid
+              AND client_norm = ANY($1::text[])`, [allNorms]);
+        byokDisabled = disabled.rows.map((r) => `${r.client_name}:${r.provider}`);
         // 4. Workspace purge via the shared resolver.
         const ws = await c.query<{ key: string; value: { v: string } }>(
           `SELECT key, value FROM module_state WHERE module = 'workspace'`);
@@ -374,7 +420,8 @@ export async function assignmentRoutes(app: FastifyInstance): Promise<void> {
         if (deletes.length) {
           await c.query(`DELETE FROM module_state WHERE module = 'workspace' AND key = ANY($1::text[])`, [deletes]);
         }
-        return { interviews: mine.length, engagements: engCount, workspaceKeys: deletes.length, orphaned };
+        return { interviews: mine.length, engagements: engCount, workspaceKeys: deletes.length,
+                 orphaned, byokDisabled };
       });
 
       // This removed client_assignments rows across potentially many
@@ -413,6 +460,10 @@ export async function assignmentRoutes(app: FastifyInstance): Promise<void> {
         engagements: result.engagements,
         workspaceKeys: result.workspaceKeys,
         intervieweeLoginsRemoved: result.orphaned.length,
+        // v5.34.68 — which of the client's OWN credentials were switched off.
+        // A deletion that silently left a live client key behind is the thing
+        // this records; an empty array is a fact, not an omission.
+        byokKeysDisabled: result.byokDisabled,
       });
       return {
         ok: true, clientName,
@@ -420,6 +471,7 @@ export async function assignmentRoutes(app: FastifyInstance): Promise<void> {
         engagements: result.engagements,
         workspaceKeys: result.workspaceKeys,
         intervieweeLoginsRemoved: result.orphaned.length,
+        byokKeysDisabled: result.byokDisabled,
       };
     }
   );

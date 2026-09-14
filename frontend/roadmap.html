@@ -12182,9 +12182,20 @@ function deckLoadPersonaScores(){
           if(!roundLabel) roundLabel='Round '+maxRound+' — Refresh';
         }
         var out=interviews.filter(function(iv){ return iv && iv.scores; }).map(function(iv){
-          var sc={}, sum=0, n=0;
-          dims.forEach(function(d){ var v=iv.scores[d]; if(v!==undefined && v!==null && v>0){ sc[d]=+(+v).toFixed(1); sum+=(+v); n++; } else { sc[d]=null; } });
-          return { role:iv.role||'—', interviewee:iv.interviewee||iv.name||'', scores:sc, overall:n?+(sum/n).toFixed(1):null };
+          var sc={}, n=0;
+          dims.forEach(function(d){ var v=iv.scores[d]; if(v!==undefined && v!==null && v>0){ sc[d]=+(+v).toFixed(1); n++; } else { sc[d]=null; } });
+          /* v5.34.92: dimTiers carried through, and the persona's own overall
+           * weighted by it. The tiering has to survive this mapping or the deck
+           * cover below silently falls back to the plain mean for every
+           * engagement — the deck being the one place a client actually reads
+           * the number. */
+          var tiers = iv.dimTiers || null;
+          var ov = null;
+          try{
+            ov = window.VyneScoring.overallOf(sc, window.VyneScoring.dimensionWeights([{dimTiers:tiers}]));
+          }catch(e){}
+          return { role:iv.role||'—', interviewee:iv.interviewee||iv.name||'',
+                   scores:sc, dimTiers:tiers, overall:(n?ov:null) };
         });
         if(out.length) return { interviews:out, roundLabel:roundLabel };
       }
@@ -12393,7 +12404,20 @@ function exportStrategyDeck(){
   // measured, and say so when coverage is partial.
   // v5.32.57: the guard this replaces could never fire — see measuredDims.
   var _scored=dimKeys.filter(isMeasured);
+  /* v5.34.92: weighted by the round's own lead/cover/light tiering, carried on
+   * each interview record. Falls back to the mean of the measured dimensions —
+   * which is what this line has computed since v5.32.57 — whenever the round
+   * predates the tiering or vyne-scoring.js is unavailable. */
   var overall=_scored.length ? _scored.reduce(function(a,k){return a+ms[k];},0)/_scored.length : 0;
+  try{
+    var _mw = window.VyneScoring.dimensionWeights(
+      (personaScores && personaScores.interviews) ? personaScores.interviews : []);
+    if(_mw){
+      var _ms2={}; _scored.forEach(function(k){ _ms2[k]=ms[k]; });
+      var _wov = window.VyneScoring.overallOf(_ms2, _mw);
+      if(typeof _wov === 'number') overall=_wov;
+    }
+  }catch(e){}
   var _coverageNote = _scored.length === dimKeys.length
     ? ''
     : (_scored.length

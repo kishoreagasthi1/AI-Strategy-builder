@@ -66,13 +66,41 @@ function chromiumPath(): string {
   const explicit = process.env.PLAYWRIGHT_CHROMIUM;
   if (explicit && existsSync(explicit)) return explicit;
 
-  const roots = [process.env.PLAYWRIGHT_BROWSERS_PATH, "/ms-playwright", "/opt/pw-browsers"]
-    .filter((r): r is string => Boolean(r) && existsSync(r as string));
+  /*
+   * v5.34.99 — the PER-USER install locations, and the macOS layout.
+   *
+   * This function knew only the two container paths, so on a Mac
+   * `npx playwright install chromium` completed successfully and the browser
+   * suite went on skipping: Playwright puts it in ~/Library/Caches/ms-playwright
+   * and neither root was ever searched. Worse, the layout list was Linux-only —
+   * chrome-linux/chrome — so even PLAYWRIGHT_BROWSERS_PATH pointed at a Mac
+   * install would have found the directory and not the binary inside it.
+   *
+   * The failure was silent in the worst way: the install said it worked, the
+   * suite said "7 skipped", and the two facts never met.
+   */
+  const home = process.env.HOME || process.env.USERPROFILE || "";
+  const roots = [
+    process.env.PLAYWRIGHT_BROWSERS_PATH,
+    "/ms-playwright",
+    "/opt/pw-browsers",
+    home ? join(home, "Library", "Caches", "ms-playwright") : "",  // macOS default
+    home ? join(home, ".cache", "ms-playwright") : "",             // Linux default
+  ].filter((r): r is string => Boolean(r) && existsSync(r as string));
+
+  /* Per-platform layouts inside a chromium-<build> directory. */
+  const layouts = [
+    ["chrome-linux", "chrome"],
+    ["chrome-linux", "headless_shell"],
+    ["chrome-mac", "Chromium.app", "Contents", "MacOS", "Chromium"],
+    ["chrome-mac-arm64", "Chromium.app", "Contents", "MacOS", "Chromium"],
+    ["chrome-win", "chrome.exe"],
+  ];
 
   const { readdirSync } = require("node:fs") as typeof import("node:fs");
   for (const root of roots) {
     for (const d of readdirSync(root).filter((x) => x.startsWith("chromium"))) {
-      for (const rel of [["chrome-linux", "chrome"], ["chrome-linux", "headless_shell"]]) {
+      for (const rel of layouts) {
         const p = join(root, d, ...rel);
         if (existsSync(p)) return p;
       }
@@ -80,8 +108,9 @@ function chromiumPath(): string {
   }
   throw new Error(
     `No Chromium found. Looked under ${roots.join(", ") || "(nothing)"}. ` +
-    `Set PLAYWRIGHT_CHROMIUM to the binary, or run these through ` +
-    `deploy/run-ui-tests.sh which uses the Playwright image.`
+    `Install it with \`npx playwright install chromium\`, set PLAYWRIGHT_CHROMIUM ` +
+    `to the binary, or run these through deploy/run-ui-tests.sh which uses the ` +
+    `Playwright image.`
   );
 }
 
@@ -97,6 +126,32 @@ function chromiumPath(): string {
  * one, and a silent skip there would mean the frontend quietly stopped being
  * tested. Which is exactly the state this suite was written to end.
  */
+/**
+ * How long a browser test may take. (v5.34.89)
+ *
+ * ── Why this is declared at all ─────────────────────────────────────────────
+ *
+ * These tests launch Chromium, serve the real frontend, load a page, wait for
+ * its fetches and assert on rendered DOM. Vitest's default limit is FIVE
+ * SECONDS, and nothing here ever raised it — so the suite has always been one
+ * busy machine away from failing.
+ *
+ * On 2026-09-14 that machine appeared: a deploy gate on a fast multi-core Mac
+ * ran the suite in 67 seconds of wall clock against 321 seconds of test time,
+ * i.e. heavily parallel, and six browser tests exceeded five seconds and failed.
+ * Nothing was wrong with the pages. The release was blocked by the rig running
+ * out of patience, which is the most expensive kind of false alarm: it looks
+ * exactly like a real regression and it lands at the moment you are trying to
+ * ship.
+ *
+ * Raised HERE rather than globally: a unit test that takes thirty seconds is a
+ * hung unit test, and a global bump would hide it. Only the suite that
+ * genuinely needs the time gets it.
+ */
+export const BROWSER_TEST_TIMEOUT_MS = 30_000;
+/** Launching Chromium the first time is the slowest thing in the suite. */
+export const BROWSER_HOOK_TIMEOUT_MS = 90_000;
+
 export function playwrightInstalled(): boolean {
   try {
     (require as any).resolve("playwright-core");

@@ -143,9 +143,30 @@ describe.skipIf(!ENABLED)("chunked synthetic generation", () => {
     await app?.close();
     await closePool();
     if (admin) {
+      /*
+       * v5.34.65. The synthetic users this file minted are identified BEFORE
+       * the tenant is dropped, because dropping it cascades the interviews
+       * that link them — after that there is nothing left to tell this file's
+       * synthetic users from another file's.
+       *
+       * The previous teardown solved that by deleting every uid LIKE
+       * 'synthetic:%', which is four files' worth. Running in parallel it took
+       * theirs too. See teardownIsolation.test.ts for the failure that
+       * behaviour produced elsewhere in the suite.
+       */
+      const mine = await admin.query<{ id: string }>(
+        `SELECT DISTINCT u.id
+           FROM users u JOIN interviews i ON i.interviewee_user_id = u.id
+          WHERE i.tenant_id = $1 AND u.identity_platform_uid LIKE 'synthetic:%'`,
+        [tenant]
+      );
       await admin.query(`DELETE FROM tenants WHERE id = $1`, [tenant]);
+      if (mine.rows.length) {
+        await admin.query(`DELETE FROM users WHERE id = ANY($1::uuid[])`,
+                          [mine.rows.map((r) => r.id)]);
+      }
       await admin.query(`DELETE FROM users WHERE identity_platform_uid LIKE 'uid-chunk%'`);
-      await admin.query(`DELETE FROM users WHERE identity_platform_uid LIKE 'synthetic:%'`);
+
       await admin.end();
     }
   });

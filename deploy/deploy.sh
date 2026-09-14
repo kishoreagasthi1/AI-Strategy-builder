@@ -285,9 +285,69 @@ run_tests() {
   echo ">>   For the full gate — unit + Postgres + browser — run:"
   echo ">>     bash deploy/run-ui-tests.sh"
   echo "   This is what catches source/test drift before it ships."
+
+  #
+  # v5.34.69 — the TEST suite is typechecked too.
+  #
+  # tsconfig.json excludes test/ (it drives the build, where rootDir is src/),
+  # so until now ~140 test files were never typechecked by anything. vitest
+  # strips types with esbuild and does not check them, so a test could reference
+  # a type that no longer existed and stay green — which is exactly what
+  # happened when v5.34.64 changed makeByokLiveResolver's return type: `tsc
+  # --noEmit` was clean, the suite was green, and the break only surfaced when
+  # the Docker runner executed the database tier for the first time. Cheap, and
+  # it catches the drift this gate exists for.
+  #
+  #
+  # v5.34.71 — installed BEFORE typechecked.
+  #
+  # On a checkout whose node_modules predates a devDependency, tsc does not say
+  # "a package is missing"; it says 82 things about implicit `any` in six
+  # browser test files and buries the one TS2307 that caused them all. See
+  # deploy/check-deps.mjs for the transcript. Naming the cause first costs a
+  # fraction of a second and saves an hour of hunting for drift that is not there.
+  #
+  # Resolved BEFORE the subshell: inside it the cwd is backend/, and a relative
+  # "$(dirname "$0")" would be re-expanded against that and miss.
+  _DEPLOY_DIR="$(cd "$(dirname "$0")" && pwd)"
+  ( cd "$_DEPLOY_DIR/../backend" && node "$_DEPLOY_DIR/check-deps.mjs" )
+
+  ( cd "$(dirname "$0")/../backend" && npx tsc -p tsconfig.test.json )
+  echo ">> Test suite typechecks."
+
   ( cd "$(dirname "$0")/../backend" && npx vitest run )
   _TESTS_RAN=1
   echo ">> Backend tests passed — proceeding."
+
+  #
+  # ── The full suite, in Docker, when a daemon is available ────────────────────
+  #
+  # `npx vitest run` above covers about 1,213 of 1,658 tests: the database tier
+  # needs a Postgres and the browser tier needs Chromium, and it SKIPS both
+  # silently. A gate that reports green on three quarters of the suite is the
+  # gap that let five real defects through — including a migration-runner race
+  # that only appears against an empty database, which is production code.
+  #
+  # So when Docker is present, run the whole thing. When it is not, say plainly
+  # what was skipped rather than leaving "tests passed" to mean more than it
+  # does. Deliberately not fatal on a missing daemon: a consultant's laptop is
+  # not required to have one, and blocking a deploy on that would just teach
+  # people to set SKIP_TESTS=1.
+  #
+  if [ "${SKIP_DOCKER_TESTS:-0}" = "1" ]; then
+    echo ">> SKIP_DOCKER_TESTS=1 — full-suite container run bypassed."
+  elif command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+    echo ">> Docker found — running the FULL suite (unit + Postgres + browser) ..."
+    ( cd "$(dirname "$0")/.." &&
+      docker compose -f deploy/test/docker-compose.yml build &&
+      docker compose -f deploy/test/docker-compose.yml run --rm tests )
+    echo ">> Full containerised suite passed."
+  else
+    echo "!! NOTE: Docker is not available, so the database and browser tiers did" >&2
+    echo "   NOT run — roughly a quarter of the suite was skipped, silently, by" >&2
+    echo "   vitest. What passed above is the unit tier only." >&2
+    echo "   To close the gap:  docker compose -f deploy/test/docker-compose.yml run --rm tests" >&2
+  fi
 }
 
 deploy_api() {

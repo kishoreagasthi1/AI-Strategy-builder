@@ -25,7 +25,7 @@ import {
   TASK_HOLD, TASK_HOLD_RELEASE, VOICES,
   type LiveSession,
 } from "../llm/liveSession.js";
-import { buildInterviewerInstruction, MAX_CONTEXT_CHARS } from "../llm/interviewerPersona.js";
+import { buildInterviewerInstruction, MAX_CONTEXT_CHARS, DIM_CODES } from "../llm/interviewerPersona.js";
 import { isCredentialRejection } from "../llm/byok/resolve.js";
 import type { ByokLiveResolution } from "../llm/byok/resolveLive.js";
 import type { Payer } from "../llm/gateway.js";
@@ -83,6 +83,32 @@ const LiveSessionBody = z.object({
   intervieweeName: z.string().max(200).optional(),
   intervieweeRole: z.string().max(200).optional(),
   industry: z.string().max(200).optional(),
+  /*
+   * v5.34.73. The dimension agenda, which the voice interviewer never had.
+   *
+   * This is the ONE thing from the browser that lands above the prompt's data
+   * fence, and it is shaped so that it cannot say anything: four arrays of
+   * fixed dimension codes, validated against the enum, capped at seven each.
+   * The dimension NAMES and every sentence built around them live in
+   * llm/interviewerPersona.ts. An interviewee's browser can choose which of
+   * seven codes to emphasise; it cannot introduce a word.
+   *
+   * `context` below stays inside the fence because it is free text and always
+   * will be.
+   */
+  agenda: z.object({
+    lead: z.array(z.enum(DIM_CODES)).max(7).optional(),
+    cover: z.array(z.enum(DIM_CODES)).max(7).optional(),
+    light: z.array(z.enum(DIM_CODES)).max(7).optional(),
+    evidenced: z.array(z.enum(DIM_CODES)).max(7).optional(),
+  }).optional(),
+  /** Count only — the questions themselves ride in `context`, as data. */
+  mandatoryCount: z.number().int().min(0).max(50).optional(),
+  /* v5.34.79 — how many questions have already been asked and answered. A
+   * bounded integer, like mandatoryCount: it crosses into the rules above the
+   * data fence, so it must be something that cannot carry words. The questions
+   * themselves stay inside `context`. */
+  askedCount: z.number().int().min(0).max(500).optional(),
   /** Validated against the allowlist in liveSession.ts, never forwarded raw. */
   voice: z.string().max(40).optional(),
   /** What the interviewer calls itself. Spoken aloud, so it is bounded and
@@ -386,6 +412,9 @@ export async function voiceRoutes(
           intervieweeName: parsed.data.intervieweeName,
           intervieweeRole: parsed.data.intervieweeRole,
           context: parsed.data.context,
+          agenda: parsed.data.agenda,
+          mandatoryCount: parsed.data.mandatoryCount,
+          askedCount: parsed.data.askedCount,
         });
         const grant = await effectiveLive.mint(sessionId, maxSeconds, instruction, parsed.data.voice,
           { manualVad: !!parsed.data.manualVad, resumeHandle: parsed.data.resumeHandle });
@@ -474,6 +503,12 @@ export async function voiceRoutes(
                 intervieweeName: parsed.data.intervieweeName,
                 intervieweeRole: parsed.data.intervieweeRole,
                 context: parsed.data.context,
+                // Same agenda on the fallback path. Omitting it here would mean
+                // a session that fell back to the platform key ran a different,
+                // agenda-less interviewer — invisibly.
+                agenda: parsed.data.agenda,
+                mandatoryCount: parsed.data.mandatoryCount,
+                askedCount: parsed.data.askedCount,
               });
               const grant2 = await live.mint(retryId, maxSeconds, instruction2, parsed.data.voice,
                 { manualVad: !!parsed.data.manualVad, resumeHandle: parsed.data.resumeHandle });

@@ -22,6 +22,7 @@
  */
 import { withTenant } from "../../db/pool.js";
 import { normClient } from "../../auth/clients.js";
+import { engagementIdFor, clientMatch } from "./engagementBinding.js";
 
 export interface FallbackGrant {
   clientNorm: string;
@@ -54,12 +55,19 @@ export async function hasFallbackGrant(
 ): Promise<boolean> {
   if (!clientName) return false;
   const norm = normClient(clientName);
+  /*
+   * v5.34.67: by engagement, norm as fallback. A rename used to revoke the
+   * grant by accident — which fails CLOSED, so the symptom was an interview
+   * refusing to start for a client the firm had explicitly agreed to cover.
+   */
+  const engagementId = await engagementIdFor(tenantId, clientName);
+  const m = clientMatch(engagementId, norm);
   return withTenant(tenantId, async (c) => {
     const r = await c.query(
       `SELECT 1 FROM byok_fallback_grant
         WHERE tenant_id = current_setting('app.tenant_id', true)::uuid
-          AND client_norm = $1`,
-      [norm]
+          AND ${m.sql}`,
+      m.params
     );
     return (r.rowCount ?? 0) > 0;
   });
@@ -83,17 +91,20 @@ export async function grantFallback(a: {
   tenantId: string; clientName: string; reason?: string; grantedBy?: string;
 }): Promise<FallbackGrant> {
   const norm = normClient(a.clientName);
+  const engagementId = await engagementIdFor(a.tenantId, a.clientName);
   return withTenant(a.tenantId, async (c) => {
     const r = await c.query<Row>(
-      `INSERT INTO byok_fallback_grant (tenant_id, client_norm, client_name, reason, granted_by)
-       VALUES (current_setting('app.tenant_id', true)::uuid, $1, $2, $3, $4)
+      `INSERT INTO byok_fallback_grant
+         (tenant_id, client_norm, client_name, reason, granted_by, engagement_id)
+       VALUES (current_setting('app.tenant_id', true)::uuid, $1, $2, $3, $4, $5)
        ON CONFLICT (tenant_id, client_norm) DO UPDATE SET
          client_name = EXCLUDED.client_name,
+         engagement_id = COALESCE(EXCLUDED.engagement_id, byok_fallback_grant.engagement_id),
          reason      = EXCLUDED.reason,
          granted_by  = EXCLUDED.granted_by,
          granted_at  = now()
        RETURNING client_norm, client_name, reason, granted_at`,
-      [norm, a.clientName, a.reason ?? null, a.grantedBy ?? null]
+      [norm, a.clientName, a.reason ?? null, a.grantedBy ?? null, engagementId]
     );
     return shape(r.rows[0]);
   });
@@ -102,11 +113,13 @@ export async function grantFallback(a: {
 /** Withdraw. The client's work goes back to failing when their key fails. */
 export async function revokeFallback(tenantId: string, clientName: string): Promise<boolean> {
   const norm = normClient(clientName);
+  const engagementId = await engagementIdFor(tenantId, clientName);
+  const m = clientMatch(engagementId, norm);
   return withTenant(tenantId, async (c) => {
     const r = await c.query(
       `DELETE FROM byok_fallback_grant
-        WHERE tenant_id = current_setting('app.tenant_id', true)::uuid AND client_norm = $1`,
-      [norm]
+        WHERE tenant_id = current_setting('app.tenant_id', true)::uuid AND ${m.sql}`,
+      m.params
     );
     return (r as { rowCount?: number }).rowCount === 1;
   });

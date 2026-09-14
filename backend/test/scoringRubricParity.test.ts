@@ -35,6 +35,8 @@ describe("the scoring scale has exactly one definition (v5.32.68)", () => {
   const scoring = read("vyne-scoring.js");
   const agent = read("interview_agent.html");
   const roadmap = read("roadmap.html");
+  /* v5.34.85: the realtime scorer, which this file never covered. */
+  const live = read("vyne-live-interview.js");
 
   it("vyne-scoring.js exports the scale and the benchmark calibration", () => {
     expect(literal(scoring, "SCALE")).toContain("1=Not Started");
@@ -58,6 +60,38 @@ describe("the scoring scale has exactly one definition (v5.32.68)", () => {
 
   it("the INTERVIEWER prompt still uses that exact benchmark calibration", () => {
     expect(agent).toContain(literal(scoring, "BENCHMARK_CALIBRATION"));
+  });
+
+  it("the VOICE scorer reads the scale from the shared module, not a copy", () => {
+    /*
+     * v5.34.85. This file pinned interview_agent.html and roadmap.html and
+     * never looked at vyne-live-interview.js — so the realtime scorer, which
+     * now produces most of the product's scores, carried a hand-written copy of
+     * the scale and no benchmark calibration at all, free to drift from the
+     * definition every other path shares.
+     *
+     * It is not cosmetic: computeRoundScores averages voice and text interviews
+     * into ONE round score. Two rubrics behind one number means the number
+     * describes neither.
+     */
+    expect(live, "the voice scorer does not read VyneScoring.SCALE").toContain("VyneScoring.SCALE");
+    expect(live, "the voice scorer does not read the benchmark calibration")
+      .toContain("VyneScoring.BENCHMARK_CALIBRATION");
+  });
+
+  it("the voice scorer asks for COVERAGE on a follow-up round", () => {
+    /*
+     * tenant/scoring.ts blends a refresh round against the prior one in
+     * proportion to reported coverage, and applyScoreData reads it from
+     * scoreData.coverage. The voice prompt had no coverage key, so every voice
+     * refresh fell through to the DEFAULT_COVERAGE_WEIGHT fallback regardless
+     * of what the conversation actually re-examined — the delta-scoring feature
+     * inert on the path that produces most interviews.
+     */
+    expect(live).toMatch(/state\.isRefreshMode/);
+    expect(live).toContain('"coverage"');
+    expect(live, "coverage must be explained, or the scorer invents the scale")
+      .toMatch(/0 if it never came up/);
   });
 
   it("the gap generator reads the scale from the shared module, not a copy", () => {

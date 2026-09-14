@@ -253,6 +253,14 @@ body{font-family:'Inter',sans-serif;background:var(--navy);color:var(--white);mi
 .dim-bar-track{position:relative;height:4px;background:rgba(1,32,61,0.15);border-radius:2px;overflow:hidden;margin-bottom:5px}
 .dim-bar-fill{height:100%;background:var(--gold);border-radius:2px;transition:width 0.5s ease}
 .dim-q-count{font-size:10px;color:var(--mid-gray)}
+/* v5.34.91 — the tier a dimension is being interviewed at, on the card itself. */
+.dim-tier{font-size:8px;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;padding:2px 6px;border-radius:10px;white-space:nowrap}
+.dim-tier-lead{background:rgba(198,164,107,0.22);color:#7A5C1E}
+.dim-tier-cover{background:rgba(55,138,221,0.16);color:#2C6FB0}
+.dim-tier-light{background:rgba(1,32,61,0.10);color:var(--mid-gray)}
+.dim-tier-out{background:rgba(1,32,61,0.06);color:var(--mid-gray)}
+.dim-card.is-out{opacity:0.55}
+.score-provisional{font-size:9px;color:var(--mid-gray);line-height:1.5;padding:6px 4px 0;border-top:1px solid rgba(1,32,61,0.05);margin-top:2px}
 .finding-item{padding:9px 11px;border-left:2px solid var(--gold);margin-bottom:7px;background:rgba(1,32,61,0.05);border-radius:0 8px 8px 0}
 .finding-dim{font-size:9px;color:#7A5C1E;font-weight:600;letter-spacing:0.06em}
 .finding-text{font-size:11px;color:var(--white);margin-top:2px;line-height:1.5}
@@ -1756,14 +1764,31 @@ const DIMENSIONS=[
   {code:'D6',name:'Governance & Risk'},
   {code:'D7',name:'Culture & Change Readiness'},
 ];
-const MATURITY=[
-  {min:4.5,label:'AI-Native',color:'#10B981',bg:'rgba(16,185,129,0.15)'},
-  {min:3.5,label:'AI-Led',color:'#34D399',bg:'rgba(52,211,153,0.12)'},
-  {min:2.5,label:'AI Capable',color:'#C6A46B',bg:'rgba(184,151,42,0.15)'},
-  {min:1.5,label:'AI Exploring',color:'#F59E0B',bg:'rgba(245,158,11,0.12)'},
-  {min:0,label:'AI Unaware',color:'#EF4444',bg:'rgba(239,68,68,0.12)'},
-];
-function getMaturity(s){return MATURITY.find(m=>s>=m.min)||MATURITY[4]}
+/* v5.34.96 — the BANDS come from vyne-scoring.js; only the COLOURS live here.
+ *
+ * This table used to carry its own thresholds and labels, one of four such
+ * copies across the product with nothing comparing them. The thresholds and the
+ * five words are the same thing a client is told on the portfolio card and in
+ * the Word document, so they belong with the formula; the colours are this
+ * panel's own presentation and legitimately differ from the light scorecard's.
+ *
+ * Keyed by label, so a renamed band loses its colour rather than silently
+ * mis-colouring — and maturityBandParity.test.ts fails if the key sets drift. */
+const MATURITY_COLORS={
+  'AI-Native':   {color:'#10B981',bg:'rgba(16,185,129,0.15)'},
+  'AI-Led':      {color:'#34D399',bg:'rgba(52,211,153,0.12)'},
+  'AI Capable':  {color:'#C6A46B',bg:'rgba(184,151,42,0.15)'},
+  'AI Exploring':{color:'#F59E0B',bg:'rgba(245,158,11,0.12)'},
+  'AI Unaware':  {color:'#EF4444',bg:'rgba(239,68,68,0.12)'},
+};
+const MATURITY=window.VyneScoring.MATURITY_BANDS.map(function(b){
+  var c=MATURITY_COLORS[b.label]||{color:'#46535F',bg:'rgba(1,32,61,0.10)'};
+  return {min:b.min,label:b.label,color:c.color,bg:c.bg};
+});
+function getMaturity(s){
+  var b=window.VyneScoring.maturityBand(s);
+  return MATURITY.find(function(m){return m.label===b.label;})||MATURITY[MATURITY.length-1];
+}
 
 const LS_PREFIX='vynora_session_';
 
@@ -1800,6 +1825,10 @@ let S={
    */
   scoreEvents:[],
   findingEvents:[],
+  /* v5.34.91: set by finishInterview(), cleared by resumeFromCode(). While it
+   * is false every number on the scorecard is an interim reading and no
+   * maturity level is named — see scoringIsFinal(). */
+  interviewComplete:false,
 };
 
 // -------------------------------------------------------------------
@@ -1819,6 +1848,30 @@ function saveSession(){
     client:S.client,stakeholderRole:S.stakeholderRole,
     stakeholderName:S.stakeholderName,industry:S.industry,
     depth:S.depth,voiceMode:S.voiceMode,
+    /*
+     * ── v5.34.87: WHO THE INTERVIEWER IS, AND WHO IT IS TALKING TO ───────────
+     *
+     * None of these three were saved, and all three are what makes a resumed
+     * interview feel like the same conversation rather than a new one:
+     *
+     *   · interviewerVoice — assignedInterviewerIdentity() re-resolves on
+     *     resume and falls back to workspace keys for a consultant-run session,
+     *     so the interviewer could come back in a DIFFERENT VOICE after a break.
+     *     Nothing else in the product is as jarring: the person you were
+     *     speaking to has been replaced by a stranger mid-interview.
+     *   · interviewerName — same path, same consequence: "I'm Jack Smith"
+     *     before the pause and a different name after it.
+     *   · stakeholderDisplayLabel — _sessionOpts sends
+     *     `stakeholderDisplayLabel || stakeholderRole` as intervieweeRole, so
+     *     losing it hands the persona the raw slug and the interviewer says
+     *     "Their role is VP_Sales" out loud.
+     *
+     * Continuity is the whole claim of "continue where you left off". An
+     * interview that forgets its own voice has not continued anything.
+     */
+    interviewerName:S.interviewerName||null,
+    interviewerVoice:S.interviewerVoice||null,
+    stakeholderDisplayLabel:S.stakeholderDisplayLabel||null,
     messages:S.messages,scores:S.scores,
     findings:S.findings,documents:S.documents,
     questionsAsked:S.questionsAsked,
@@ -1833,8 +1886,52 @@ function saveSession(){
     lastSaved:Date.now(),
   };
   // TASK 3: persist refresh metadata when this is a refresh interview
+  /*
+   * ── v5.34.85: WRITTEN AND READ UNDER THE SAME NAME ─────────────────────────
+   *
+   * These went out as `isRefresh` / `roundLabel` / `coverageByDim` and come back
+   * through `S = {...S, ...blob}` under exactly those names — but the app reads
+   * `S.isRefreshMode`, `S.refreshRoundLabel` and `S.coverage`. So nothing
+   * restored them, and a RESUMED refresh interview believed it was an initial
+   * one: writeInterviewToEngagement stamped `isRefresh:false, refreshRound:null`
+   * and routed it to the CURRENT round, where it replaced that role's original
+   * round-1 interview. A follow-up conversation silently overwriting the
+   * baseline it was meant to be compared against is the worst thing this
+   * product can do, because the comparison IS the deliverable.
+   *
+   * Both spellings are written: the outward names are what the server merge and
+   * every existing record already use (engagementMerge.ts reads coverageByDim),
+   * and the inward names are what a resume needs. Cheap, and it cannot break a
+   * record written by an older build.
+   */
+  data.scoreHealth=S.scoreHealth||null;   // see recordScoringHealth
+  // v5.34.91: whether finishInterview() has closed this one. Drives whether the
+  // scorecard is allowed to name a maturity level; see scoringIsFinal().
+  data.interviewComplete=!!S.interviewComplete;
+  /* v5.34.93 — the tiering has to be in the SESSION blob, not only on the
+   * engagement record.
+   *
+   * writeInterviewToEngagement() puts dimTiers straight onto the engagement,
+   * which covers a CONSULTANT-run interview. An interviewee-run one never calls
+   * it: POST /api/interviews/mine/complete reads this blob out of module_state
+   * and mergeSessionIntoEngagement() rebuilds the record from it server-side.
+   * Without this line that path carried no tiering, dimensionWeights() returned
+   * null for the whole round, and the v5.34.92 weighting was dead on the
+   * distributed flow — the normal one. */
+  try{ data.dimTiers=dimensionTierMap(); }catch(e){ data.dimTiers=null; }
+  /*
+   * v5.34.85: consent was documented as "stored with the session so there is
+   * a record" and was in no blob, no field and no request — the one claim in
+   * this file that was the opposite of the truth, about the one thing a firm
+   * may later have to evidence. Recorded now, with the version and wording
+   * that were actually shown.
+   */
+  data.consent=S.consent||null;
   if(S.isRefreshMode){
     data.isRefresh=true;
+    data.isRefreshMode=true;
+    data.refreshRoundLabel='Round '+S.refreshRound+' — Follow-up';
+    data.coverage=S.coverage||{};
     data.refreshRound=S.refreshRound;
     data.refreshTrigger=S.refreshTrigger;
     data.refreshScope=S.refreshScope;
@@ -1994,13 +2091,52 @@ function restoreScoresToSynthesis(){
   S.messages=(rec.transcript||[]).map(function(t){ return {role:t.role,content:t.content}; });
   S.documents=S.documents||[];
   S.isRefreshMode=!!rec.isRefreshMode;
+  S.refreshRoundLabel=rec.roundLabel||null;
+  /* v5.34.94: carried through the archive since this version. Older records
+   * have neither, and for those the fallbacks below are the best available —
+   * but an older refresh record still cannot name its round, so it is refused
+   * rather than silently routed into the current one. */
+  S.coverage=rec.coverage||{};
+  S.dimTiers=rec.dimTiers||null;
   if(S.isRefreshMode){
     S.refreshScope=rec.refreshScope||[];
     S.refreshRound=rec.refreshRound||null;
     S.refreshQuestionBudget=rec.refreshQuestionBudget||(rec.refreshScope?{low:6,high:Math.min(30,Math.max(6,(rec.refreshScope.length||1)*3)),items:0,mandatory:0}:null);
+    if(!S.refreshRound){
+      /* Refusing beats guessing. writeInterviewToEngagement() routes a refresh
+       * with no round number into the CURRENT round, where the role upsert
+       * replaces that role's original interview — so a well-meant recovery
+       * would delete the baseline the refresh was measured against. A record
+       * archived before v5.34.94 cannot say which round it belonged to. */
+      setRecoverStatus('This record is from a follow-up round but does not say which round '
+        + '(it was archived before v5.34.94). Restoring it could overwrite the original '
+        + 'interview for this role. Re-run the follow-up instead, or send me the file.', false);
+      return;
+    }
   }
   if(typeof saveSession==='function') saveSession();
-  setRecoverStatus('✓ Restored "'+(rec.client||'')+' · '+(rec.stakeholderName||rec.stakeholderRole||'')+'" (session '+S.sessionCode+') into storage. Open the Synthesis Dashboard and load this client to see the scores.', true);
+  /* v5.34.94 — THE RESTORE NEVER REACHED SYNTHESIS.
+   *
+   * This wrote a vynora_session_* blob and then told the consultant to open the
+   * Synthesis Dashboard. Synthesis scores from vynora_engagement_<code>; the
+   * only place it touches vynora_session_* is the client-scoped delete
+   * predicate (synthesis.html:3325). So the recovery feature — whose entire
+   * purpose is salvaging an interview that would otherwise be lost — wrote to a
+   * key nothing reads, reported success, and produced no visible change.
+   *
+   * writeInterviewToEngagement() is the function that puts an interview into
+   * engagement.rounds. It is what finishInterview() calls, and it is what this
+   * needed to call all along. */
+  var wrote=false;
+  try{ writeInterviewToEngagement(); wrote=true; }
+  catch(e){ console.warn('[Recover] engagement write failed:', e.message); }
+  setRecoverStatus(wrote
+    ? '✓ Restored "'+(rec.client||'')+' · '+(rec.stakeholderName||rec.stakeholderRole||'')
+      + '" into the engagement record'+(S.isRefreshMode?(' (round '+S.refreshRound+')'):'')
+      + '. Open the Synthesis Dashboard and load this client. Note: this replaces any existing '
+      + 'interview for this role in that round.'
+    : 'Restored into storage, but writing it into the engagement record failed — the Synthesis '
+      + 'Dashboard will not show it. Check the browser console and send me the error.', wrote);
   var act=document.getElementById('recover-action'); if(act) act.style.display='none';
 }
 
@@ -2152,7 +2288,11 @@ function resumeFromCode(){
   const sess=loadSessionByCode(code);
   if(!sess){showToast('Session not found. Sessions are saved to the firm cloud workspace.');return;}
   // Restore state
-  S={...S,...sess,isListening:false,isSpeaking:false,isThinking:false};
+  /* v5.34.91: interviewComplete is deliberately forced back to false here. If
+   * the consultant is resuming, the room is open again and more evidence is
+   * about to arrive — so the scorecard goes back to interim readings and stops
+   * naming maturity levels until finishInterview() closes it again. */
+  S={...S,...sess,isListening:false,isSpeaking:false,isThinking:false,interviewComplete:false};
   // Use API key from setup form if available, else prompt
   const formKey=document.getElementById('api-key').value.trim();
   if(formKey)S.apiKey=formKey;
@@ -2469,14 +2609,34 @@ function showToast(msg,duration=5000){
  *  name the persona actually introduces itself with. Falls back only when no
  *  identity was assigned at all. */
 function agentLabel(){
+  /* v5.34.91: the no-identity fallback is 'Vyn', not 'VYNE Agent'.
+   * interviewerPersona.ts has defaulted to "Vyn" since v5.32.33 and the text
+   * prompt now does too (textInterviewerName), so a bubble labelled "VYNE
+   * Agent" beside an interviewer saying "I'm Vyn" was the same two-people bug
+   * in the one case where nobody had been assigned. */
   try{
-    return (LIVE && LIVE.opts && LIVE.opts.interviewerName) || S.interviewerName || 'VYNE Agent';
-  }catch(e){ return 'VYNE Agent'; }
+    return (LIVE && LIVE.opts && LIVE.opts.interviewerName) || S.interviewerName || 'Vyn';
+  }catch(e){ return 'Vyn'; }
+}
+/** The name the TEXT interviewer introduces itself with, sanitised.
+ *
+ *  Deliberately not agentLabel(): that falls back to the display string "VYNE
+ *  Agent", which is a UI label and not something anyone should say out loud.
+ *
+ *  The sanitiser mirrors safeIdentity() in interviewerPersona.ts, and it is not
+ *  cosmetic. This string is interpolated into the system prompt ABOVE the data
+ *  fence, and during an interview this browser belongs to the interviewee — so
+ *  anything that is not plainly a name is dropped rather than escaped. */
+function textInterviewerName(){
+  var n = '';
+  try{ n = String(S.interviewerName || (assignedInterviewerIdentity()||{}).name || ''); }catch(e){}
+  n = n.replace(/[^\p{L}\p{N} '\-&,]/gu, ' ').replace(/\s+/g, ' ').trim().slice(0, 40);
+  return n || 'Vyn';
 }
 /** Initials for the avatar bubble: "Jack Smith" → "JS". */
 function agentInitials(){
   var n=String(agentLabel()||'').trim();
-  if(!n || n==='VYNE Agent') return 'VY';
+  if(!n || n==='VYNE Agent' || n==='Vyn') return 'VY';
   var parts=n.split(/\s+/).filter(Boolean);
   return ((parts[0][0]||'')+(parts.length>1?parts[parts.length-1][0]:'')).toUpperCase() || 'VY';
 }
@@ -2586,12 +2746,142 @@ async function submitClarification(encodedOriginal){
 // -------------------------------------------------------------------
 // SCORECARD RENDER
 // -------------------------------------------------------------------
+/**
+ * The live scorer's heartbeat, on the scorecard panel. (v5.34.86)
+ *
+ * The seven dimension bars beside the conversation are the consultant's view of
+ * the assessment forming in real time. They move only when a scoring pass
+ * lands, so between passes a working scorer and a dead one looked exactly the
+ * same — a still panel. That ambiguity is worse now that a dead scorer ends the
+ * sitting: the consultant needs to see the difference between "nothing has been
+ * evidenced yet" and "nothing is being scored".
+ *
+ * Deliberately quiet. This sits in the interviewee's browser on a distributed
+ * interview, so it says nothing technical and nothing alarming — it reads as
+ * the panel keeping up, not as a diagnostic.
+ */
+function setScoringIndicator(active){
+  var el=document.getElementById('scoring-indicator');
+  if(!el){
+    var box=document.querySelector('.overall-score-box');
+    if(!box) return;
+    el=document.createElement('div');
+    el.id='scoring-indicator';
+    el.style.cssText='font-size:10px;letter-spacing:0.08em;text-transform:uppercase;'
+      + 'margin-top:6px;height:12px;transition:opacity 0.25s;opacity:0;color:var(--mid-gray)';
+    box.appendChild(el);
+  }
+  el.textContent = active ? 'listening · updating scores' : '';
+  el.style.opacity = active ? '1' : '0';
+}
+
+/* ── v5.34.91: SEEING a number is not the same as being GIVEN ITS MEANING ────
+ *
+ * The scorecard printed an unqualified maturity label under every dimension
+ * from the first scoring pass onward: one answer into a 45-minute interview,
+ * "Governance & Risk — 1.0 / 5 · AI Unaware". Two things were wrong with that,
+ * and they are different things.
+ *
+ * 1. TIME. A live score is an interim reading of a conversation that has not
+ *    finished. The number is honest — it is what the evidence so far supports,
+ *    and watching it move is the point of the live meter. The MATURITY LABEL is
+ *    not: "AI Unaware" is a verdict, and a verdict on partial evidence is just
+ *    wrong rather than provisional. So the number stays live and the label
+ *    waits until the interview is closed.
+ *
+ * 2. WEIGHT. Not every dimension is being assessed to the same depth in this
+ *    interview, and one may not be being assessed at all. getRolePriorityData()
+ *    tiers them per role, the Pre-Engagement roleCatalog can override that
+ *    tiering outright, and a round's scopeDimensions can narrow it further — a
+ *    dimension absent from all three is EXCLUDED, not "scored zero". A 1.4 on a
+ *    LIGHT dimension means "we asked two questions in passing"; the same 1.4 on
+ *    a LEAD dimension is a finding. Rendering both as the same badge invited
+ *    exactly the misreading the user described.
+ *
+ * The tier map is derived from buildLiveAgenda() rather than recomputed here,
+ * deliberately: that is the same object the interviewer is given, so the panel
+ * cannot tell the consultant a dimension is in scope while the interviewer has
+ * been told to leave it alone. One source, two readers.
+ */
+var DIM_TIER_LABEL = { lead:'Lead', cover:'Cover', light:'Light', out:'Not in scope' };
+var DIM_TIER_NOTE = {
+  lead:  'Lead dimension for this role',
+  cover: 'Covered at moderate depth',
+  light: 'Light coverage — indicative only, not a rating',
+  out:   'Not in scope for this role — any number here is incidental',
+};
+
+function dimensionTierMap(){
+  var map = {};
+  ['D1','D2','D3','D4','D5','D6','D7'].forEach(function(d){ map[d] = 'out'; });
+  var a = {};
+  try{ a = buildLiveAgenda() || {}; }catch(e){}
+  // Applied weakest-first so a dimension listed twice resolves to its strongest
+  // tier rather than to whichever list happened to be iterated last.
+  (a.light || []).forEach(function(d){ if(map[d]) map[d] = 'light'; });
+  (a.cover || []).forEach(function(d){ if(map[d]) map[d] = 'cover'; });
+  (a.lead  || []).forEach(function(d){ if(map[d]) map[d] = 'lead';  });
+  return map;
+}
+
+// The interview is closed when finishInterview() has completed. Until then every
+// number on this panel is an interim reading, and nothing here is a verdict.
+function scoringIsFinal(){ return !!S.interviewComplete; }
+
+/* ONE overall, read by the live panel and the export sheet.
+ *
+ * Both used to compute their own `vals.reduce(...)/vals.length` over every
+ * score in S, which meant an EXCLUDED dimension — one the consultant switched
+ * off for this role in Pre-Engagement, or one outside this round's scope —
+ * still pulled the client's headline number down if a scoring pass happened to
+ * put anything on it. It is not part of the assessment, so it is not part of
+ * the mean.
+ *
+ * v5.34.91 deliberately did NOT weight lead/cover/light against each other,
+ * on the grounds that a second arithmetic here would disagree with Synthesis.
+ * v5.34.92 does weight them — but by adding the weighting to the SHARED
+ * formula (VyneScoring.dimensionWeights / overallOf, mirrored in
+ * backend/src/tenant/scoring.ts and pinned by scoringParity.test.ts) and
+ * calling it from here, rather than by growing a private one. The objection
+ * was to a second implementation, not to the idea.
+ *
+ * For a single interview the weights are just this role's own tiers: a CTO's
+ * overall leans on D2/D1/D6 because that is where the questions went.
+ */
+function computeOverall(){
+  var tiers = dimensionTierMap();
+  var scored = DIMENSIONS.filter(function(d){
+    return (S.scores[d.code] || 0) > 0 && tiers[d.code] !== 'out';
+  });
+  var inScope = DIMENSIONS.filter(function(d){ return tiers[d.code] !== 'out'; });
+  /* One interview, so the round is [this interview] and the weights are its
+   * own tier map. dimensionWeights returns null if the tiering excludes
+   * everything, and overallOf then falls back to the plain mean — which is
+   * also what happens if vyne-scoring.js somehow failed to load. */
+  var value = 0;
+  try{
+    var w = window.VyneScoring.dimensionWeights([{ dimTiers: tiers }]);
+    value = window.VyneScoring.overallOf(S.scores, w) || 0;
+  }catch(e){
+    var sum = scored.reduce(function(a, d){ return a + S.scores[d.code]; }, 0);
+    value = scored.length ? sum / scored.length : 0;
+  }
+  return {
+    value:    value,
+    assessed: scored.length,
+    inScope:  inScope.length,
+  };
+}
+
 function renderScorecard(){
   const c=document.getElementById('dim-cards-container');
+  const tiers=dimensionTierMap();
+  const isFinal=scoringIsFinal();
   c.innerHTML=DIMENSIONS.map(d=>{
     const sc=S.scores[d.code]||0;
     const pct=(sc/5)*100;
     const m=getMaturity(sc);
+    const tier=tiers[d.code]||'out';
     // Benchmark markers
     const bm = S.benchmarks && S.benchmarks[d.code];
     const avgPct  = bm ? ((bm.avg||0)/5*100).toFixed(1)  : null;
@@ -2599,10 +2889,24 @@ function renderScorecard(){
     const avgMarker  = avgPct  ? `<div style="position:absolute;left:${avgPct}%;top:0;bottom:0;width:2px;background:rgba(55,138,221,0.7);border-radius:1px" title="Industry avg: ${bm.avg}"></div>` : '';
     const bestMarker = bestPct ? `<div style="position:absolute;left:${bestPct}%;top:0;bottom:0;width:2px;background:rgba(16,185,129,0.7);border-radius:1px" title="Best-in-class: ${bm.best}"></div>` : '';
     // bmLegend removed — single legend shown below all cards
-    return `<div class="dim-card">
+    /* The maturity LABEL is the claim; the number is the observation.
+     * - not scored yet  → say so, and nothing else.
+     * - light / out     → never a maturity label at any point. The depth of
+     *                     questioning cannot support one, and saying it later
+     *                     does not make it supportable.
+     * - lead / cover    → interim reading during the interview, label at close. */
+    const caption = sc <= 0
+      ? (tier === 'out' ? 'Not assessed — out of scope' : 'Not yet assessed')
+      : (tier === 'out' || tier === 'light')
+        ? DIM_TIER_NOTE[tier]
+        : (isFinal ? m.label : 'Interim reading — interview in progress');
+    return `<div class="dim-card${tier==='out'?' is-out':''}">
       <div class="dim-header">
         <div class="dim-name">${d.code}</div>
-        <div class="dim-score">${sc>0?sc.toFixed(1):'--'} <span>/ 5</span></div>
+        <div style="display:flex;align-items:center;gap:6px">
+          <span class="dim-tier dim-tier-${tier}" title="${esc(DIM_TIER_NOTE[tier])}">${DIM_TIER_LABEL[tier]}</span>
+          <div class="dim-score">${sc>0?sc.toFixed(1):'--'} <span>/ 5</span></div>
+        </div>
       </div>
       <div style="font-size:10px;color:var(--mid-gray);margin-bottom:5px">${d.name}</div>
       <div class="dim-bar-track" style="position:relative">
@@ -2610,7 +2914,7 @@ function renderScorecard(){
         ${avgMarker}${bestMarker}
       </div>
 
-      <div class="dim-q-count">${sc>0?m.label:'Not yet assessed'}</div>
+      <div class="dim-q-count">${caption}</div>
     </div>`;
   }).join('');
   /* ONE benchmark legend below all the dimension cards.
@@ -2628,15 +2932,39 @@ function renderScorecard(){
       '</div>'
     );
   }
-  const vals=Object.values(S.scores).filter(s=>s>0);
-  if(vals.length){
-    const ov=vals.reduce((a,b)=>a+b,0)/vals.length;
-    const m=getMaturity(ov);
-    document.getElementById('overall-score-num').textContent=ov.toFixed(1);
-    document.getElementById('maturity-badge').textContent=m.label;
-    document.getElementById('maturity-badge').style.background=m.bg;
-    document.getElementById('maturity-badge').style.color=m.color;
+  /* The badge is the claim, and it is withheld until the interview is closed.
+   * The NUMBER keeps moving live — that is the point of the meter, and the
+   * consultant needs to see the evidence landing. What they must not be handed
+   * mid-interview is "AI Unaware" over a conversation that is still running. */
+  const ovr=computeOverall();
+  const badge=document.getElementById('maturity-badge');
+  if(ovr.assessed){
+    document.getElementById('overall-score-num').textContent=ovr.value.toFixed(1);
+    if(isFinal){
+      const m=getMaturity(ovr.value);
+      badge.textContent=m.label;
+      badge.style.background=m.bg;
+      badge.style.color=m.color;
+    }else{
+      badge.textContent='INTERIM';
+      badge.style.background='rgba(1,32,61,0.15)';
+      badge.style.color='var(--mid-gray)';
+    }
   }
+  /* What the number is standing on, in one line, always visible.
+   *
+   * Built with textContent rather than an insertAdjacentHTML template on
+   * purpose: it would otherwise be a twelfth unresolvable innerHTML sink in
+   * this file (innerHtmlSinks.test.ts), and there is nothing here that needs
+   * markup. A ratchet is only worth having if new code is held to it. */
+  var note = document.createElement('div');
+  note.className = 'score-provisional';
+  note.textContent = isFinal
+    ? 'Final for this interview: '+ovr.assessed+' of '+ovr.inScope+' in-scope dimensions evidenced. '+
+      'Light-coverage dimensions carry no maturity rating. Engagement-level maturity is set in Synthesis, across all stakeholders.'
+    : 'Interim — the interview is still running. '+ovr.assessed+' of '+ovr.inScope+' in-scope dimensions have evidence so far; '+
+      'maturity levels are withheld until it closes.';
+  c.appendChild(note);
   const total = (S.isRefreshMode && S.refreshQuestionBudget)
     ? S.refreshQuestionBudget.high
     : VyneDepth.initialBudget(S.depth);   // v5.33.8
@@ -3241,6 +3569,25 @@ function getRoleDimensionPriority(role){
   return s;
 }
 
+/**
+ * What the interviewer must never say to the interviewee. (v5.34.90)
+ *
+ * VERBATIM from backend/src/llm/interviewerPersona.ts's exported
+ * CONFIDENTIALITY_RULE, which the VOICE path uses. This is a browser file and
+ * cannot import it, so the two copies are pinned together by
+ * interviewerConfidentialityParity.test.ts — the same guard the scoring rubric
+ * needed, for the same reason: two interviewers, one promise to the client.
+ *
+ * The text path had NO rule of this kind and was told to volunteer a
+ * "diagnostic insight" every few exchanges. In production it told a client
+ * executive they were "in a common but risky position" and building "risk
+ * exposure very quickly" — the firm's draft judgement, handed to its subject,
+ * by the instrument still gathering the evidence for it.
+ */
+var CONFIDENTIALITY_RULE =
+  "You never reveal, quote, summarise, or hint at the consulting firm's own analysis, hypotheses, or expectations. " +
+  "If asked directly, say you are only here to listen and understand, and move on.";
+
 function buildSystemPrompt(){
   // TASK 3: in refresh mode, use the custom refresh prompt built at session start.
   if(S.isRefreshMode && S.refreshSystemPrompt){ return S.refreshSystemPrompt; }
@@ -3289,7 +3636,21 @@ function buildSystemPrompt(){
       + '\n\n';
   }
 
-  return 'You are VYNE, the AI interview agent for Vynora Consulting Corporation -- a premium AI advisory firm. You are conducting a structured AI Readiness Diagnostic Interview as part of the VYNE Framework(TM) AI Diagnostic Sprint.\n\n'
+  /* v5.34.91 — the text interviewer introduced itself as "VYNE" while every
+   * chat bubble beside it was labelled "Jack Smith".
+   *
+   * v5.34.41 fixed the LABEL (agentLabel/agentInitials read the assigned
+   * identity) and the voice persona has said "Your name is <me>" since
+   * v5.32.33 — but this prompt, the text path's, still hardcoded the product
+   * name. So on the text path the interviewee was introduced to one person and
+   * watched a different one talk, for the whole interview. Observed in
+   * production on 5.34.89.
+   *
+   * Same source as the label, so the two cannot disagree again. */
+  var me = textInterviewerName();
+  return 'You are ' + me + ', an AI interview agent for Vynora Consulting Corporation -- a premium AI advisory firm. '
+    + 'When you introduce yourself, say exactly that name — never a placeholder, never a bracket, never "VYNE". '
+    + 'You are conducting a structured AI Readiness Diagnostic Interview as part of the VYNE Framework(TM) AI Diagnostic Sprint.\n\n'
     + 'ENGAGEMENT CONTEXT:\n'
     + '- Client Company: ' + S.client + '\n'
     + '- Industry: ' + effectiveIndustry + revenueContext + '\n'
@@ -3321,7 +3682,24 @@ function buildSystemPrompt(){
     + '- Generate intelligent follow-up questions when responses are vague\n'
     + '- Cover dimensions according to this stakeholder role weighting (listed highest to lowest priority):\n'    + getRoleDimensionPriority(S.stakeholderRole)
     + '- When a document is shared, acknowledge it, extract insights, and reference them\n'
-    + '- After every 4-5 exchanges, offer a brief diagnostic insight\n\n'
+    /*
+     * v5.34.90 — was: "After every 4-5 exchanges, offer a brief diagnostic
+     * insight". That instruction made the interviewer hand the firm's own read
+     * of the client to the client, mid-diagnostic, before any consultant had
+     * reviewed a word of it. Observed in production, unprompted, to a client
+     * executive: "you are in a common but risky position ... you build up
+     * technical debt and risk exposure very quickly."
+     *
+     * The instruction existed for a good reason — an interview that only takes
+     * and never gives feels like an interrogation — so it is replaced rather
+     * than deleted. Reflecting back what they SAID does the same conversational
+     * work and reveals nothing: it is a comprehension check, and it makes the
+     * interviewee correct you, which is better evidence than agreement.
+     */
+    + '- Every few exchanges, briefly play back what you have understood so far in their own terms, '
+    + 'and invite them to correct you. Describe only what THEY told you. Never offer your assessment, '
+    + 'a score, a maturity level, a comparison to other firms, or what any of it implies.\n\n'
+    + CONFIDENTIALITY_RULE + '\n\n'
     + briefingSection
     + 'RESPONSE FORMAT: After every response, append this exact block:\n'
     + '<<<SCORES>>>\n'
@@ -3730,12 +4108,28 @@ function mqAnswerers(store, qid){
 }
 
 // For an interview: the mandatory questions THIS PERSON has not yet answered.
-function getDueMandatoryQuestions(client, role, personName){
+/*
+ * v5.34.79 — releaseHolds: a RESTART asks everything again.
+ *
+ * The welcome screen offers two doors once someone has started: "Continue
+ * where you left off" and "Start over from the beginning". They differ in what
+ * the interviewee expects to happen, and until now they did not differ here —
+ * both consulted the completed store, so starting over still skipped every
+ * required question the person had already answered. "From the beginning" that
+ * silently omits the required questions is not from the beginning.
+ *
+ * The store is NOT cleared. It is the record of who answered what and when,
+ * and a restart is not a reason to lose it — it is only a reason to stop it
+ * suppressing. So the release is a read-time argument, passed from
+ * startNewInterview() alone; resume and every other caller are unchanged.
+ */
+function getDueMandatoryQuestions(client, role, personName, releaseHolds){
   var store=loadMandatoryStore(client);
   var me=mqPersonKey(role, personName);
   var due=[];
   store.questions.forEach(function(q){
     if(q.roles.indexOf(role)<0) return;                       // not assigned to this role
+    if(releaseHolds){ due.push({id:q.id, text:q.text, dimensions:q.dimensions||[], asked:false}); return; }
     var answered=mqAnswerers(store, q.id).some(function(a){
       if(!a.legacy) return a.key===me;
       /* A legacy role-level record cannot tell us WHICH holder answered. It
@@ -3764,22 +4158,206 @@ function markMandatoryComplete(client, qid, role, personName){
   saveMandatoryStore(client, store);
 }
 
+/*
+ * Every turn of this interview, as {role:'ai'|'user', text}. (v5.34.79)
+ *
+ * S.messages is written by the TEXT path only. S.displayMessages is written by
+ * BOTH, which is why renderWelcome() already treats it as the honest measure of
+ * "has this person talked". markAskedMandatoryQuestions() read S.messages, so
+ * on a VOICE interview it saw an empty conversation and marked nothing — the
+ * required questions were never recorded as asked however many times the
+ * interviewer asked them, and the Finish backstop then force-asked all of them
+ * again at the end of a sitting in which they had all been answered.
+ */
+function allInterviewTurns(){
+  var dm=(S.displayMessages||[]).filter(function(m){ return m && m.text; });
+  if(dm.length) return dm.map(function(m){
+    return { role: (m.role==='user' ? 'user' : 'ai'), text: String(m.text) };
+  });
+  return (S.messages||[]).filter(function(m){ return m && m.content; }).map(function(m){
+    return { role: (m.role==='user' ? 'user' : 'ai'), text: String(m.content) };
+  });
+}
+
+/**
+ * Every question this interviewer has already asked AND had answered. (v5.34.79)
+ *
+ * ── Why a separate block from the transcript ────────────────────────────────
+ *
+ * priorTranscriptBlock carries the most recent 3200 characters of exchanges.
+ * That is the right thing for continuity — it is what the interviewer needs to
+ * pick up a thread — and the wrong thing for not repeating itself, because the
+ * oldest questions fall off first and they are precisely the ones most at risk
+ * of being asked again. Stripping the answers away leaves something small
+ * enough that the whole interview fits.
+ *
+ * ── asked AND answered ──────────────────────────────────────────────────────
+ *
+ * A question the interviewee never answered is not finished business, and
+ * suppressing it would quietly lose it — which matters most for a PAUSE: the
+ * question on screen when someone walked away is usually unanswered, and on
+ * resume it is the one question that SHOULD come again. So a question counts
+ * as done only when a non-empty interviewee turn follows it. The trailing
+ * unanswered question is named separately, so the interviewer knows to put it
+ * back rather than treating it as covered.
+ *
+ * ── This text is model output, so it stays fenced ───────────────────────────
+ *
+ * These are the interviewer's own words, but an interviewee can steer what the
+ * interviewer says, so a line here is reachable by someone outside the firm.
+ * It therefore rides in the BACKGROUND block with everything else the
+ * interviewee can influence; the rule that gives it force
+ * (interviewerPersona.ts) sits above the fence and carries only a COUNT.
+ */
+function askedQuestionsBlock(budget){
+  try{
+    var turns = allInterviewTurns();
+    if(!turns.length) return '';
+    var asked = [];        // answered questions, oldest first
+    var pending = null;    // the last question with no answer after it
+    var seen = {};
+    for(var i = 0; i < turns.length; i++){
+      if(turns[i].role !== 'ai') continue;
+      var qs = String(turns[i].text).split(/(?<=[?])\s+/)
+        .filter(function(s){ return s.indexOf('?') >= 0; })
+        .map(function(s){ return s.replace(/\s+/g,' ').trim(); })
+        .filter(function(s){ return s.length > 12; });
+      if(!qs.length) continue;
+      var answered = turns.slice(i+1).some(function(t){ return t.role==='user' && t.text.trim().length > 0; });
+      qs.forEach(function(q){
+        if(q.length > 220) q = q.slice(0, 220) + '…';
+        var k = q.toLowerCase().replace(/[^a-z0-9 ]/g,'').replace(/\s+/g,' ');
+        if(answered){ if(!seen[k]){ seen[k] = 1; asked.push(q); } }
+        else { pending = q; }
+      });
+    }
+    if(!asked.length && !pending) return '';
+    var out = [];
+    if(asked.length){
+      /*
+       * Newest first when trimming: if this ever has to be cut, the questions
+       * asked minutes ago are the ones the model is about to repeat, so they
+       * are the ones that must survive. Rendered oldest-first for readability.
+       */
+      var kept = [], used = 0;
+      for(var j = asked.length - 1; j >= 0; j--){
+        if(used + asked[j].length + 3 > budget) break;
+        used += asked[j].length + 3; kept.unshift(asked[j]);
+      }
+      out.push('Questions you have ALREADY asked in this interview, and which have been answered:');
+      kept.forEach(function(q,k){ out.push((k+1) + '. ' + q); });
+      if(kept.length < asked.length) out.push('(' + (asked.length - kept.length) + ' earlier ones omitted for length — they are answered too.)');
+    }
+    if(pending){
+      out.push('');
+      out.push('This one was asked but NOT answered — the interview was interrupted here. Ask it again:');
+      out.push(pending);
+    }
+    return out.join('\n');
+  }catch(e){ return ''; }
+}
+
 // Detect which of S.mandatoryQuestions were asked AND responded to (a user turn after the agent asked).
+/*
+ * Does this turn ask that question? (v5.34.83)
+ *
+ * ── MQ_OVERLAP and why it is not simply lowered ─────────────────────────────
+ *
+ * Two errors are possible and they are NOT symmetric. Marking a required
+ * question done when it was never asked LOSES it — the firm promised to ask it
+ * and nobody notices it was skipped. Failing to mark one that WAS asked merely
+ * risks repetition. So the threshold stays high, and the way to catch more is
+ * to compare better, not to demand less.
+ *
+ * ── What changed ────────────────────────────────────────────────────────────
+ *
+ * Measured on the 2026-09-14 run: the interviewer asked "who actually makes the
+ * final decision to let it start affecting production or customers?" for the
+ * required question "Who signs off before a model is allowed to affect a
+ * customer or a production line?" — the same question in its own words. It
+ * scored 0.5 and went unmarked, so it stayed on the outstanding list and would
+ * have been re-asked at the next mint.
+ *
+ *   · Light stemming, so models≈model, affecting≈affect, reports≈report. The
+ *     old code compared raw tokens, which failed on ordinary inflection.
+ *   · WORD-BOUNDARY matching. The old code used indexOf, so the question word
+ *     "line" was satisfied by "airline" or "online" and "sign" by "design" —
+ *     false hits that pushed unrelated turns toward the threshold and made the
+ *     score mean less than it appeared to.
+ *
+ * This still cannot see through a genuine paraphrase — "signs off" and "makes
+ * the final decision" share no words at all. Nothing token-based can. That gap
+ * is closed above the prompt's data fence instead (interviewerPersona.ts), by
+ * telling the interviewer to check the asked list before it asks a required
+ * question and to treat one it already asked in different words as done. Text
+ * matching does the mechanical half; the model does the semantic half.
+ */
+var MQ_OVERLAP = 0.7;
+var MQ_STOP = {'the':1,'a':1,'an':1,'of':1,'to':1,'and':1,'or':1,'in':1,'on':1,'for':1,'is':1,'are':1,'you':1,'your':1,'have':1,'has':1,'do':1,'this':1,'that':1,'with':1,'we':1,'i':1,'it':1,'be':1,'as':1,'at':1,'by':1,'how':1,'what':1,'please':1,'confirm':1};
+/** Crude, deliberate: plural and participle endings only. No irregular forms. */
+function mqStem(w){
+  return w.replace(/(ies)$/, 'y').replace(/(sses|shes|ches|xes)$/, function(m){ return m.slice(0, -2); })
+          .replace(/(ing|ed|es|s)$/, '');
+}
+function mqTokens(text){
+  return String(text||'').toLowerCase().replace(/[^a-z0-9\s]/g,' ').split(/\s+/)
+    .filter(function(w){ return w.length>3 && !MQ_STOP[w]; }).map(mqStem);
+}
+/** The fraction of the question's content words this turn actually contains. */
+function mqOverlap(turnText, questionText){
+  var want=mqTokens(questionText);
+  if(!want.length) return 0;
+  var got={}; mqTokens(turnText).forEach(function(w){ got[w]=1; });
+  var hits=0, seen={};
+  want.forEach(function(w){ if(seen[w]) return; seen[w]=1; if(got[w]) hits++; });
+  var distinct=Object.keys(seen).length;
+  return distinct ? hits/distinct : 0;
+}
+
+/**
+ * The interview's own record of whether it was being scored. (v5.34.85)
+ *
+ * ── Why this has to be on the RECORD and not on a screen ────────────────────
+ *
+ * On a distributed interview this page runs in the INTERVIEWEE's browser. Every
+ * signal the product had for a scoring outage — the voice badge, the "no
+ * dimension scores" toast — therefore went to a senior executive who has never
+ * heard of a dimension score and could not act on one if they had. The
+ * consultant, whose deliverable is the thing being hollowed out, was told
+ * nothing and found out by opening an empty scorecard afterwards.
+ *
+ * So scoring health rides in the session, which is saved to the server with
+ * everything else and read by the consultant. It answers the question the
+ * scorecard cannot: were these scores thin because the conversation was thin,
+ * or because the scorer was down?
+ *
+ * Kept small and bounded on purpose — a count, the last reason, and the first
+ * and last times — because it is written on a per-minute cadence for the life
+ * of the interview and has to survive a three-hour sitting.
+ */
+function recordScoringHealth(ok, info){
+  if(!S.scoreHealth) S.scoreHealth = { passes:0, failures:0, lastError:null, everSucceeded:false,
+                                       firstFailureAt:null, lastFailureAt:null, stopped:false };
+  var h = S.scoreHealth;
+  if(ok){ h.passes++; h.everSucceeded = true; return; }
+  h.failures++;
+  h.lastError = (info && info.code) || 'scoring_failed';
+  h.lastFailureAt = new Date().toISOString();
+  if(!h.firstFailureAt) h.firstFailureAt = h.lastFailureAt;
+  if(info && info.consecutive) h.maxConsecutive = Math.max(h.maxConsecutive || 0, info.consecutive);
+}
+
 function markAskedMandatoryQuestions(){
   if(!S.mandatoryQuestions || !S.mandatoryQuestions.length) return;
-  var msgs=S.messages||[];
-  var stop={'the':1,'a':1,'an':1,'of':1,'to':1,'and':1,'or':1,'in':1,'on':1,'for':1,'is':1,'are':1,'you':1,'your':1,'have':1,'has':1,'do':1,'this':1,'that':1,'with':1,'we':1,'i':1,'it':1,'be':1,'as':1,'at':1,'by':1,'how':1,'what':1,'please':1,'confirm':1};
+  var msgs=allInterviewTurns().map(function(m){ return { role:m.role, content:m.text }; });
   S.mandatoryQuestions.forEach(function(q){
     if(q.asked) return;
-    var words=q.text.toLowerCase().replace(/[^a-z0-9\s]/g,' ').split(/\s+/).filter(function(w){return w.length>3 && !stop[w];});
-    if(!words.length) return;
+    if(!mqTokens(q.text).length) return;
     // find the first AI turn that strongly overlaps the question, and require a later USER turn (a response)
     for(var i=0;i<msgs.length;i++){
       var m=msgs[i];
       if(m.role!=='ai' && m.role!=='assistant') continue;
-      var t=(m.content||'').toLowerCase();
-      var hits=words.filter(function(w){ return t.indexOf(w)>=0; }).length;
-      if(hits/words.length >= 0.7){
+      if(mqOverlap(m.content||'', q.text) >= MQ_OVERLAP){
         // asked here — was there a user response after this turn?
         var responded=msgs.slice(i+1).some(function(mm){ return mm.role==='user' && (mm.content||'').trim().length>0; });
         if(responded){ q.asked=true; if(q.id && S.client && S.stakeholderRole) markMandatoryComplete(S.client, q.id, S.stakeholderRole, S.stakeholderName); }
@@ -3814,7 +4392,10 @@ async function startNewInterview(){
      interviewerName:identity.name,
      interviewerVoice:identity.voice,
      industry,voiceMode,depth,apiKey,eventContext:eventContext||null,
-     mandatoryQuestions:getDueMandatoryQuestions(client, role, name),
+     // v5.34.79 — a restart releases the holds (see getDueMandatoryQuestions).
+     // This is the ONLY caller that passes true: every other path is a resume,
+     // a preview or a follow-up, none of which should re-ask what is answered.
+     mandatoryQuestions:getDueMandatoryQuestions(client, role, name, true),
      messages:[],scores:{},findings:[],documents:[],benchmarks:null,questionsAsked:0,displayMessages:[],
      // v5.32.66 — see the matching note on the refresh path above.
      scoreEvents:[],findingEvents:[]};
@@ -3881,49 +4462,154 @@ function setVoiceBadge(mode, detail){
 }
 
 /** Everything the interviewer needs to know, as DATA (never as instructions). */
+/**
+ * The dimension agenda for the LIVE interviewer. (v5.34.73)
+ *
+ * Codes only. The names, and every sentence built around them, live in
+ * backend/src/llm/interviewerPersona.ts — this must stay an enum, because it is
+ * the one thing from this browser that lands ABOVE the prompt's data fence, and
+ * during an interview this browser belongs to the interviewee.
+ *
+ * `evidenced` is recomputed at every mint (see the function form passed to
+ * vyneLiveInterview.create), so after a ~10-minute handover the interviewer
+ * knows what it already has and stops re-asking it.
+ */
+function buildLiveAgenda(){
+  var DIMS = ['D1','D2','D3','D4','D5','D6','D7'];
+  var only = function(a){
+    return (a||[]).map(function(x){ return String(x).slice(0,2).toUpperCase(); })
+                  .filter(function(d){ return DIMS.indexOf(d) >= 0; });
+  };
+  var p = {};
+  try{ p = getRolePriorityData(S.stakeholderRole) || {}; }catch(e){}
+  var scope = null;
+  try{
+    var br = loadBriefingContext(S.client);
+    if(br && br.scopeDimensions && br.scopeDimensions.length) scope = only(br.scopeDimensions);
+  }catch(e){}
+  // A round can narrow the agenda. Out-of-scope dimensions are not this
+  // interview's job, so they should not be in the interviewer's head at all.
+  var inScope = function(list){
+    return scope && scope.length ? list.filter(function(d){ return scope.indexOf(d) >= 0; }) : list;
+  };
+  var evidenced = [];
+  try{
+    evidenced = DIMS.filter(function(d){ return S.scores && typeof S.scores[d] === 'number' && S.scores[d] > 0; });
+  }catch(e){}
+  return {
+    lead:      inScope(only(p.lead)),
+    cover:     inScope(only(p.cover)),
+    light:     inScope(only(p.light)),
+    evidenced: evidenced,
+  };
+}
+
+/**
+ * Everything the live interviewer knows about the engagement. (rewritten v5.34.73)
+ *
+ * ── What this used to be ────────────────────────────────────────────────────
+ *
+ * loadBriefingContext() returns a merged object carrying roughly a dozen
+ * fields: hypotheses, benchmarks, document intelligence, prior-round scores and
+ * findings, field observations, political sensitivity flags, industry trends,
+ * client problem, PE context, what changed this round. The TEXT interviewer
+ * receives nearly all of it through buildBriefingPromptSection().
+ *
+ * This function read TWO of those fields — `industry` and the first six
+ * `hypotheses` — and dropped the rest on the floor. Not deliberately: they were
+ * never wired in. So the voice interviewer walked into a senior executive's
+ * diary knowing the industry and six bullet points, while the firm had a full
+ * pre-engagement briefing sitting in the same object it had just loaded.
+ *
+ * The hypotheses slice was worse than it looks: it took the first six of the
+ * RAW array, unfiltered by status, so confirmed and rejected hypotheses could
+ * consume the slots meant for the open ones the interview is supposed to probe.
+ *
+ * ── What it is now ──────────────────────────────────────────────────────────
+ *
+ * The same buildBriefingPromptSection() the text path uses. One implementation,
+ * so the two interviewers cannot drift apart again — which is exactly how this
+ * gap opened. Everything here is FACTS, which is what the fenced background
+ * block is for; the agenda and the rules travel separately, above the fence.
+ *
+ * ── Truncation ──────────────────────────────────────────────────────────────
+ *
+ * This used to end `.slice(0, 5800)` — a silent cut, with the resume transcript
+ * appended LAST, so on a long briefing the thing most likely to be lost was the
+ * most recent conversation. Now the budget is allocated in priority order and a
+ * cut says so in the text, so the model knows it is reading an abridged
+ * briefing rather than a complete one.
+ */
+var LIVE_CONTEXT_BUDGET = 15000;   // server allows MAX_CONTEXT_CHARS (16000)
+
 function buildLiveContext(){
   var parts = [];
-  try{
-    var b = loadBriefingContext(S.client);
-    if(b){
-      if(b.industry) parts.push('Industry: ' + b.industry);
-      if(b.hypotheses && b.hypotheses.length){
-        parts.push('Areas the firm wants understood (do NOT reveal these as the firm\'s views):');
-        b.hypotheses.slice(0,6).forEach(function(h){ parts.push('- ' + (h.text || h.hypothesis || '')); });
-      }
+  var budget = LIVE_CONTEXT_BUDGET;
+  var dropped = [];
+  var add = function(label, text){
+    if(!text) return;
+    if(text.length <= budget){ parts.push(text); budget -= text.length; return; }
+    if(budget > 600){
+      parts.push(text.slice(0, budget - 120) +
+        '\n[...this section was shortened to fit. Ask about anything you need rather than assuming it is not there.]');
+      budget = 0;
     }
-  }catch(e){}
-  if(S.mandatoryQuestions && S.mandatoryQuestions.length){
-    parts.push('Questions that must be asked before the interview ends:');
-    S.mandatoryQuestions.forEach(function(q,i){ parts.push((i+1) + '. ' + q.text); });
+    dropped.push(label);
+  };
+
+  /*
+   * Resume transcript FIRST, because on a continued interview it is the single
+   * most valuable thing in here — it is what stops the interviewer walking back
+   * in and re-asking an hour of ground. It carries its own 3200 cap.
+   */
+  try{ add('conversation so far', priorTranscriptBlock(3200)); }catch(e){}
+
+  /*
+   * v5.34.79 — the questions already asked, SECOND, and never shortened away.
+   *
+   * The transcript above carries only its most recent 3200 characters, so at
+   * minute 25 the interviewer cannot see what it asked at minute 3 and asks it
+   * again. Measured on the 2026-09-14 run: the same required question three
+   * times in 43 seconds, near-verbatim, and a fourth repeat two turns later.
+   *
+   * A list of bare questions is an order of magnitude smaller than the exchanges
+   * that produced them, so the WHOLE interview fits here where the transcript
+   * cannot. It sits above the briefing for the same reason the transcript does:
+   * if anything has to be shortened, it must not be this.
+   */
+  try{ add('questions already asked', askedQuestionsBlock(3000)); }catch(e){}
+
+  /*
+   * Only the OUTSTANDING ones. Listing a question the interviewee has already
+   * answered is an instruction to ask it again — the model is being told, in
+   * the same breath, that this is required and that it has not been done.
+   */
+  var dueMandatory = (S.mandatoryQuestions || []).filter(function(q){ return !q.asked; });
+  if(dueMandatory.length){
+    var mq = ['Questions that must be asked before the interview ends:'];
+    dueMandatory.forEach(function(q,i){ mq.push((i+1) + '. ' + q.text); });
+    add('mandatory questions', mq.join('\n'));
   }
   if(S.isRefreshMode && S.refreshScope && S.refreshScope.length){
-    parts.push('This is a follow-up round. Focus on: ' + S.refreshScope.join(', ') + '.');
+    add('refresh scope', 'This is a follow-up round. Focus on: ' + S.refreshScope.join(', ') + '.');
   }
+
   /*
-   * v5.34.33 — what has already been said, so "continue later" continues.
-   *
-   * A deep dive can end before it is finished: the duration ceiling, a lapsed
-   * grant, a closed laptop, or the interviewee simply having to go. The
-   * transcript survives (liveAppend mirrors it into S.displayMessages and
-   * every turn autosaves), but a resumed session was told only "welcome me
-   * back and ask your next question" — so the interviewer walked back in with
-   * no memory and re-asked ground already covered, which to the interviewee is
-   * indistinguishable from having wasted the first hour.
-   *
-   * The prior conversation therefore goes into the session context, which the
-   * server fences as DATA inside the persona (interviewerPersona.ts) rather
-   * than as instructions. Bounded from the END: the recent exchanges are what
-   * the next question should follow from, and the whole block has to fit
-   * inside MAX_CONTEXT_CHARS alongside everything above.
+   * The full briefing last, because it is the largest and the most tolerant of
+   * being shortened — every other section is either small or irreplaceable.
    */
-  var prior = priorTranscriptBlock(3200);
-  if(prior){
-    parts.push('');
-    parts.push(prior);
+  try{
+    var b = loadBriefingContext(S.client);
+    if(b) add('pre-engagement briefing', buildBriefingPromptSection(b));
+  }catch(e){}
+
+  if(dropped.length){
+    parts.push('[Not included, for length: ' + dropped.join(', ') +
+      '. Do not assume these are empty — ask.]');
   }
-  return parts.join('\n').slice(0, 5800);
+  return parts.join('\n');
 }
+
 
 /**
  * The tail of the conversation so far, as plain labelled turns, plus which
@@ -4110,16 +4796,76 @@ function startLiveVoice(isResume){
     clientName: S.client,
     interviewerName: identity.name || S.interviewerName || undefined,
     voice: identity.voice || S.interviewerVoice || undefined,
-    context: buildLiveContext(),
+    /*
+     * v5.34.79 — a FUNCTION, re-evaluated at every mint (vyne-live.js resolves
+     * it there, as it already did for agenda and mandatoryCount). The context
+     * now carries the questions already asked and answered, and the ~10-minute
+     * handover is precisely when that has to be current: the session on the
+     * other side starts with no memory of the conversation.
+     */
+    context: function(){ try{ return buildLiveContext(); }catch(e){ return ''; } },
+    /*
+     * v5.34.73. Functions, not values — these are re-evaluated at EVERY mint,
+     * including the ~10-minute handovers. A static agenda would tell the
+     * interviewer at minute 29 exactly what it knew at minute 0, which is how
+     * it ends up re-asking dimensions it already has evidence for.
+     */
+    agenda: function(){ try{ return buildLiveAgenda(); }catch(e){ return undefined; } },
+    /*
+     * v5.34.79 — OUTSTANDING, not total. This is re-evaluated at every mint,
+     * so each handover tells the interviewer how many required questions are
+     * actually left rather than how many there were at minute zero.
+     */
+    mandatoryCount: function(){
+      try{ markAskedMandatoryQuestions(); }catch(e){}
+      return (S.mandatoryQuestions || []).filter(function(q){ return !q.asked; }).length;
+    },
+    /* The count of questions already asked and answered. A number, so it can
+     * cross above the data fence and give the no-repeat rule something concrete
+     * to point at; the questions themselves stay in the fenced background. */
+    askedCount: function(){
+      try{
+        var t = allInterviewTurns(), n = 0;
+        for(var i=0;i<t.length;i++){
+          if(t[i].role!=='ai' || t[i].text.indexOf('?')<0) continue;
+          if(t.slice(i+1).some(function(x){ return x.role==='user' && x.text.trim(); })) n++;
+        }
+        return n;
+      }catch(e){ return 0; }
+    },
     // v5.34.14: surface connection progress so the setup window never reads
     // as a frozen/silent screen. The first spoken turn from a native-audio
     // model can take a few seconds; say what's happening meanwhile.
     onNote: function(msg){ try{ setStatus('thinking', 'Connecting to your interviewer…'); }catch(e){} },
-    onScore: function(sd){ try{ applyScoreData(sd); autoSave(); }catch(e){} },
+    /*
+     * v5.34.85 — do NOT swallow. A throw here is a lost scoring pass, and
+     * vyne-live-interview.js now counts it as a failure like any other. The
+     * try/catch that used to sit here made an outage look like a clean run.
+     */
+    onScore: function(sd){ applyScoreData(sd); recordScoringHealth(true); autoSave(); },
+    /*
+     * v5.34.86 — the scorecard is a live meter, so show it working.
+     *
+     * Seven dimension bars sit beside the conversation and move only when a
+     * pass lands. Between passes there was nothing at all, so a panel that was
+     * working and a panel that had died looked identical — which matters more
+     * now that a dead scorer ends the sitting. This is the heartbeat.
+     */
+    onScoringState: function(active){ try{ setScoringIndicator(!!active); }catch(e){} },
     onTurns: function(){
       // Persist the transcript as it accumulates so a dropped connection or a
       // closed tab never loses the interview record.
       try{ autoSave(); }catch(e){}
+      /*
+       * v5.34.79 — mark required questions off AS THEY ARE ANSWERED.
+       *
+       * This ran only on Finish, which is far too late for two reasons: the
+       * next handover re-sent every required question as still outstanding,
+       * and a person who paused and came back was asked them again. Running it
+       * per turn is what makes "asked once, never again" true during the
+       * conversation rather than only in the record afterwards.
+       */
+      try{ markAskedMandatoryQuestions(); }catch(e){}
     },
     // The model is reasoning before speaking. Keep the wait explained; the
     // reasoning text itself is never rendered — it is not what it said.
@@ -4215,11 +4961,81 @@ function startLiveVoice(isResume){
     // guessing, which is how a silently-dropped voice survived several releases.
     // v5.32.55: a scoring pass that fails is now visible while the interview is
     // still running, when it can still be acted on.
+    /*
+     * v5.34.85 — the failure goes on the RECORD, not just on this screen.
+     *
+     * This page runs in the INTERVIEWEE's browser on a distributed interview.
+     * The badge below therefore warns a senior executive about a subsystem they
+     * have never heard of and cannot act on, while the consultant — the person
+     * whose deliverable is being hollowed out — is told nothing at all and
+     * discovers it by opening a blank scorecard.
+     *
+     * So the failure is now written into the session, which is saved to the
+     * server with the interview and read by the consultant afterwards. The
+     * badge stays for the consultant-run case (same page, their own browser),
+     * on the existing threshold: one blip is noise, two in a row is two minutes
+     * of unscored conversation.
+     */
     onScoreError: function(info){
       if(!info) return;
+      recordScoringHealth(false, info);
       if(info.consecutive >= 2 || !info.everSucceeded){
         setVoiceBadge('live', LIVE_VOICE_IN_USE + ' · ⚠ scoring: ' + liveReasonText(info.code));
       }
+    },
+    /*
+     * v5.34.85 — scoring is dead, so stop the sitting.
+     *
+     * The interview exists to produce evidence. Carrying on once scoring has
+     * demonstrably failed spends an executive's hour to produce a transcript
+     * that cannot become an assessment — the one cost the firm cannot recover.
+     *
+     * Closed through the INTERVIEWER, not by cutting the audio: the interviewee
+     * is owed an explanation in the voice they have been talking to, and the
+     * persona already carries the rule for exactly this ("say what is left and
+     * offer to pick it up another time", v5.34.75 — written for a time limit,
+     * and this is the same situation arriving for a different reason).
+     * Everything is saved first, and the sitting is resumable.
+     */
+    onScoringDead: function(info){
+      try{ recordScoringHealth(false, info); }catch(e){}
+      try{ saveSession(); }catch(e){}
+      VL('scoring is dead — closing the sitting', info);
+      setVoiceBadge('live', LIVE_VOICE_IN_USE + ' · ⚠ stopped: scoring unavailable');
+      try{
+        /*
+         * say(), not open(): open() is the once-per-session opening trigger
+         * with its own warmup retry, and re-firing it mid-interview would
+         * send the interviewer back to its greeting. say() is the ordinary
+         * turn-injection path the typed box uses, and it already queues
+         * correctly across a renewal in flight.
+         */
+        if(LIVE && typeof LIVE.say === 'function'){
+          /*
+           * v5.34.86 — SAY WHAT HAPPENED. The first version told the interviewer
+           * "do not explain what the problem was", which leaves a senior
+           * executive who has given up an hour with an unexplained withdrawal.
+           * They are owed the reason, an apology, and a commitment — the fault
+           * is ours and hiding it is worse than naming it.
+           */
+          LIVE.say('Our scoring system has failed, so I cannot record this conversation properly '
+            + 'and it would waste your time to carry on. Apologise sincerely, tell them plainly that '
+            + 'there is a problem with our scoring mechanism, that this is our fault and not anything '
+            + 'they did, that we are fixing it and will come back to them as soon as possible to pick '
+            + 'up exactly where we left off, and that nothing they have said is lost. '
+            + 'Thank them warmly for their time, then stop.');
+        }
+      }catch(e){}
+      /* Give the closing line time to play, then end the sitting for real. */
+      setTimeout(function(){
+        try{ if(LIVE) LIVE.stop('scoring_unavailable'); }catch(e){}
+        try{ saveSession(); vyneStore.flush(); }catch(e){}
+        try{
+          showToast('We are sorry — our scoring system has failed, so we have paused this interview. '
+            + 'Everything you have said is saved. We are fixing the problem and will be back in touch '
+            + 'as soon as possible to pick up where you left off.', 20000);
+        }catch(e){}
+      }, 9000);
     },
     onReady: function(g){
       LIVE_VOICE_IN_USE = (g && g.voice) || '';
@@ -4766,11 +5582,36 @@ async function finishInterview(){
    * So this stops and says so rather than silently succeeding, and lets the
    * consultant decide whether to retry or submit unscored. */
   var noScores = Object.keys(S.scores || {}).length === 0;
-  if(noScores && (S.displayMessages || []).length > 2 && !S._forcedSubmitUnscored){
-    S._forcedSubmitUnscored = true;
+  /*
+   * ── v5.34.85: AN UNSCORED INTERVIEW IS NOT SUBMITTED ───────────────────────
+   *
+   * This used to be a speed bump: one warning, then `_forcedSubmitUnscored` let
+   * the SECOND click through. The person clicking is usually the interviewee,
+   * who reads a warning about a subsystem they have never heard of, clicks
+   * again to make it go away, and the firm receives an interview that scores
+   * nothing. The scorecard, the synthesis and the deck are all built from
+   * scores; a conversation with none contributes nothing to any of them.
+   *
+   * So it is a stop now, not a speed bump. Nothing is lost by stopping: the
+   * transcript is saved and the sitting is resumable, which is strictly better
+   * than a submitted record that looks complete and is empty.
+   *
+   * everScored() is used alongside the score count because they fail
+   * differently and the difference is the diagnosis: scores present with no
+   * successful pass is impossible (a bug); passes succeeded with no scores
+   * means the conversation genuinely evidenced nothing, which is a short or
+   * evasive interview rather than an outage. The message says which.
+   */
+  var everScoredOk = (LIVE && typeof LIVE.everScored === 'function') ? LIVE.everScored() : null;
+  if(noScores && (S.displayMessages || []).length > 2){
     setStatus('','');
-    showToast('⚠ This interview has no dimension scores — the scoring passes did not succeed. '
-      + 'The conversation is saved. Click Finish again to submit it unscored, or check the voice badge for the reason.', 12000);
+    var why = (everScoredOk === false)
+      ? 'the scoring passes did not succeed'
+      : 'the conversation did not give enough evidence to score any dimension';
+    showToast('⚠ This interview cannot be submitted: it has no dimension scores — ' + why + '. '
+      + 'Everything said is saved and the interview can be resumed. '
+      + 'Please tell your consultant rather than resubmitting.', 20000);
+    try{ saveSession(); vyneStore.flush(); }catch(e){}
     return;
   }
 
@@ -4830,16 +5671,27 @@ async function finishInterview(){
   document.getElementById('interview-screen').style.display='none';
   const es=document.getElementById('export-screen');es.style.display='flex';es.style.flexDirection='column';
 
-  const vals=DIMENSIONS.map(d=>S.scores[d.code]||0).filter(s=>s>0);
-  const ov=vals.length?vals.reduce((a,b)=>a+b,0)/vals.length:0;
+  /* v5.34.91: the interview is now closed, so the panel and this sheet may name
+   * a maturity level — and they compute the overall the same way, through
+   * computeOverall(), which leaves out-of-scope dimensions out of the mean. */
+  S.interviewComplete = true;
+  try{ renderScorecard(); }catch(e){}
+  const exTiers=dimensionTierMap();
+  const ovr=computeOverall();
+  const ov=ovr.value;
   const m=getMaturity(ov);
   document.getElementById('ex-overall').textContent=ov>0?ov.toFixed(1):'--';
-  document.getElementById('ex-level').textContent=m.label;
+  document.getElementById('ex-level').textContent=
+    ov>0 ? m.label+' · this interview only' : 'Not assessed';
   document.getElementById('ex-questions').textContent=S.questionsAsked||0;
   document.getElementById('export-sub').textContent=`${S.client} · ${S.stakeholderRole} · ${new Date().toLocaleDateString()} · Session: ${S.sessionCode}`;
   document.getElementById('export-dim-grid').innerHTML=DIMENSIONS.map(d=>{
     const sc=S.scores[d.code]||0;
-    return `<div class="export-dim-row"><div class="export-dim-name">${d.code} -- ${d.name}</div><div class="export-dim-score">${sc>0?sc.toFixed(1):'--'} / 5</div></div>`;
+    /* Tier travels with the number. This sheet is what gets screenshotted into
+     * a status mail, and a bare "D4 -- Talent & Skills  1.2 / 5" read out of
+     * context is precisely the misreading this version exists to prevent. */
+    const t=exTiers[d.code]||'out';
+    return `<div class="export-dim-row"><div class="export-dim-name">${d.code} -- ${d.name} <span class="dim-tier dim-tier-${t}">${DIM_TIER_LABEL[t]}</span></div><div class="export-dim-score">${sc>0?sc.toFixed(1):'--'} / 5</div></div>`;
   }).join('');
   const exportData={
     engagement:{client:S.client,stakeholderRole:S.stakeholderRole,stakeholderName:S.stakeholderName,industry:S.industry,sessionCode:S.sessionCode,interviewDate:new Date().toISOString(),documentsReviewed:S.documents.map(d=>d.name)},
@@ -4847,7 +5699,14 @@ async function finishInterview(){
     maturityLevel:m.label,
     dimensionScores:Object.fromEntries(DIMENSIONS.map(d=>[d.code,S.scores[d.code]||null])),
     keyFindings:S.findings,
-    conversationTurns:Math.floor(S.messages.length/2),
+    /*
+     * v5.34.85: displayMessages, not messages. S.messages is written by the
+     * TEXT path alone, so this archive — the last-resort copy if a session is
+     * lost — recorded ZERO turns and an EMPTY transcript for every voice
+     * interview ever run, which is now most of them. The recovery record that
+     * existed to survive a disaster was empty exactly when it was needed.
+     */
+    conversationTurns:Math.floor(((S.displayMessages&&S.displayMessages.length)?S.displayMessages.length:S.messages.length)/2),
   };
   window._exportJSON=JSON.stringify(exportData,null,2);
   document.getElementById('export-json-box').textContent=window._exportJSON;
@@ -4867,10 +5726,32 @@ async function finishInterview(){
     sessionCode:S.sessionCode,
     isRefreshMode:!!S.isRefreshMode,
     roundLabel:(S.refreshRoundLabel||null),
+    /* v5.34.94 — WHAT THE ARCHIVE HAS TO CARRY FOR A RESTORE TO BE CORRECT.
+     *
+     * restoreScoresToSynthesis() reads rec.refreshRound, rec.refreshScope and
+     * rec.refreshQuestionBudget. None of the three was ever written here, so
+     * every one of those reads resolved to its `||` fallback and a recovered
+     * REFRESH came back as isRefreshMode:true with refreshRound:null — which
+     * routes it into the CURRENT round and upserts over that role's original
+     * interview, destroying the baseline the refresh existed to be compared
+     * against. The same hole dropped `coverage`, so the blend reverted to the
+     * 0.3 default (the 0.6-point error described on coverageByDim above).
+     *
+     * dimTiers is here for the v5.34.92 reason: a recovered interview without
+     * it makes dimensionWeights() return null for its whole round, quietly
+     * reverting that engagement's overall to the plain mean. */
+    refreshRound:(S.isRefreshMode ? (S.refreshRound||null) : null),
+    refreshScope:(S.isRefreshMode ? (S.refreshScope||[]) : null),
+    refreshQuestionBudget:(S.isRefreshMode ? (S.refreshQuestionBudget||null) : null),
+    coverage:(S.isRefreshMode ? Object.assign({}, S.coverage||{}) : null),
+    dimTiers:(function(){ try{ return dimensionTierMap(); }catch(e){ return null; } })(),
     scores:Object.fromEntries(DIMENSIONS.map(d=>[d.code,S.scores[d.code]||null])),
     overallReadinessScore:ov>0?parseFloat(ov.toFixed(2)):null,
     findings:S.findings,
-    transcript:S.messages.map(function(m){return {role:m.role,content:(m.content||'').replace(/<<<SCORES>>>[\s\S]*?<<<END_SCORES>>>/g,'').trim()};})
+    transcript:(S.messages && S.messages.length)
+      ? S.messages.map(function(m){return {role:m.role,content:(m.content||'').replace(/<<<SCORES>>>[\s\S]*?<<<END_SCORES>>>/g,'').trim()};})
+      /* Voice: the conversation only ever exists in displayMessages. */
+      : (S.displayMessages||[]).map(function(m){return {role:(m.role==='user'?'user':'assistant'),content:(m.text||'').trim()};})
   };
   window._interviewRecord = recoverRecord;
   try{ archiveInterview(recoverRecord); }catch(e){ console.warn('[Archive] failed:', e.message); }
@@ -4917,6 +5798,44 @@ function writeInterviewToEngagement(){
     sessionId: S.sessionId,
     sessionCode: S.sessionCode,
     scores: Object.assign({}, S.scores),
+    /* v5.34.92 — the tiering that GOVERNED this interview, stored beside the
+     * scores it produced.
+     *
+     * Everything downstream (Synthesis, the deck, the client document, the
+     * portfolio API) needs to know how much each dimension counted for this
+     * engagement, and the alternative was for each of them to re-read the
+     * Pre-Engagement briefing and re-derive it. That is five re-derivations of
+     * one fact, which is how this codebase acquired four scoring formulas.
+     *
+     * It is also the only version that stays TRUE: a consultant re-tiering a
+     * role next month must not restate the overall of an interview that was
+     * conducted, scored and delivered under the old tiering. This is a
+     * snapshot, like the transcript. */
+    /* S.dimTiers when we have one — a resumed or RECOVERED interview carries
+     * the tiering that actually governed its questions, and that snapshot beats
+     * re-deriving from a Pre-Engagement that may have been edited since.
+     * Otherwise resolve it now, which is the normal live case. */
+    dimTiers: (function(){
+      try{ return S.dimTiers || dimensionTierMap(); }catch(e){ return S.dimTiers || null; }
+    })(),
+    /* v5.34.93 — THE SAME OMISSION AS dimTiers, IN THE OPPOSITE DIRECTION.
+     *
+     * v5.32.59 found that coverageByDim never reached the engagement record on
+     * the DISTRIBUTED path and fixed it in engagementMerge.ts. This builder —
+     * the CONSULTANT-run path — was not touched, and never wrote it either.
+     *
+     * So a consultant running a refresh interview themselves produced an
+     * interview record with no coverage, computeRoundScores fell back to
+     * DEFAULT_COVERAGE_WEIGHT (0.3), and a dimension the refresh had fully
+     * re-covered moved a third of the way instead of most of it: prior 3.3,
+     * fresh 4.5, true coverage 0.8 blends to 4.3 — and reported 3.7. That is
+     * 0.6, across the AI-Led boundary, in the direction of understating
+     * progress the client had actually made.
+     *
+     * Found by diffing this object's field list against the server's rather
+     * than by anything failing, which is the only way this class of bug gets
+     * found: both sides are correct on their own and only the SEAM is wrong. */
+    coverageByDim: S.isRefreshMode ? Object.assign({}, S.coverage||{}) : null,
     findings: (S.findings||[]).slice(),
     isRefresh: !!S.isRefreshMode,
     refreshRound: S.isRefreshMode ? S.refreshRound : null,
@@ -4975,6 +5894,20 @@ function writeInterviewToEngagement(){
     return ivaSameInterviewee(i.interviewee||i.name, ivRecord.interviewee||ivRecord.name);
   });
   if(existingIdx>=0) round.interviews[existingIdx] = ivRecord; else round.interviews.push(ivRecord);
+
+  /* v5.34.96 — roll the event tags UP to the round.
+   *
+   * Synthesis reads round.eventDriven / round.eventCoveredDims to draw the ⚡
+   * "re-scored because of X" marker; both builders wrote those fields on the
+   * INTERVIEW and nothing ever wrote them on the round, so the marker has never
+   * rendered. Derived rather than copied, so it cannot drift from the
+   * interviews it describes. eventContext is only filled in when the round does
+   * not already carry one — Pre-Engagement authors that field and a
+   * consultant's wording must win over an interview's. */
+  var _evt = VyneScoring.roundEventRollup(round.interviews);
+  round.eventDriven = _evt.eventDriven;
+  round.eventCoveredDims = _evt.eventCoveredDims;
+  if(!round.eventContext && _evt.eventContext) round.eventContext = _evt.eventContext;
   round.status = 'complete';
 
   /* v5.32.59 (F6/F23). This was the FIFTH implementation of the scoring rules
@@ -5111,6 +6044,31 @@ document.addEventListener('DOMContentLoaded', function(){
   // Hide ALL consultant setup UI.
   var setup = document.getElementById('setup-screen');
   if (setup) setup.style.display = 'none';
+
+  /*
+   * ── v5.34.90: THE PERSON BEING ASSESSED DOES NOT WATCH THE ASSESSMENT ──────
+   *
+   * The side panel carries the live scorecard and the findings list, and only
+   * the SETUP was ever hidden from an interviewee. So on a distributed
+   * interview a client executive sat watching their own organisation scored in
+   * real time — "Governance & Risk 1.0 / 5 · AI Unaware" — while the Findings
+   * tab filled with the firm's findings about them, mid-conversation, before a
+   * consultant had reviewed a word of it.
+   *
+   * That is the firm's working judgement, shown to its subject, in draft. It
+   * changes how people answer: an executive who sees a 1.0 appear starts
+   * defending rather than describing, and the evidence the interview exists to
+   * collect degrades from that turn on. It is also simply not how a diagnostic
+   * is delivered — findings reach a client once, reviewed, in context.
+   *
+   * The CONSULTANT running an interview in their own browser still sees all of
+   * it: that is their working view and the only signal that scoring is alive.
+   * The cut is exactly isInterviewee(), and nothing else changes.
+   */
+  var panel = document.querySelector('.side-panel');
+  if (panel) panel.style.display = 'none';
+  var body = document.querySelector('.interview-body');
+  if (body) body.style.gridTemplateColumns = '1fr';
 
   // ── Find this interviewee's most recent saved session ──────────────────
   function latestSession(){

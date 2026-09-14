@@ -43,12 +43,24 @@
  * A key for a vendor the task's chain never mentions simply goes unused for
  * that task. That is the correct outcome, not a gap.
  *
- * ── Fallback is never failure ───────────────────────────────────────────────
+ * ── Failure is NOT fallback (v5.34.64, corrected header v5.34.69) ──────────
  *
- * Every failure here — no row, no secret, Secret Manager down, a revoked key —
- * falls back to the platform credential and the firm's own bill. An interview
- * must not stop because a client's key lapsed; the firm eats that cost until
- * someone fixes it, which is the right way round (byokRepo.ts says the same).
+ * This header used to end: "Every failure here falls back to the platform
+ * credential and the firm's own bill. An interview must not stop because a
+ * client's key lapsed; the firm eats that cost until someone fixes it, which is
+ * the right way round."
+ *
+ * It is not the right way round, and v5.34.64 reversed it. A revoked key, a
+ * project that lost API access or a lapsed billing account all read as business
+ * as usual from the consultant's side while every call moves back onto the
+ * firm's account — a decision nobody made, discovered in an invoice. A client
+ * with a key on file now runs on that key alone; if it cannot be spent the call
+ * FAILS and says whose key failed. byok_fallback_grant (migration 036) is how a
+ * firm chooses continuity for a named client instead.
+ *
+ * The distinction that makes this work is in ResolvedByok.unusable below: a key
+ * the vendor REFUSED is not the same as no key at all, and is not the same as a
+ * key the Owner deliberately switched off.
  */
 import type { ProviderAdapter } from "../types.js";
 import { makeGeminiAiStudioAdapter } from "../adapters/geminiAiStudio.js";
@@ -106,6 +118,52 @@ export interface ResolvedByok {
   adapters: Map<string, ProviderAdapter>;
   /** adapter name → which client credential backs it (payer + failure handling). */
   backing: Map<string, ByokBinding>;
+  /**
+   * Keys that are ON FILE and cannot be spent right now. (v5.34.69)
+   *
+   * ── The hole this closes ──────────────────────────────────────────────────
+   *
+   * v5.34.64 confined a BYOK client to their own credentials, so a refused key
+   * failed the call instead of moving the charge to the firm. It protected
+   * exactly ONE call.
+   *
+   * When a key is refused, onByokRejected marks the row `failed`. The next
+   * call's lookup asks for status = 'active', finds nothing, and reports a
+   * client with NO key — so there are no BYOK adapters, confinement does not
+   * apply, the firm's chain runs, and the firm pays. Silently, for every call
+   * after the first, which is the behaviour v5.34.64 exists to end.
+   *
+   * A `failed` row is not "no key". It is a key on file that the vendor has
+   * refused, and the caller has to be able to tell the difference.
+   *
+   * ── Why `disabled` is NOT in here ─────────────────────────────────────────
+   *
+   * `disabled` means the OWNER pressed "turn off" — a deliberate decision to
+   * take that client off BYOK and back onto the firm's account. Honouring it is
+   * the point. `pending` means the client never supplied a key at all. Only
+   * `failed`, and a secret that cannot be read, belong here.
+   */
+  /*
+   * `reason` is VETTED PROSE and is safe to put in an HTTP response body.
+   * `detail` is raw upstream text (a Secret Manager or driver error recorded on
+   * the row) and must only ever reach a log or GatewayError.detail.
+   *
+   * v5.34.70. These were one field, and gateway.ts interpolated it into the 402
+   * MESSAGE — the string route handlers send to the caller. byok_keys.last_error
+   * has two writers: deactivateKey stores a fixed literal, while
+   * recordResolveError stores `err.message` verbatim, which for a Secret Manager
+   * failure carries the secret's resource name and therefore the GCP project,
+   * the tenant UUID and the client_norm. Nothing checked which one it held; the
+   * two simply had not co-occurred yet. gateway.ts:GatewayError already states
+   * the rule — raw provider text goes in `detail`, never the message — so this
+   * makes the type enforce it instead of trusting the caller to remember.
+   */
+  unusable: Array<{
+    provider: ByokProvider;
+    clientName: string;
+    reason: string;
+    detail?: string;
+  }>;
 }
 
 export interface ByokResolverOptions {
@@ -154,15 +212,33 @@ export function makeByokResolver(opts: ByokResolverOptions) {
   return async function resolveByok(ctx: ByokCallContext): Promise<ResolvedByok> {
     const adapters = new Map<string, ProviderAdapter>();
     const backing = new Map<string, ByokBinding>();
+    const unusable: ResolvedByok["unusable"] = [];
     // Unattributed work is the firm's own — there is no client to bill and no
     // client key to look for. Returning early also keeps cross-client admin
     // work off any one client's account.
-    if (!ctx.clientName) return { adapters, backing };
+    if (!ctx.clientName) return { adapters, backing, unusable };
 
     await Promise.all(ALL_PROVIDERS.map(async (provider) => {
       try {
         const row = await lookup(ctx.tenantId, ctx.clientName, provider);
-        if (!row || row.status !== "active" || !row.secretName) return;
+        if (!row) return;                               // no key for this vendor
+        /*
+         * v5.34.69. `failed` is reported, not skipped — see ResolvedByok.
+         * `disabled` is the Owner's own decision to stop using this key, and
+         * `pending` was never supplied, so both correctly mean "the firm pays".
+         */
+        if (row.status === "failed") {
+          unusable.push({
+            provider, clientName: row.clientName,
+            // Vetted prose only — row.lastError is raw and rides in `detail`.
+            // The Owner still reads it verbatim on the Client API keys screen,
+            // which is tenant-scoped and owner-only; a 402 is not.
+            reason: "their key was refused by the provider and switched off automatically",
+            detail: row.lastError ?? undefined,
+          });
+          return;
+        }
+        if (row.status !== "active" || !row.secretName) return;
 
         const key = await fetchKey(opts.secretStore, row.secretName);
         if (!key) {
@@ -178,6 +254,8 @@ export function makeByokResolver(opts: ByokResolverOptions) {
            */
           const why = "the key could not be read from Secret Manager — check the service account's permissions";
           opts.onResolveError?.({ tenantId: ctx.tenantId, provider, clientName: ctx.clientName!, err: new Error(why), clientNorm: row.clientNorm, reason: why });
+          // On file, active, unreadable: the firm must not silently absorb it.
+          unusable.push({ provider, clientName: row.clientName, reason: why });
           return;
         }
 
@@ -201,7 +279,7 @@ export function makeByokResolver(opts: ByokResolverOptions) {
       }
     }));
 
-    return { adapters, backing };
+    return { adapters, backing, unusable };
   };
 }
 

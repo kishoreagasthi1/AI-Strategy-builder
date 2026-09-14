@@ -5,8 +5,8 @@
  * the button enable at the right moment, does the key actually get posted, does
  * the success state appear, does the key leave the DOM.
  */
-import { describe, it, expect, afterEach } from "vitest";
-import { openPage, pageErrors, skipBrowser, type Harness } from "./harness.js";
+import { describe, it, expect, afterEach, vi } from "vitest";
+import { openPage, pageErrors, skipBrowser, type Harness, type StubHandler } from "./harness.js";
 
 const SKIP = skipBrowser();
 
@@ -19,6 +19,10 @@ const SKIP = skipBrowser();
  * this test always exercises the words a client is actually shown.
  */
 import { ATTESTATION_TEXT } from "../../src/routes/byok.js";
+
+import { BROWSER_TEST_TIMEOUT_MS, BROWSER_HOOK_TIMEOUT_MS } from "./harness.js";
+/* Real browser work does not fit vitest's 5s default — see harness.ts. */
+vi.setConfig({ testTimeout: BROWSER_TEST_TIMEOUT_MS, hookTimeout: BROWSER_HOOK_TIMEOUT_MS });
 const ATTEST = ATTESTATION_TEXT["gemini-aistudio"];
 
 const okInvite = {
@@ -29,7 +33,7 @@ const okInvite = {
 let h: Harness | null = null;
 afterEach(async () => { await h?.close(); h = null; });
 
-const open = (stub: any, query = "?t=" + "a".repeat(43)) =>
+const open = (stub: StubHandler, query = "?t=" + "a".repeat(43)) =>
   openPage({ file: "byok.html", query, stub, session: null });
 
 describe.skipIf(SKIP)("v5.34.56 — byok.html in a browser", () => {

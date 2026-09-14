@@ -17,7 +17,9 @@ import { migrate } from "../src/db/migrate.js";
 import { initPool, closePool } from "../src/db/pool.js";
 import { byokRoutes } from "../src/routes/byok.js";
 import { hasFallbackGrant } from "../src/llm/byok/fallbackGrant.js";
+import { activeKeyFor } from "../src/llm/byok/byokRepo.js";
 import { normClient } from "../src/auth/clients.js";
+import { engagementIdFor } from "../src/llm/byok/engagementBinding.js";
 
 const ENABLED = process.env.RLS_TEST === "1";
 const ADMIN_URL = process.env.TEST_DATABASE_URL ?? "postgres://vyne:vyne@localhost:5432/vyne";
@@ -69,7 +71,15 @@ describe.skipIf(!ENABLED)("v5.34.64 — fallback grant", () => {
       // audit_log too: every grant in this file writes one, so without this the
       // ordering assertion below counts rows left behind by earlier tests.
       await db.query(`DELETE FROM audit_log WHERE tenant_id = $1`, [t]);
+      await db.query(`DELETE FROM engagements WHERE tenant_id = $1`, [t]);
     }
+    // The clients these tests act on, registered the way the product does.
+    for (const n of ["Nestlé", "Acme Industrial", "Lapsed Corp", "Never Granted"]) {
+      await makeClient(n);
+    }
+    await db.query(
+      `INSERT INTO engagements (tenant_id, code, client_name) VALUES ($1, $2, 'Nestlé')
+         ON CONFLICT DO NOTHING`, [other, "O-" + Math.random().toString(36).slice(2, 8).toUpperCase()]);
   });
 
   afterAll(async () => {
@@ -79,10 +89,25 @@ describe.skipIf(!ENABLED)("v5.34.64 — fallback grant", () => {
     await closePool();
   });
 
+  /**
+   * v5.34.67: the routes now refuse a client who does not exist as an
+   * engagement, so every client these tests name has to be created the way the
+   * product creates one. That is the point of the change — a key could
+   * previously be attached to a name nobody had ever registered, which stored
+   * fine, showed as active, and was never used.
+   */
+  const makeClient = async (name: string) => {
+    await db.query(
+      `INSERT INTO engagements (tenant_id, code, client_name) VALUES ($1, $2, $3)
+         ON CONFLICT DO NOTHING`,
+      [tenant, "T-" + Math.random().toString(36).slice(2, 8).toUpperCase(), name]);
+  };
+
   /** A client with an ACTIVE key on file, which is what triggers confinement. */
   const giveKey = async (
     clientName: string, provider = "gemini-aistudio", tenantId = tenant
   ) => {
+    if (tenantId === tenant) await makeClient(clientName);
     /*
      * byok_key_active_requires_attestation (migration 030) makes an ACTIVE key
      * without a stored attestation impossible — including attestation_text,
@@ -194,6 +219,16 @@ describe.skipIf(!ENABLED)("v5.34.64 — fallback grant", () => {
     expect(detail).toContain("Google (Gemini)");
     expect(detail).toContain("Anthropic (Claude)");
     expect(detail).toMatch(/your account/i);
+    /*
+     * v5.34.66. The message used to end "or grant fallback for this client
+     * first" — a remedy that does not exist. Found by following my own
+     * instruction in production: granted the fallback, retried, got the same
+     * refusal telling me to grant the fallback. The two features answer
+     * different questions and the message must not conflate them.
+     */
+    expect(detail).not.toMatch(/grant fallback for this client first/i);
+    expect(detail).toMatch(/a fallback grant does not change this/i);
+    expect(detail).toMatch(/ask them for an Anthropic \(Claude\) key/i);   // "an", not "a"
     // Nothing was written.
     const rows = await db.query(`SELECT 1 FROM client_routing WHERE tenant_id = $1`, [tenant]);
     expect(rows.rowCount).toBe(0);
@@ -205,6 +240,21 @@ describe.skipIf(!ENABLED)("v5.34.64 — fallback grant", () => {
       { clientName: "ZZ BYOK Test", textVendor: "anthropic-api" })).json().detail as string;
     expect(detail).not.toContain("anthropic-api");
     expect(detail).not.toContain("gemini-aistudio");
+  });
+
+  it("a fallback grant does NOT unlock a preference for an unkeyed vendor", async () => {
+    /*
+     * The two are deliberately independent. A grant says who pays when a
+     * client's key FAILS; it is not permission to route their work to a vendor
+     * they never keyed, which would move the charge on every call rather than
+     * on a failure. Pinned because the refusal message once implied otherwise.
+     */
+    await giveKey("Granted Corp", "gemini-aistudio");
+    await post("/api/byok/fallback-grants", { clientName: "Granted Corp", reason: "pilot" });
+    const r = await post("/api/client-routing",
+      { clientName: "Granted Corp", textVendor: "anthropic-api" });
+    expect(r.statusCode).toBe(409);
+    expect(r.json().error).toBe("vendor_not_keyed");
   });
 
   it("allows the preference for a vendor they HAVE keyed", async () => {
@@ -238,6 +288,191 @@ describe.skipIf(!ENABLED)("v5.34.64 — fallback grant", () => {
     const r = await post("/api/client-routing",
       { clientName: "Lapsed Corp", textVendor: "anthropic-api" });
     expect(r.statusCode).toBe(200);
+  });
+
+  /* ── the client must exist first (v5.34.67) ───────────────────────────── */
+
+  it("refuses to issue a setup link for a client who does not exist", async () => {
+    /*
+     * The ordering flaw. The Owner could issue a link for any string; a
+     * consultant later typed the client name into Pre-Engagement; the two were
+     * joined only by normClient(). "Newell Brands" and "Newell Brands Inc"
+     * produced a key that stored fine, showed as active, and was never used
+     * while the work ran on the firm's credential.
+     */
+    const r = await post("/api/byok/invites",
+      { clientName: "Nobody Ever Heard Of Them", provider: "gemini-aistudio" });
+    expect(r.statusCode).toBe(409);
+    expect(r.json().error).toBe("no_such_client");
+    expect(r.json().detail).toMatch(/create them first/i);
+    // And the reason it matters, in the message, because "no such client" alone
+    // reads like a bug rather than an ordering rule.
+    expect(r.json().detail).toMatch(/stored, shows as active, and is never used/i);
+  });
+
+  it("refuses a grant for a client who does not exist", async () => {
+    const r = await post("/api/byok/fallback-grants", { clientName: "Ghost Industries" });
+    expect(r.statusCode).toBe(409);
+    expect(r.json().error).toBe("no_such_client");
+    expect(await hasFallbackGrant(tenant, "Ghost Industries")).toBe(false);
+  });
+
+  it("refuses a preference for a client who does not exist", async () => {
+    const r = await post("/api/client-routing",
+      { clientName: "Ghost Industries", textVendor: "anthropic-api" });
+    expect(r.statusCode).toBe(409);
+    expect(r.json().error).toBe("no_such_client");
+  });
+
+  it("accepts all three once the client exists", async () => {
+    // The same three calls, after the client is registered — so the guard is
+    // an ordering rule and not a wall.
+    await makeClient("Real Client Ltd");
+    expect((await post("/api/byok/invites",
+      { clientName: "Real Client Ltd", provider: "gemini-aistudio" })).statusCode).toBe(200);
+    expect((await post("/api/byok/fallback-grants",
+      { clientName: "Real Client Ltd" })).statusCode).toBe(200);
+    expect((await post("/api/client-routing",
+      { clientName: "Real Client Ltd", textVendor: "anthropic-api" })).statusCode).toBe(200);
+  });
+
+  it("matches the client however the name is punctuated", async () => {
+    // The guard must not become a new way to fail on a typo it should forgive:
+    // normClient() already decides what "the same client" means everywhere.
+    await makeClient("Meridian Foods");
+    expect((await post("/api/byok/fallback-grants",
+      { clientName: "  meridian  foods " })).statusCode).toBe(200);
+  });
+
+  it("a client with a key but no engagement stays manageable", async () => {
+    /*
+     * Found in production immediately after the pickers shipped. A client can
+     * have an active key and no engagement row — the key still works, because
+     * the lookup falls back to the norm — and the first version of the guard
+     * refused every operation on them. Their grant could not be re-issued and
+     * their preference could not be set: tightening what may be ATTACHED had
+     * made what already WAS attached unreachable.
+     */
+    await db.query(
+      `INSERT INTO byok_keys
+         (tenant_id, client_norm, client_name, provider, status, secret_name, key_hint,
+          paid_tier_attested, attested_by_email, attested_at, attestation_text)
+       VALUES ($1, $2, 'ZZ BYOK Test', 'gemini-aistudio', 'active',
+               'projects/p/s/versions/1', 'wxyz', true, 'a@b.com', now(), 'attested')`,
+      [tenant, normClient("ZZ BYOK Test")]);
+    // No engagement for them — deliberately.
+    expect(await engagementIdFor(tenant, "ZZ BYOK Test")).toBeNull();
+
+    const r = await post("/api/byok/fallback-grants",
+      { clientName: "ZZ BYOK Test", reason: "legacy key, client not registered yet" });
+    expect(r.statusCode, "a client with a key on file was refused a grant").toBe(200);
+    expect(await hasFallbackGrant(tenant, "ZZ BYOK Test")).toBe(true);
+  });
+
+  it("lists such a client, marked as not registered", async () => {
+    await giveKey("Registered Co");            // giveKey also creates the engagement
+    await db.query(
+      `INSERT INTO byok_keys
+         (tenant_id, client_norm, client_name, provider, status, secret_name, key_hint,
+          paid_tier_attested, attested_by_email, attested_at, attestation_text)
+       VALUES ($1, $2, 'Legacy Co', 'anthropic-api', 'active',
+               'projects/p/s/versions/9', 'lgcy', true, 'a@b.com', now(), 'attested')`,
+      [tenant, normClient("Legacy Co")]);
+
+    const list = (await app.inject({ method: "GET", url: "/api/byok/clients" })).json();
+    const byName = Object.fromEntries(
+      list.clients.map((c: any) => [c.clientName, c.registered]));
+    expect(byName["Registered Co"]).toBe(true);
+    expect(byName["Legacy Co"], "a client with a key on file is missing from the picker").toBe(false);
+  });
+
+  it("still refuses a name that is neither an engagement nor on file", async () => {
+    // The guard must not have been loosened into nothing.
+    const r = await post("/api/byok/fallback-grants", { clientName: "Entirely Invented Ltd" });
+    expect(r.statusCode).toBe(409);
+    expect(r.json().error).toBe("no_such_client");
+  });
+
+  /* ── turning a key back on (v5.34.69) ─────────────────────────────────── */
+
+  it("a disabled key can be turned back on", async () => {
+    /*
+     * "turn off" shipped without a "turn on". The only route back was a fresh
+     * setup link and the CLIENT's administrator pasting their key again — a
+     * round trip to the client, to undo a click the firm made on its own
+     * screen, with nothing warning it was one-way. Nothing was ever destroyed:
+     * the secret is still in Secret Manager and secret_name is still on the
+     * row, so this is the status flip it always should have been.
+     */
+    await giveKey("Toggle Corp");
+    await post("/api/byok/keys/disable",
+      { clientName: "Toggle Corp", provider: "gemini-aistudio" });
+    expect(await activeKeyFor(tenant, "Toggle Corp", "gemini-aistudio")).toBeNull();
+
+    const r = await post("/api/byok/keys/enable",
+      { clientName: "Toggle Corp", provider: "gemini-aistudio" });
+    expect(r.statusCode).toBe(200);
+    const back = await activeKeyFor(tenant, "Toggle Corp", "gemini-aistudio");
+    expect(back, "a switched-off key could not be switched back on").not.toBeNull();
+    expect(back!.keyHint).toBe("wxyz");
+  });
+
+  it("refuses to re-enable a key the provider REFUSED, and says why", async () => {
+    /*
+     * A `failed` key was rejected by its vendor. Flipping it back to active
+     * would show "active" for a credential that fails on the very next call —
+     * the screen would be lying again, in the other direction.
+     */
+    await giveKey("Refused Corp");
+    await db.query(
+      `UPDATE byok_keys SET status = 'failed', last_error = '403 PERMISSION_DENIED'
+        WHERE tenant_id = $1 AND client_norm = $2`,
+      [tenant, normClient("Refused Corp")]);
+
+    const r = await post("/api/byok/keys/enable",
+      { clientName: "Refused Corp", provider: "gemini-aistudio" });
+    expect(r.statusCode).toBe(409);
+    expect(r.json().error).toBe("not_disabled");
+    expect(r.json().detail).toMatch(/has to be replaced/i);
+    /*
+     * v5.34.70. Asserting null here was a PROXY for "still not active", and the
+     * proxy stopped holding when activeKeyFor started reporting refused keys so
+     * the resolvers could tell them apart from absent ones. Assert the thing
+     * this test is actually about: the row did not go back into service.
+     */
+    const still = await activeKeyFor(tenant, "Refused Corp", "gemini-aistudio");
+    expect(still?.status, "a refused key was quietly re-activated").toBe("failed");
+  });
+
+  it("clears the recorded failure, so the screen does not stay red", async () => {
+    // last_error is what renders "active — but not working". A key put back
+    // into service carrying an old error would look broken from the moment it
+    // was fixed.
+    await giveKey("Cleared Corp");
+    await db.query(
+      `UPDATE byok_keys SET last_error = 'stale failure', last_error_at = now()
+        WHERE tenant_id = $1 AND client_norm = $2`,
+      [tenant, normClient("Cleared Corp")]);
+    await post("/api/byok/keys/disable",
+      { clientName: "Cleared Corp", provider: "gemini-aistudio" });
+    await post("/api/byok/keys/enable",
+      { clientName: "Cleared Corp", provider: "gemini-aistudio" });
+
+    const row = await db.query<{ last_error: string | null }>(
+      `SELECT last_error FROM byok_keys WHERE tenant_id = $1 AND client_norm = $2`,
+      [tenant, normClient("Cleared Corp")]);
+    expect(row.rows[0].last_error).toBeNull();
+  });
+
+  it("is Owner-only, like every other key action", async () => {
+    await giveKey("Role Corp");
+    await post("/api/byok/keys/disable",
+      { clientName: "Role Corp", provider: "gemini-aistudio" });
+    for (const role of ["consultant", "interviewee"]) {
+      const r = await post("/api/byok/keys/enable",
+        { clientName: "Role Corp", provider: "gemini-aistudio" }, role);
+      expect(r.statusCode, role).toBe(403);
+    }
   });
 
   it("records that the preference was checked, so old rows stay distinguishable", async () => {

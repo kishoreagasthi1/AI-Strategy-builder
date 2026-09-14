@@ -108,12 +108,17 @@ describe("scoring parity — frontend/vyne-scoring.js vs backend/src/tenant/scor
       "computeRoundScores", "isRefreshRound", "sortRounds", "latestRound",
       "latestScoredRound", "priorRoundsBefore", "priorScoresFor",
       "lowestRoundNumber", "nextRoundNumber", "overallOf", "round1", "round2",
+      "dimensionWeights",
     ]) {
       expect(typeof web[fn], `frontend is missing ${fn}`).toBe("function");
       expect(typeof (srv as any)[fn], `backend is missing ${fn}`).toBe("function");
     }
     expect(web.DIMS).toEqual([...srv.DIMS]);
     expect(web.DEFAULT_COVERAGE_WEIGHT).toBe(srv.DEFAULT_COVERAGE_WEIGHT);
+    /* v5.34.92: the tier→weight table is the new thing that can drift, and it
+     * is three numbers, so it would drift silently and be visible only as a
+     * client's overall differing between the browser and /api/scorecard. */
+    expect(web.TIER_WEIGHT).toEqual(srv.TIER_WEIGHT);
   });
 
   it("agrees on 400 randomised rounds (no coverage reported)", () => {
@@ -170,6 +175,132 @@ describe("scoring parity — frontend/vyne-scoring.js vs backend/src/tenant/scor
       if (rnd() < 0.2) s.D3 = 0;
       expect(web.overallOf(s)).toBe(srv.overallOf(s));
     }
+  });
+
+  /* ── v5.34.92: the WEIGHTED overall ────────────────────────────────────────
+   *
+   * The weighted path is the one a client actually sees — it feeds the deck
+   * cover, the Word document, the portfolio card and the figure quoted to the
+   * model as the client's measured maturity. Two implementations, four
+   * consumers, so it gets the same randomised treatment as computeRoundScores
+   * rather than a couple of hand-picked cases.
+   */
+  it("agrees on dimensionWeights across randomised rosters", () => {
+    const rnd = lcg(4242);
+    const TIERS = ["lead", "cover", "light", "off", undefined] as const;
+    for (let t = 0; t < 400; t++) {
+      const n = 1 + Math.floor(rnd() * 4);
+      const interviews: any[] = [];
+      for (let i = 0; i < n; i++) {
+        // 15% of interviews are legacy — no dimTiers at all. The whole round
+        // must then fall back, and both sides must fall back identically.
+        if (rnd() < 0.15) { interviews.push({ role: "CTO" }); continue; }
+        const dimTiers: Record<string, string> = {};
+        for (const d of srv.DIMS) {
+          const pick = TIERS[Math.floor(rnd() * TIERS.length)];
+          if (pick !== undefined) dimTiers[d] = pick;   // "off" is a tier name nothing recognises → weight 0
+        }
+        interviews.push({ role: "CTO", dimTiers });
+      }
+      expect(web.dimensionWeights(interviews)).toEqual(srv.dimensionWeights(interviews));
+    }
+  });
+
+  it("agrees on the WEIGHTED overall across randomised score sets", () => {
+    const rnd = lcg(777001);
+    const TIERS = ["lead", "cover", "light"] as const;
+    for (let t = 0; t < 400; t++) {
+      const s = randomPrior(rnd);
+      if (rnd() < 0.2) s.D3 = 0;
+      const interviews: any[] = [];
+      const n = 1 + Math.floor(rnd() * 3);
+      for (let i = 0; i < n; i++) {
+        const dimTiers: Record<string, string> = {};
+        for (const d of srv.DIMS) if (rnd() < 0.8) dimTiers[d] = TIERS[Math.floor(rnd() * 3)];
+        interviews.push({ dimTiers });
+      }
+      const wWeb = web.dimensionWeights(interviews);
+      const wSrv = srv.dimensionWeights(interviews);
+      expect(wWeb).toEqual(wSrv);
+      expect(web.overallOf(s, wWeb)).toBe(srv.overallOf(s, wSrv));
+    }
+  });
+
+  it("omitting the weights is EXACTLY today's plain mean, on both sides", () => {
+    /*
+     * The migration guarantee. Every call site that does not opt in must be
+     * bit-identical to v5.34.91, or the version that added weighting silently
+     * restated numbers that had already been delivered to clients.
+     */
+    const rnd = lcg(13579);
+    for (let t = 0; t < 300; t++) {
+      const s = randomPrior(rnd);
+      expect(web.overallOf(s, null)).toBe(web.overallOf(s));
+      expect(web.overallOf(s, undefined)).toBe(web.overallOf(s));
+      expect(srv.overallOf(s, null)).toBe(srv.overallOf(s));
+      expect(srv.overallOf(s, undefined)).toBe(srv.overallOf(s));
+    }
+  });
+});
+
+describe("v5.34.92 — dimension weighting, derived from the tiers already set", () => {
+  const tiers = (o: Record<string, string>) => ({ dimTiers: o });
+
+  it("sums lead/cover/light across the roles interviewed", () => {
+    const w = srv.dimensionWeights([
+      tiers({ D1: "lead", D2: "lead", D3: "cover", D6: "lead" }),          // CTO-shaped
+      tiers({ D1: "cover", D3: "lead", D5: "lead", D6: "lead" }),          // CFO-shaped
+    ]);
+    expect(w).not.toBeNull();
+    expect(w!.D1).toBeCloseTo(1.6);   // lead + cover
+    expect(w!.D6).toBeCloseTo(2.0);   // lead + lead
+    expect(w!.D3).toBeCloseTo(1.6);   // cover + lead
+    expect(w!.D4, "a dimension nobody tiered is excluded, not light").toBe(0);
+  });
+
+  it("a dimension excluded by everyone leaves the mean, it does not score 0", () => {
+    const w = srv.dimensionWeights([tiers({ D1: "lead", D2: "lead" })]);
+    // D7 carries a low score but is out of scope for every role interviewed.
+    expect(srv.overallOf({ D1: 4.0, D2: 4.0, D7: 1.0 }, w)).toBe(4.0);
+    // Without weights — i.e. a legacy round — it still drags the number down.
+    expect(srv.overallOf({ D1: 4.0, D2: 4.0, D7: 1.0 })).toBe(3.0);
+  });
+
+  it("ONE legacy interview disables weighting for the whole round", () => {
+    /*
+     * All-or-nothing. Weighting a round from the two interviews that happen to
+     * carry tiers, and silently ignoring the third, produces a number that is
+     * neither the weighted nor the plain mean and that nobody could reconcile
+     * against either.
+     */
+    expect(srv.dimensionWeights([tiers({ D1: "lead" }), { role: "CFO" }])).toBeNull();
+    expect(srv.dimensionWeights([{ role: "CFO" }])).toBeNull();
+    expect(srv.dimensionWeights([])).toBeNull();
+    expect(srv.dimensionWeights(null)).toBeNull();
+  });
+
+  it("tiers that exclude every dimension fall back rather than returning zeros", () => {
+    // Otherwise overallOf would divide by a zero weight sum and report null —
+    // an engagement that HAS scores would render as unassessed.
+    expect(srv.dimensionWeights([tiers({})])).toBeNull();
+    expect(srv.dimensionWeights([tiers({ D1: "nonsense" })])).toBeNull();
+  });
+
+  it("moves a real scorecard by about a tenth, not by a band", () => {
+    /*
+     * The worked example in docs/SCORING_EXPLAINED.md — CTO + CFO + CHRO on
+     * default tiers. Pinned because the honest claim made to the user was
+     * "this is a correctness fix, not a re-scoring", and that claim should
+     * fail loudly if the weighting ever starts swinging the headline number.
+     */
+    const round = { D1: 3.3, D2: 3.2, D3: 2.6, D4: 3.2, D5: 2.8, D6: 1.7, D7: 2.8 };
+    const w = srv.dimensionWeights([
+      tiers({ D2: "lead", D1: "lead", D6: "lead", D3: "cover", D5: "cover", D4: "light", D7: "light" }),
+      tiers({ D3: "lead", D6: "lead", D5: "lead", D1: "cover", D2: "light", D4: "light", D7: "light" }),
+      tiers({ D4: "lead", D7: "lead", D3: "cover", D5: "cover", D1: "light", D2: "light", D6: "light" }),
+    ]);
+    expect(srv.overallOf(round)).toBe(2.8);        // plain
+    expect(srv.overallOf(round, w)).toBe(2.7);     // weighted
   });
 });
 
@@ -264,7 +395,7 @@ describe("scoring — the behaviour the four old implementations disagreed about
   });
 
   it("latestScoredRound skips a freshly planned empty round (F21)", () => {
-    const rounds = [
+    const rounds: srv.RoundLike[] = [
       { roundId: "r1", roundNumber: 1, scores: { D1: 3, D2: 4 } },
       { roundId: "r2", roundNumber: 2, scores: {} },     // planned, nobody interviewed yet
     ];
@@ -349,8 +480,8 @@ describe("recomputeAllRounds — browser-only, so tested here where it can be ex
     // pin round 3 before round 2 completes.
     const eng = {
       rounds: [
-        { roundId: "r2", roundNumber: 2, interviews: [{ role: "CEO", scores: { D3: 4 }, isRefresh: true }], scores: {} },
-        { roundId: "r1", roundNumber: 1, interviews: [{ role: "CEO", scores: { D3: 2 } }], scores: {} },
+        { roundId: "r2", roundNumber: 2, interviews: [{ role: "CEO", scores: { D3: 4 }, isRefresh: true }], scores: {} as Record<string, number> },
+        { roundId: "r1", roundNumber: 1, interviews: [{ role: "CEO", scores: { D3: 2 } }], scores: {} as Record<string, number> },
       ],
     };
     web.recomputeAllRounds(eng, { roleWeight: rw });
@@ -381,9 +512,9 @@ describe("recomputeAllRounds — browser-only, so tested here where it can be ex
   it("carries the running baseline PAST an empty round to a later real one", () => {
     const eng = {
       rounds: [
-        { roundId: "r1", roundNumber: 1, interviews: [{ role: "CEO", scores: { D3: 2 } }], scores: {} },
-        { roundId: "r2", roundNumber: 2, interviews: [], scores: {} },
-        { roundId: "r3", roundNumber: 3, interviews: [{ role: "CEO", scores: { D3: 4 }, isRefresh: true }], scores: {} },
+        { roundId: "r1", roundNumber: 1, interviews: [{ role: "CEO", scores: { D3: 2 } }], scores: {} as Record<string, number> },
+        { roundId: "r2", roundNumber: 2, interviews: [], scores: {} as Record<string, number> },
+        { roundId: "r3", roundNumber: 3, interviews: [{ role: "CEO", scores: { D3: 4 }, isRefresh: true }], scores: {} as Record<string, number> },
       ],
     };
     web.recomputeAllRounds(eng, { roleWeight: rw });

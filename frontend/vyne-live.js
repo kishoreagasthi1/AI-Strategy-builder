@@ -1152,6 +1152,39 @@
    * a full stop, which the fragments never do; the floor is set at 12 so a
    * short real sentence still counts and a 7-char tail does not). */
   var MUTE_TEXT_MIN_CHARS = Number(window.VYNE_MUTE_TEXT_MIN_CHARS) || 12;
+  /**
+   * How long to wait for turnComplete after generationComplete. (v5.34.75)
+   *
+   * ── The turn that never ends ──────────────────────────────────────────────
+   *
+   * A turn is closed in exactly one place — the `if (f.turnComplete)` branch
+   * below — and that branch is what banks the turn's usage, ends the playback
+   * run, clears the per-turn flags and returns the state machine to 'idle'.
+   * `generationComplete` was parsed and then used for nothing but a log line.
+   *
+   * On models/gemini-3.1-flash-live-preview, which is what production serves,
+   * the server sometimes sends generationComplete and never follows it with
+   * turnComplete. Measured on the 30-minute recording of 2026-09-13: 26
+   * generationComplete, 23 turnComplete. Each of the three missing ones left
+   * _turnState pinned at 'speaking' for the rest of that session — the model
+   * had finished talking, and nothing downstream was ever told.
+   *
+   * The same run on models/gemini-2.5-flash-native-audio-latest shows 102
+   * generationComplete against 145 turnComplete — never fewer. So this is new
+   * behaviour on the newer model, and the client had no answer for it.
+   *
+   * What a pinned 'speaking' costs: onTurnState consumers believe the
+   * interviewer is still talking, the goAway idle check in
+   * vyne-live-interview.js defers a renewal that is not actually mid-turn, the
+   * mute-reply detection never resolves, and _turnText never clears. Token
+   * usage survives — _turnUsage holds the max and stop() banks it — so this is
+   * not a billing fault, but usage.turns under-counts.
+   *
+   * 1200ms because generationComplete and turnComplete arrive together or not
+   * at all; the gap when both come is milliseconds, so this only ever fires on
+   * the pathological case. Overridable for tests.
+   */
+  var TURN_CLOSE_GRACE_MS = Number(window.VYNE_TURN_CLOSE_GRACE_MS) || 1200;
 
   VyneLiveSession.prototype._noteModelActivity = function (f) {
     var now = Date.now();
@@ -1218,6 +1251,20 @@
     // _gotAgentFrame stays as it is (the opening retry depends on it).
     if (f.modelText && !this._turnAudio && !this._turnThinkingAt) this._turnThinkingAt = now;
     if (f.modelText && !this._turnAudio && this._turnState !== 'thinking') this._setTurnState('thinking');
+    /*
+     * v5.34.75 — ANY audio cancels a pending salvage, not just a turn's first.
+     *
+     * This lived inside the `!this._turnAudio` branch below, which runs only on
+     * the FIRST audio frame of a turn — and _turnAudio is cleared only by
+     * _closeTurn. So while a salvage was pending it could never fire, and the
+     * model carrying on talking after generationComplete would have had its
+     * turn closed out from under it. Audio arriving at all means the turn is
+     * still running; that is the whole signal, and it belongs out here.
+     */
+    if (f.audio.length && this._turnCloseTimer) {
+      clearTimeout(this._turnCloseTimer); this._turnCloseTimer = null;
+      vlog('audio after generationComplete — the turn is still going; salvage cancelled');
+    }
     if (f.audio.length && !this._turnAudio) {
       this._turnAudio = true;
       this._turnFirstAudioAt = now;
@@ -1246,7 +1293,28 @@
       this._loggedTurnAudio = true;
       this._setTurnState('speaking');
     }
+    /*
+     * v5.34.75 — generationComplete is a turn ending too, when nothing follows.
+     *
+     * Armed here, disarmed by turnComplete below, by a new turn starting, and
+     * by stop()/renewal. See TURN_CLOSE_GRACE_MS for the measurement that made
+     * this necessary. The close is the SAME path turnComplete takes, so a
+     * salvaged turn and a normal one leave identical state behind.
+     */
+    if (f.generationComplete && !f.turnComplete && !this._turnCloseTimer) {
+      var selfTC = this;
+      this._turnCloseTimer = setTimeout(function () {
+        selfTC._turnCloseTimer = null;
+        if (selfTC._turnState !== 'speaking' && selfTC._turnState !== 'thinking') return;
+        vlog('!!! turnComplete never arrived after generationComplete — closing the turn',
+             { graceMs: TURN_CLOSE_GRACE_MS, turnState: selfTC._turnState,
+               turnHadAudio: !!selfTC._turnAudio });
+        selfTC._salvagedTurns = (selfTC._salvagedTurns || 0) + 1;
+        selfTC._closeTurn('generationComplete');
+      }, TURN_CLOSE_GRACE_MS);
+    }
     if (f.turnComplete) {
+      if (this._turnCloseTimer) { clearTimeout(this._turnCloseTimer); this._turnCloseTimer = null; }
       this._lastTurnCompleteAt = now;
       this._touchAppSession();   // v5.34.33: an agent turn is activity too
       /*
@@ -1285,16 +1353,31 @@
           }
         }
       }
-      vlog('model turn ENDS', { turnHadAudio: !!this._turnAudio, playbackPending: this.queue ? this.queue.pending() : null,
-        msSinceLastUtteranceEnd: this._micLastLoudAt ? now - this._micLastLoudAt : null });
-      this._bankTurnUsage();          // v5.34.52 — before the turn state resets
-      if (this.queue) this.queue.endRun('turnComplete');
-      this._turnAudio = false; this._loggedTurnAudio = false;
-      this._turnWasInterrupted = false;
-      this._turnText = '';
-      if (this._muteReplyTimer) { clearTimeout(this._muteReplyTimer); this._muteReplyTimer = null; }
-      this._setTurnState('idle');
+      this._closeTurn('turnComplete');
     }
+  };
+
+  /**
+   * End the model's turn. (extracted v5.34.75)
+   *
+   * One implementation, reached from turnComplete and from the
+   * generationComplete salvage above. Extracted rather than duplicated because
+   * a turn closed two slightly different ways is a state-machine bug waiting
+   * to happen — and this function is what banks usage and frees the state.
+   */
+  VyneLiveSession.prototype._closeTurn = function (why) {
+    var now = Date.now();
+    vlog('model turn ENDS', { via: why, turnHadAudio: !!this._turnAudio,
+      playbackPending: this.queue ? this.queue.pending() : null,
+      msSinceLastUtteranceEnd: this._micLastLoudAt ? now - this._micLastLoudAt : null });
+    this._bankTurnUsage();          // v5.34.52 — before the turn state resets
+    if (this.queue) this.queue.endRun(why);
+    this._turnAudio = false; this._loggedTurnAudio = false;
+    this._turnWasInterrupted = false;
+    this._turnText = '';
+    if (this._muteReplyTimer) { clearTimeout(this._muteReplyTimer); this._muteReplyTimer = null; }
+    if (this._turnCloseTimer) { clearTimeout(this._turnCloseTimer); this._turnCloseTimer = null; }
+    this._setTurnState('idle');
   };
   /**
    * Add the turn just finished to the session total. (v5.34.52)
@@ -1338,7 +1421,43 @@
       body: JSON.stringify({
         module: self.opts.module || 'interview_agent',
         clientName: self.opts.clientName || undefined,
-        context: self.opts.context || undefined,
+        /*
+         * v5.34.79 — resolved at MINT, like agenda and mandatoryCount above.
+         *
+         * This was captured once at create() and sent unchanged at every
+         * renewal, which was harmless while the context was a static briefing
+         * and is not any more: it now carries the list of questions already
+         * asked and answered, and a ~10-minute handover is exactly the moment
+         * that list matters, because the model on the other side of it has no
+         * memory of the turns before. A frozen context told the fresh session
+         * what was true at minute zero — nothing asked yet — which is the
+         * state most likely to make it repeat itself.
+         */
+        context: (function(c){
+          try{ var v = typeof c === 'function' ? c() : c; return v || undefined; }
+          catch(e){ return undefined; }
+        })(self.opts.context),
+        /*
+         * v5.34.73. Resolved HERE rather than captured at create(), so a
+         * renewal mint sends the agenda as it stands now — in particular which
+         * dimensions already have evidence. The server validates every code
+         * against its own enum; nothing here is trusted.
+         */
+        agenda: (function(a){
+          try{ return typeof a === 'function' ? a() : a; }catch(e){ return undefined; }
+        })(self.opts.agenda) || undefined,
+        mandatoryCount: (function(m){
+          try{ var v = typeof m === 'function' ? m() : m; return typeof v === 'number' ? v : undefined; }
+          catch(e){ return undefined; }
+        })(self.opts.mandatoryCount),
+        /* v5.34.84: the no-repeat rule is gated on this being > 0, so without
+         * it the rule never appears — see the note in vyne-live-interview.js's
+         * _sessionOpts. Resolved at mint like the two above, because it only
+         * means anything if it counts the conversation as it now stands. */
+        askedCount: (function(a){
+          try{ var v = typeof a === 'function' ? a() : a; return typeof v === 'number' ? v : undefined; }
+          catch(e){ return undefined; }
+        })(self.opts.askedCount),
         intervieweeName: self.opts.intervieweeName || undefined,
         intervieweeRole: self.opts.intervieweeRole || undefined,
         industry: self.opts.industry || undefined,
@@ -2030,6 +2149,7 @@
     // v5.34.52: a handover or a hang-up lands mid-turn far more often than
     // not. Bank whatever that turn had accrued before reporting.
     this._bankTurnUsage();
+    if (this._turnCloseTimer) { clearTimeout(this._turnCloseTimer); this._turnCloseTimer = null; }
     if (this.grant) {
       var seconds = this.startedAt ? Math.round((Date.now() - this.startedAt) / 1000) : 0;
       try {

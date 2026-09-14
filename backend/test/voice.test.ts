@@ -13,7 +13,7 @@ import Fastify, { type FastifyInstance } from "fastify";
 import { voiceRoutes } from "../src/routes/voice.js";
 import { LlmGateway } from "../src/llm/gateway.js";
 import type { Tts } from "../src/llm/tts.js";
-import type { LlmGateway as LlmGatewayType } from "../src/llm/gateway.js";
+import type { LlmGateway as LlmGatewayType, MeterEvent } from "../src/llm/gateway.js";
 
 function fakeTts(freeTier: boolean, synthesize = vi.fn(async () => ({
   audioBase64: "AAAA", mime: "audio/wav" as const, voice: "Kore", model: "fake-tts-model",
@@ -107,7 +107,7 @@ describe("POST /api/voice/tts — V225-audit gating", () => {
   });
 
   it("still meters a successful synthesis", async () => {
-    const meter = vi.fn(async () => {});
+    const meter = vi.fn(async (_e: MeterEvent) => {});
     const gateway = new LlmGateway({ adapters: [], policy: { defaultChain: [], taskChains: {} }, meter: async () => {}, blockFreeTier: false });
     const tts = fakeTts(false);
     const app = Fastify();

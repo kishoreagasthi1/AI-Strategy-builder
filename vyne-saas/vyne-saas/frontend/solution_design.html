@@ -1,0 +1,392 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>VYNE™ Solution Design Studio</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet"/>
+<script>window.VYNE_MODULE = "solution_design";</script>
+<script src="vyne-client.js"></script>
+<script src="vyne-rail.js"></script>
+<style>
+/* Foundry design system — matches billing.html/scorecard.html. */
+:root{
+  --navy:#01203D;--navy-2:#0A2E4D;--ink:#132433;--paper:#F3F1EB;--panel:#FFFFFF;
+  --panel-raised:#FAF8F3;--line:#E8E3D8;--line-strong:#D8D3C7;--quiet:#6C7783;--quiet-soft:#9AA4AE;
+  --gold:#A88553;--gold-2:#C6A46B;--signal-bg:#F4ECDD;--live:#2F7D4F;--live-bg:#E9F2EC;
+  --warn:#A9761C;--warn-bg:#F8EFDC;--danger:#B0324B;--danger-bg:#F7E7EB;
+  --r-sm:9px;--r-lg:14px;--r-pill:999px;
+  --shadow:0 1px 2px rgba(16,33,47,.05),0 10px 30px rgba(16,33,47,.06);
+}
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:var(--paper);color:var(--ink);font-family:'Inter',system-ui,sans-serif;font-size:14px;line-height:1.55;
+  -webkit-font-smoothing:antialiased;min-height:100vh;font-variant-numeric:tabular-nums}
+.page{max-width:1180px;margin:0 auto;padding:2rem}
+a{color:var(--gold);font-weight:600;text-decoration:none}
+a:hover{text-decoration:underline}
+.header{display:flex;align-items:center;justify-content:space-between;margin-bottom:26px;padding-bottom:1rem;border-bottom:1px solid rgba(184,151,42,0.3)}
+.logo-row{display:flex;align-items:center;gap:12px}
+.logo-hex{width:40px;height:40px}
+.logo-text{font-family:'Space Grotesk','Inter',sans-serif;font-size:18px;color:#132433;letter-spacing:0.08em}
+.logo-sub{font-size:10px;color:#7A5C1E;letter-spacing:0.2em;text-transform:uppercase;display:block}
+.header-title{font-family:'Space Grotesk','Inter',sans-serif;font-size:22px;color:#132433}
+.header-sub{font-size:12px;color:#46535F;margin-top:2px}
+.sub{font-size:12px;color:var(--quiet);margin-bottom:18px}
+.layout{display:grid;grid-template-columns:280px 1fr;gap:20px;align-items:start}
+.panel{background:var(--panel-raised);border:1px solid var(--line);border-radius:var(--r-lg);box-shadow:var(--shadow);padding:22px;margin-bottom:20px}
+.panel h2{font-size:11.5px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;margin-bottom:14px;color:var(--gold)}
+input,select,textarea{background:rgba(1,32,61,0.05);border:1px solid rgba(1,32,61,0.15);border-radius:8px;
+  padding:9px 12px;color:var(--ink);font-family:'Inter',sans-serif;font-size:13.5px;outline:none;width:100%;transition:border-color .2s;margin-bottom:8px}
+input:focus,select:focus,textarea:focus{border-color:#7A5C1E}
+textarea{resize:vertical;min-height:60px;line-height:1.5}
+label{font-size:11px;font-weight:600;color:var(--quiet);text-transform:uppercase;letter-spacing:.04em;display:block;margin-bottom:4px}
+button{background:var(--navy);color:#fff;border:none;border-radius:var(--r-sm);padding:10px 17px;
+  font-weight:600;font-size:13px;cursor:pointer;font-family:inherit;transition:background .15s,transform .08s}
+button:hover{background:var(--navy-2)}
+button:disabled{opacity:.5;cursor:default}
+button.ghost{background:transparent;color:var(--navy);border:1px solid var(--line-strong)}
+button.ghost:hover{background:rgba(1,32,61,0.05);border-color:var(--gold)}
+button.danger-ghost{background:transparent;color:var(--danger);border:1px solid var(--danger-bg)}
+.msg{font-size:12.5px;color:var(--quiet);margin-top:10px;min-height:16px;line-height:1.5}
+.msg.err{color:var(--danger)}
+.msg.ok{color:var(--live)}
+.hint{font-size:11.5px;color:var(--quiet-soft);line-height:1.6;margin-top:8px}
+.saved-list{list-style:none;display:flex;flex-direction:column;gap:6px;max-height:340px;overflow-y:auto}
+.saved-item{display:flex;align-items:center;gap:8px;padding:9px 10px;border-radius:8px;cursor:pointer;font-size:12.5px}
+.saved-item:hover{background:rgba(1,32,61,0.05)}
+.saved-item.active{background:var(--signal-bg)}
+.saved-item .name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.saved-item .del{color:var(--quiet-soft);font-size:14px;padding:2px 6px}
+.saved-item .del:hover{color:var(--danger)}
+.badge{display:inline-block;border-radius:var(--r-pill);padding:3px 11px;font-size:11px;font-weight:600;background:var(--signal-bg);color:#7A5C1E}
+.doc-section{margin-bottom:18px}
+.doc-section h3{font-size:12.5px;font-weight:700;color:var(--navy);margin-bottom:6px;text-transform:uppercase;letter-spacing:.04em}
+.list-rows{display:flex;flex-direction:column;gap:8px}
+.list-row{display:flex;gap:8px;align-items:flex-start}
+.list-row input,.list-row textarea{margin-bottom:0}
+.list-row .rm{background:transparent;color:var(--quiet-soft);border:none;padding:6px 8px;font-size:16px}
+.list-row .rm:hover{color:var(--danger)}
+.two-col{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.three-col{display:grid;grid-template-columns:2fr 1fr 1fr;gap:10px}
+@media print{
+  .vyne-home-btn,.layout > div:first-child,#gen-form,.saved-list,.actions,.header,.footer{display:none !important}
+  body{background:#fff}
+  .panel{box-shadow:none;border:none}
+  .layout{display:block}
+}
+</style>
+</head>
+<body>
+<div class="page">
+<div class="header">
+  <div class="logo-row">
+    <svg class="logo-hex" viewBox="0 0 40 40" fill="none">
+      <polygon points="20,2 36,10 36,30 20,38 4,30 4,10" fill="none" stroke="#C6A46B" stroke-width="1.8"/>
+      <circle cx="20" cy="20" r="9" fill="none" stroke="#C6A46B" stroke-width="1.4"/>
+      <line x1="14" y1="26" x2="26" y2="14" stroke="#C6A46B" stroke-width="1.4"/>
+    </svg>
+    <div>
+      <div class="logo-text">VYNORA</div>
+      <span class="logo-sub">Solution Design Studio</span>
+    </div>
+  </div>
+  <div style="text-align:right">
+    <div class="header-title">Solution Design Studio</div>
+    <div class="header-sub">AI-drafted, editable build/buy/partner doc per use case — feeds the client deck</div>
+  </div>
+</div>
+<div class="sub vyne-home-btn"><a href="index.html">← Back to modules</a></div>
+
+<div class="layout">
+  <div>
+    <div class="panel">
+      <h2>Client</h2>
+      <label for="client-input">Client name</label>
+      <input id="client-input" placeholder="e.g. Acme Industrial" onchange="onClientChange()"/>
+      <div class="hint">Same client name used across Pre-Engagement, Roadmap, and Billing.</div>
+    </div>
+    <div class="panel">
+      <h2>Saved designs</h2>
+      <ul id="saved-list" class="saved-list"><li class="hint">Pick a client to see saved designs.</li></ul>
+    </div>
+  </div>
+
+  <div>
+    <div class="panel" id="gen-form">
+      <h2>New use case</h2>
+      <div class="hint" style="margin:0 0 12px">
+        Copy the use case name/description straight from the Roadmap Builder, or describe a new one. VYNE drafts a
+        full structured design doc — edit anything below before saving.
+      </div>
+      <label for="uc-name">Use case name *</label>
+      <input id="uc-name" placeholder="e.g. AI-Assisted Invoice Matching"/>
+      <label for="uc-desc">Description (optional)</label>
+      <textarea id="uc-desc" placeholder="What the use case does, in a sentence or two"></textarea>
+      <div class="three-col">
+        <div><label for="uc-industry">Industry</label><input id="uc-industry" placeholder="e.g. Manufacturing"/></div>
+        <div><label for="uc-impact">Impact</label><input id="uc-impact" placeholder="e.g. high"/></div>
+        <div><label for="uc-complexity">Complexity</label><input id="uc-complexity" placeholder="e.g. medium"/></div>
+      </div>
+      <label for="uc-value">Expected business value (optional)</label>
+      <input id="uc-value" placeholder="e.g. Inventory −20%"/>
+      <button id="gen-btn" onclick="generate()" style="margin-top:6px">✨ Generate design</button>
+      <div class="msg" id="gen-msg"></div>
+    </div>
+
+    <div class="panel" id="doc-panel" style="display:none">
+      <h2>
+        <span id="doc-title">Design</span>
+        <span class="actions" style="float:right;display:flex;gap:8px">
+          <button class="ghost" style="padding:5px 12px" onclick="saveDoc()" id="save-btn">Save changes</button>
+          <button class="ghost" style="padding:5px 12px" onclick="window.print()">🖨 Print / Export</button>
+        </span>
+      </h2>
+      <div id="doc-meta" class="hint" style="margin-bottom:14px"></div>
+      <div id="doc-editor"></div>
+      <div class="msg" id="save-msg"></div>
+    </div>
+  </div>
+</div>
+
+</div><!-- /.page -->
+
+<script>
+// Owner/consultant module — interviewees never see this.
+(function(){
+  var s = vyneAuth.session();
+  if (s && s.role === "interviewee") window.location.href = "interview_agent.html";
+})();
+
+function esc(t){ var d=document.createElement('div'); d.textContent=t==null?'':String(t); return d.innerHTML; }
+
+var currentClient = null;
+var currentUcId = null;
+var savedDesigns = {};
+
+function onClientChange(){
+  currentClient = document.getElementById("client-input").value.trim();
+  loadSavedList();
+}
+
+async function loadSavedList(){
+  var list = document.getElementById("saved-list");
+  if (!currentClient) { list.innerHTML = "<li class='hint'>Pick a client to see saved designs.</li>"; return; }
+  list.innerHTML = "<li class='hint'>Loading…</li>";
+  try{
+    var d = await vyneAuth.api("/api/solution-design?client=" + encodeURIComponent(currentClient));
+    savedDesigns = d.designs || {};
+    var keys = Object.keys(savedDesigns);
+    if (!keys.length) { list.innerHTML = "<li class='hint'>No saved designs yet for this client.</li>"; return; }
+    list.innerHTML = keys.map(function(ucId){
+      var entry = savedDesigns[ucId];
+      return "<li class='saved-item" + (ucId === currentUcId ? " active" : "") + "' onclick=\"loadSaved('" + esc(ucId).replace(/'/g,"\\'") + "')\">" +
+        "<span class='name'>" + esc(entry.useCaseName) + "</span>" +
+        "<span class='del' onclick=\"event.stopPropagation(); deleteSaved('" + esc(ucId).replace(/'/g,"\\'") + "')\">✕</span>" +
+      "</li>";
+    }).join("");
+  }catch(e){ list.innerHTML = "<li class='msg err'>Failed to load: " + esc(e.message) + "</li>"; }
+}
+
+function loadSaved(ucId){
+  var entry = savedDesigns[ucId];
+  if (!entry) return;
+  currentUcId = ucId;
+  document.getElementById("uc-name").value = entry.useCaseName;
+  renderDoc(ucId, entry);
+  loadSavedList();
+}
+
+async function deleteSaved(ucId){
+  if (!confirm("Delete this design? This can't be undone.")) return;
+  try{
+    await vyneAuth.api("/api/solution-design", { method: "DELETE", body: { clientName: currentClient, useCaseId: ucId } });
+    if (ucId === currentUcId) { document.getElementById("doc-panel").style.display = "none"; currentUcId = null; }
+    loadSavedList();
+  }catch(e){ alert("Delete failed: " + e.message); }
+}
+
+async function generate(){
+  var msg = document.getElementById("gen-msg");
+  var btn = document.getElementById("gen-btn");
+  var name = document.getElementById("uc-name").value.trim();
+  if (!currentClient) { msg.className = "msg err"; msg.textContent = "Enter a client name first."; return; }
+  if (!name) { msg.className = "msg err"; msg.textContent = "Use case name is required."; return; }
+  btn.disabled = true; btn.textContent = "Generating…";
+  msg.className = "msg"; msg.textContent = "";
+  try{
+    var ucId = "uc_" + name.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 60) + "_" + Date.now().toString(36);
+    var body = {
+      clientName: currentClient, useCaseId: ucId, useCaseName: name,
+      useCaseDescription: document.getElementById("uc-desc").value.trim() || undefined,
+      industry: document.getElementById("uc-industry").value.trim() || undefined,
+      impact: document.getElementById("uc-impact").value.trim() || undefined,
+      complexity: document.getElementById("uc-complexity").value.trim() || undefined,
+      businessValue: document.getElementById("uc-value").value.trim() || undefined,
+    };
+    var d = await vyneAuth.api("/api/solution-design/generate", { method: "POST", body: body });
+    currentUcId = d.useCaseId;
+    savedDesigns[d.useCaseId] = d.entry;
+    renderDoc(d.useCaseId, d.entry);
+    msg.className = "msg ok"; msg.textContent = "Generated — review and edit below, then Save.";
+    loadSavedList();
+  }catch(e){
+    msg.className = "msg err";
+    msg.textContent = "Generation failed: " + (e.body && e.body.detail ? e.body.detail : e.message);
+  }finally{
+    btn.disabled = false; btn.textContent = "✨ Generate design";
+  }
+}
+
+function renderDoc(ucId, entry){
+  document.getElementById("doc-panel").style.display = "block";
+  document.getElementById("doc-title").textContent = entry.useCaseName;
+  var meta = [];
+  if (entry.generatedAt) meta.push("Generated " + new Date(entry.generatedAt).toLocaleString());
+  if (entry.editedAt) meta.push("Edited " + new Date(entry.editedAt).toLocaleString());
+  if (entry.model) meta.push("Model: " + entry.model);
+  document.getElementById("doc-meta").innerHTML = meta.map(function(m){ return "<span class='badge' style='margin-right:6px'>" + esc(m) + "</span>"; }).join("");
+
+  var d = entry.doc;
+  var html = "";
+  html += field("Problem statement", "problemStatement", d.problemStatement);
+  html += field("Current state", "currentState", d.currentState);
+  html += field("Target state", "targetState", d.targetState);
+
+  html += "<div class='doc-section'><h3>Recommendation</h3><div class='two-col'>" +
+    "<div><label>Approach</label><select id='f-approach'>" +
+      ["build","buy","partner"].map(function(o){ return "<option value='" + o + "'" + (o === d.recommendation.approach ? " selected" : "") + ">" + o + "</option>"; }).join("") +
+    "</select></div>" +
+    "<div><label>Rationale</label><textarea id='f-rationale'>" + esc(d.recommendation.rationale) + "</textarea></div>" +
+  "</div></div>";
+
+  html += listField("Data & integration requirements", "reqs", d.dataAndIntegrationRequirements, function(v,i){
+    return "<div class='list-row'><input class='req-item' value=\"" + esc(v).replace(/"/g,'&quot;') + "\"/><button class='rm' onclick='removeRow(this)'>✕</button></div>";
+  }, "Add requirement");
+
+  html += "<div class='doc-section'><h3>Phased implementation plan</h3><div id='phases' class='list-rows'>" +
+    d.phasedPlan.map(function(p){
+      return "<div class='list-row phase-row'>" +
+        "<input class='ph-phase' style='width:60px' type='number' value='" + esc(p.phase) + "'/>" +
+        "<input class='ph-name' value=\"" + esc(p.name).replace(/"/g,'&quot;') + "\" placeholder='Phase name'/>" +
+        "<textarea class='ph-desc'>" + esc(p.description) + "</textarea>" +
+        "<input class='ph-weeks' style='width:80px' type='number' value='" + esc(p.durationWeeks) + "' title='Duration (weeks)'/>" +
+        "<button class='rm' onclick='removeRow(this)'>✕</button>" +
+      "</div>";
+    }).join("") + "</div>" +
+    "<button class='ghost' style='padding:5px 12px;margin-top:8px' onclick=\"addPhaseRow()\">+ Add phase</button></div>";
+
+  html += "<div class='doc-section'><h3>Risks &amp; dependencies</h3><div id='risks' class='list-rows'>" +
+    d.risksAndDependencies.map(function(r){
+      return "<div class='list-row risk-row'>" +
+        "<input class='rk-risk' value=\"" + esc(r.risk).replace(/"/g,'&quot;') + "\" placeholder='Risk'/>" +
+        "<input class='rk-mit' value=\"" + esc(r.mitigation).replace(/"/g,'&quot;') + "\" placeholder='Mitigation'/>" +
+        "<button class='rm' onclick='removeRow(this)'>✕</button>" +
+      "</div>";
+    }).join("") + "</div>" +
+    "<button class='ghost' style='padding:5px 12px;margin-top:8px' onclick=\"addRiskRow()\">+ Add risk</button></div>";
+
+  html += "<div class='doc-section'><h3>Success metrics</h3><div id='metrics' class='list-rows'>" +
+    d.successMetrics.map(function(m){
+      return "<div class='list-row metric-row'>" +
+        "<input class='mt-metric' value=\"" + esc(m.metric).replace(/"/g,'&quot;') + "\" placeholder='Metric'/>" +
+        "<input class='mt-target' value=\"" + esc(m.target).replace(/"/g,'&quot;') + "\" placeholder='Target'/>" +
+        "<button class='rm' onclick='removeRow(this)'>✕</button>" +
+      "</div>";
+    }).join("") + "</div>" +
+    "<button class='ghost' style='padding:5px 12px;margin-top:8px' onclick=\"addMetricRow()\">+ Add metric</button></div>";
+
+  document.getElementById("doc-editor").innerHTML = html;
+}
+
+function field(label, id, value){
+  return "<div class='doc-section'><h3>" + esc(label) + "</h3><textarea id='f-" + id + "'>" + esc(value) + "</textarea></div>";
+}
+function listField(label, containerId, items, rowFn){
+  return "<div class='doc-section'><h3>" + esc(label) + "</h3><div id='" + containerId + "' class='list-rows'>" +
+    items.map(rowFn).join("") + "</div>" +
+    "<button class='ghost' style='padding:5px 12px;margin-top:8px' onclick=\"addReqRow()\">+ Add requirement</button></div>";
+}
+function removeRow(btn){ btn.parentElement.remove(); }
+function addReqRow(){
+  var row = document.createElement("div"); row.className = "list-row";
+  row.innerHTML = "<input class='req-item' placeholder='New requirement'/><button class='rm' onclick='removeRow(this)'>✕</button>";
+  document.getElementById("reqs").appendChild(row);
+}
+function addPhaseRow(){
+  var row = document.createElement("div"); row.className = "list-row phase-row";
+  row.innerHTML = "<input class='ph-phase' style='width:60px' type='number' value='1'/>" +
+    "<input class='ph-name' placeholder='Phase name'/><textarea class='ph-desc'></textarea>" +
+    "<input class='ph-weeks' style='width:80px' type='number' value='4'/><button class='rm' onclick='removeRow(this)'>✕</button>";
+  document.getElementById("phases").appendChild(row);
+}
+function addRiskRow(){
+  var row = document.createElement("div"); row.className = "list-row risk-row";
+  row.innerHTML = "<input class='rk-risk' placeholder='Risk'/><input class='rk-mit' placeholder='Mitigation'/><button class='rm' onclick='removeRow(this)'>✕</button>";
+  document.getElementById("risks").appendChild(row);
+}
+function addMetricRow(){
+  var row = document.createElement("div"); row.className = "list-row metric-row";
+  row.innerHTML = "<input class='mt-metric' placeholder='Metric'/><input class='mt-target' placeholder='Target'/><button class='rm' onclick='removeRow(this)'>✕</button>";
+  document.getElementById("metrics").appendChild(row);
+}
+
+function collectDoc(){
+  return {
+    problemStatement: document.getElementById("f-problemStatement").value,
+    currentState: document.getElementById("f-currentState").value,
+    targetState: document.getElementById("f-targetState").value,
+    recommendation: {
+      approach: document.getElementById("f-approach").value,
+      rationale: document.getElementById("f-rationale").value,
+    },
+    dataAndIntegrationRequirements: Array.from(document.querySelectorAll("#reqs .req-item")).map(function(i){ return i.value.trim(); }).filter(Boolean),
+    phasedPlan: Array.from(document.querySelectorAll("#phases .phase-row")).map(function(row){
+      return {
+        phase: Number(row.querySelector(".ph-phase").value) || 1,
+        name: row.querySelector(".ph-name").value.trim(),
+        description: row.querySelector(".ph-desc").value.trim(),
+        durationWeeks: Number(row.querySelector(".ph-weeks").value) || 1,
+      };
+    }).filter(function(p){ return p.name; }),
+    risksAndDependencies: Array.from(document.querySelectorAll("#risks .risk-row")).map(function(row){
+      return { risk: row.querySelector(".rk-risk").value.trim(), mitigation: row.querySelector(".rk-mit").value.trim() };
+    }).filter(function(r){ return r.risk; }),
+    successMetrics: Array.from(document.querySelectorAll("#metrics .metric-row")).map(function(row){
+      return { metric: row.querySelector(".mt-metric").value.trim(), target: row.querySelector(".mt-target").value.trim() };
+    }).filter(function(m){ return m.metric; }),
+  };
+}
+
+async function saveDoc(){
+  var msg = document.getElementById("save-msg");
+  var btn = document.getElementById("save-btn");
+  if (!currentUcId || !currentClient) return;
+  btn.disabled = true; btn.textContent = "Saving…";
+  try{
+    var doc = collectDoc();
+    var d = await vyneAuth.api("/api/solution-design", {
+      method: "PUT",
+      body: { clientName: currentClient, useCaseId: currentUcId, useCaseName: document.getElementById("uc-name").value.trim(), doc: doc },
+    });
+    savedDesigns[currentUcId] = d.entry;
+    renderDoc(currentUcId, d.entry);
+    msg.className = "msg ok"; msg.textContent = "Saved.";
+    loadSavedList();
+  }catch(e){
+    msg.className = "msg err";
+    msg.textContent = "Save failed: " + (e.body && e.body.error === "invalid_input" ? "please check every field is filled in." : e.message);
+  }finally{
+    btn.disabled = false; btn.textContent = "Save changes";
+  }
+}
+
+// Carry over the active client, same convention as billing.html/scorecard.html.
+(function(){
+  try{
+    var active = (window.vyneAuth && typeof vyneAuth.activeClient === 'function') ? vyneAuth.activeClient() : undefined;
+    if (active) { document.getElementById("client-input").value = active; onClientChange(); }
+  }catch(e){}
+})();
+</script>
+</body>
+</html>

@@ -29,7 +29,7 @@ describe.skipIf(!ENABLED)("v5.34.55 — BYOK routes", () => {
   let db: pg.Client;
   let tenant: string;
   let owner: string;
-  let stored: { tenantId: string; key: string }[] = [];
+  let stored: { tenantId: string; key: string; clientNorm: string; provider: string }[] = [];
   let probeResult: KeyProbe = GOOD;
   /** Every key the Gemini prober was asked to send to Google. */
   let probed: string[] = [];
@@ -74,6 +74,19 @@ describe.skipIf(!ENABLED)("v5.34.55 — BYOK routes", () => {
     await db.query(`DELETE FROM byok_invites WHERE tenant_id = $1`, [tenant]);
     await db.query(`DELETE FROM byok_keys WHERE tenant_id = $1`, [tenant]);
     await db.query(`DELETE FROM byok_events WHERE tenant_id = $1`, [tenant]);
+    /*
+     * v5.34.67: a setup link can only be issued for a client who EXISTS. These
+     * tests were written when the Owner could type any string, which is the
+     * flaw that release closed — a key attached to an unregistered name stored
+     * fine, showed as active, and was never used. Every client named below is
+     * now registered the way POST /api/engagements registers one.
+     */
+    await db.query(`DELETE FROM engagements WHERE tenant_id = $1`, [tenant]);
+    for (const name of ["Nestlé", "Acme Industrial", "Acme Corp", "Meridian Foods", "Second Client"]) {
+      await db.query(
+        `INSERT INTO engagements (tenant_id, code, client_name) VALUES ($1, $2, $3)`,
+        [tenant, "R-" + Math.random().toString(36).slice(2, 8).toUpperCase(), name]);
+    }
   });
 
   afterAll(async () => {
@@ -83,9 +96,23 @@ describe.skipIf(!ENABLED)("v5.34.55 — BYOK routes", () => {
     await closePool();
   });
 
-  const invite = async (clientName = "Nestlé", provider = "gemini-aistudio") =>
-    (await app.inject({ method: "POST", url: "/api/byok/invites",
-      payload: { clientName, provider } })).json();
+  const invite = async (clientName = "Nestlé", provider = "gemini-aistudio") => {
+    const r = await app.inject({ method: "POST", url: "/api/byok/invites",
+      payload: { clientName, provider } });
+    /*
+     * Assert here rather than letting the caller trip over it. When v5.34.67
+     * started refusing links for unregistered clients, an un-seeded name made
+     * this return a 409 body with no url — and the failure surfaced three lines
+     * later as "Invalid URL" from new URL(undefined), which says nothing about
+     * the actual cause.
+     */
+    if (r.statusCode !== 200) {
+      throw new Error(
+        `invite("${clientName}") failed with ${r.statusCode}: ${r.body} — ` +
+        `is that client registered as an engagement in beforeEach?`);
+    }
+    return r.json();
+  };
 
   const tokenOf = (url: string) => new URL(url).searchParams.get("t")!;
 

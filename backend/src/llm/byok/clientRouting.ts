@@ -29,6 +29,7 @@
 import { withTenant } from "../../db/pool.js";
 import { normClient } from "../../auth/clients.js";
 import { VENDOR_OF_ADAPTER } from "./resolve.js";
+import { engagementIdFor, clientMatch } from "./engagementBinding.js";
 import type { ByokProvider } from "./byokRepo.js";
 
 export interface ClientRouting {
@@ -60,13 +61,17 @@ export async function routingFor(
 ): Promise<ClientRouting | null> {
   if (!clientName) return null;          // unattributed work follows firm policy
   const norm = normClient(clientName);
+  // v5.34.67: by engagement, with the norm as fallback — see engagementBinding.ts.
+  // A renamed client kept their key and lost their preference otherwise.
+  const engagementId = await engagementIdFor(tenantId, clientName);
+  const m = clientMatch(engagementId, norm);
   return withTenant(tenantId, async (c) => {
     const r = await c.query<Row>(
       `SELECT client_norm, client_name, text_vendor, note, updated_at
          FROM client_routing
         WHERE tenant_id = current_setting('app.tenant_id', true)::uuid
-          AND client_norm = $1`,
-      [norm]
+          AND ${m.sql}`,
+      m.params
     );
     return r.rows[0] ? shape(r.rows[0]) : null;
   });
@@ -98,13 +103,16 @@ export async function setRouting(a: {
   checkedAgainstKeys?: boolean;
 }): Promise<ClientRouting> {
   const norm = normClient(a.clientName);
+  const engagementId = await engagementIdFor(a.tenantId, a.clientName);
   return withTenant(a.tenantId, async (c) => {
     const r = await c.query<Row>(
       `INSERT INTO client_routing
-         (tenant_id, client_norm, client_name, text_vendor, note, set_by, checked_against_keys)
-       VALUES (current_setting('app.tenant_id', true)::uuid, $1, $2, $3, $4, $5, $6)
+         (tenant_id, client_norm, client_name, text_vendor, note, set_by,
+          checked_against_keys, engagement_id)
+       VALUES (current_setting('app.tenant_id', true)::uuid, $1, $2, $3, $4, $5, $6, $7)
        ON CONFLICT (tenant_id, client_norm) DO UPDATE SET
          client_name = EXCLUDED.client_name,
+         engagement_id = COALESCE(EXCLUDED.engagement_id, client_routing.engagement_id),
          text_vendor = EXCLUDED.text_vendor,
          note = EXCLUDED.note,
          set_by = EXCLUDED.set_by,
@@ -112,7 +120,7 @@ export async function setRouting(a: {
          updated_at = now()
        RETURNING client_norm, client_name, text_vendor, note, updated_at`,
       [norm, a.clientName, a.textVendor, a.note ?? null, a.setBy ?? null,
-       a.checkedAgainstKeys ?? false]
+       a.checkedAgainstKeys ?? false, engagementId]
     );
     return shape(r.rows[0]);
   });
@@ -121,11 +129,13 @@ export async function setRouting(a: {
 /** Remove a preference — the client goes back to the firm's own policy. */
 export async function clearRouting(tenantId: string, clientName: string): Promise<boolean> {
   const norm = normClient(clientName);
+  const engagementId = await engagementIdFor(tenantId, clientName);
+  const m = clientMatch(engagementId, norm);
   return withTenant(tenantId, async (c) => {
     const r = await c.query(
       `DELETE FROM client_routing
-        WHERE tenant_id = current_setting('app.tenant_id', true)::uuid AND client_norm = $1`,
-      [norm]
+        WHERE tenant_id = current_setting('app.tenant_id', true)::uuid AND ${m.sql}`,
+      m.params
     );
     return (r as { rowCount?: number }).rowCount === 1;
   });

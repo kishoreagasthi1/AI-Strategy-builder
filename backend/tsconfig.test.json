@@ -1,0 +1,33 @@
+{
+  /*
+   * Typechecking for the TEST suite. (v5.34.67b)
+   *
+   * ── Why a second config ─────────────────────────────────────────────────────
+   *
+   * tsconfig.json excludes test/, and has to: it drives the BUILD, where
+   * rootDir is src/ and anything outside it would either fail the compile or
+   * land in dist/. The consequence was that none of the ~140 test files were
+   * ever typechecked by anything. vitest strips types with esbuild and does not
+   * check them, so a test could reference a type that no longer exists and stay
+   * green until the moment it ran — and only if it ran at all.
+   *
+   * That is not hypothetical. v5.34.64 changed makeByokLiveResolver's return
+   * type from `ByokLiveBinding | null` to a three-way union.
+   * byokVoicePayer.test.ts still returned null. `tsc --noEmit` was clean, the
+   * suite was green, and the break was invisible — because those tests are
+   * gated on RLS_TEST and were skipping. It surfaced only when the Docker
+   * runner executed the database tier for the first time.
+   *
+   * So: same compiler options, no emit, and test/ included. Nothing about the
+   * build changes; this is a check that runs beside it.
+   */
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    // rootDir is dropped deliberately — there is no output, so the constraint
+    // that every input live under src/ buys nothing and would reject test/.
+    "rootDir": "."
+  },
+  "include": ["src/**/*.ts", "test/**/*.ts", "vitest.config.ts"],
+  "exclude": ["node_modules", "dist"]
+}

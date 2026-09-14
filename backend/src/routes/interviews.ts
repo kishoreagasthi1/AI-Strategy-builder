@@ -1517,6 +1517,14 @@ export async function interviewRoutes(app: FastifyInstance): Promise<void> {
   // are never lost even if the fold-in has a problem; a consultant can still
   // pull the raw session via GET /api/interviews/:id/state as before).
   app.post("/api/interviews/mine/complete", async (req, reply) => {
+    /*
+     * v5.34.69 — carried out of the transaction so the response and the audit
+     * row can say the merge failed. Declared here rather than inside, because
+     * the reporting happens after withTenant() returns.
+     */
+    let mergeError: string | null = null;
+    let mergeId: string | null = null;
+    let mergeClient: string | null = null;
     const ctx = req.ctx!;
     const result = await withTenant(ctx.tenantId, async (c) => {
       const upd = await c.query<{
@@ -1591,6 +1599,8 @@ export async function interviewRoutes(app: FastifyInstance): Promise<void> {
             role: interviewee_role,
             name: interviewee_name,
           });
+          // For the failure report below, while these are still in scope.
+          mergeId = id; mergeClient = client_name;
 
           /*
            * Persist the TRANSCRIPT as an auditable record (v5.32.58).
@@ -1720,9 +1730,20 @@ export async function interviewRoutes(app: FastifyInstance): Promise<void> {
            * client, and repair the index either way.
            */
           if (!code || !eng) {
+            /*
+             * v5.34.69: an explicit tenant_id alongside RLS.
+             *
+             * This file's own header says the consultant-facing state queries
+             * "carry their own explicit tenant_id predicate in addition to RLS,
+             * as belt-and-braces defense-in-depth". This one did not, and it is
+             * the query that decides which engagement record a client's
+             * interview answers are written into — the worst place in the file
+             * to be relying on a single mechanism.
+             */
             const scan = await c.query<{ key: string; value: { v: string } }>(
               `SELECT key, value FROM module_state
-                WHERE module = 'workspace'
+                WHERE tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid
+                  AND module = 'workspace'
                   AND key LIKE 'vynora_engagement_%'
                   AND key <> 'vynora_engagement_index'`
             );
@@ -1775,11 +1796,45 @@ export async function interviewRoutes(app: FastifyInstance): Promise<void> {
           await upsert("vynora_engagement_" + code, JSON.stringify(merged));
         }
       } catch (e) {
-        req.log.warn({ err: e }, "engagement auto-merge failed (interview still marked completed)");
+        /*
+         * v5.34.69. The merge failing is REPORTED, not swallowed.
+         *
+         * This used to log a warning and return ok. The interviewee saw
+         * "completed", their scores and findings never reached the engagement
+         * record that Synthesis, the scorecard, the roadmap and the client deck
+         * all read from, and the only trace was a log line nobody tails. Silent
+         * loss of the one thing this product exists to collect.
+         *
+         * The interview itself STAYS completed, and deliberately: the session
+         * blob and the transcript are already written in this transaction, the
+         * interviewee has finished and gone, and re-opening the interview would
+         * invite a second run over data we already hold. What changes is that
+         * somebody is told. `mergeFailed` reaches the consultant's tracker;
+         * audit_log carries the reason; and the response says so rather than
+         * claiming an unqualified success.
+         */
+        mergeError = (e as Error)?.message ?? "unknown error";
+        req.log.error({ err: e, interviewId: id, clientName: client_name },
+                      "engagement auto-merge FAILED — the interview is complete but its answers "
+                      + "did not reach the engagement record");
       }
       return "ok" as const;
     });
     if (result === "not_found") { reply.code(404).send({ error: "no_open_interview" }); return; }
+    if (mergeError) {
+      // Audited because this is data that should exist and does not; the row is
+      // what lets someone find it later without reading a week of logs.
+      void auditLog(ctx.tenantId, ctx.userId, "engagement_merge_failed", {
+        interviewId: mergeId, clientName: mergeClient, reason: mergeError,
+      });
+      return {
+        ok: true,
+        mergeFailed: true,
+        detail:
+          "Your interview was saved, but it could not be added to the engagement record. "
+          + "Your consultant has been notified and nothing you entered has been lost.",
+      };
+    }
     return { ok: true };
   });
 }

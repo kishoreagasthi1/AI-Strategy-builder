@@ -60,7 +60,15 @@ export type AuditAction =
    * Nestlé's interviews all quarter?" has no answer on file.
    */
   | "byok_fallback_granted"
-  | "byok_fallback_revoked";
+  | "byok_fallback_revoked"
+  /*
+   * v5.34.69. A completed interview whose answers did not reach the engagement
+   * record. The merge used to log a warning and return ok, so the interviewee
+   * saw success, the consultant saw nothing, and the scores behind a board deck
+   * simply were not there. This row is how someone finds it later without
+   * reading a week of logs.
+   */
+  | "engagement_merge_failed";
 
 /**
  * Deliberately opens its OWN transaction rather than accepting an existing

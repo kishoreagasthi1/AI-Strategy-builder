@@ -43,7 +43,7 @@ function keyRow(over: Partial<ByokKeyRow> = {}): ByokKeyRow {
     status: "active", secretName: "projects/p/secrets/s/versions/3", keyHint: "aaaa",
     verifiedAt: new Date().toISOString(), paidTierAttested: true,
     attestedByEmail: "admin@nestle.example", attestedAt: new Date().toISOString(),
-    probe: null, ...over,
+    probe: null, lastError: null, lastErrorAt: null, ...over,
   };
 }
 
@@ -247,7 +247,7 @@ describe("v5.34.64 — a refused client key fails the call", () => {
 
     const err = await gw.generate(
       { tenantId: "t1", userId: "u1", module: "m", clientName: "Nestle" }, REQ
-    ).catch((e) => e as GatewayError);
+    ).catch((e) => e) as GatewayError;
 
     expect(err).toBeInstanceOf(GatewayError);
     // 402, not 502: this is not an outage and must not send a consultant
@@ -332,7 +332,7 @@ describe("v5.34.64 — a refused client key fails the call", () => {
     });
     const err = await gw.generate(
       { tenantId: "t1", userId: "u1", module: "m", clientName: "Nestle" }, REQ
-    ).catch((e) => e as GatewayError);
+    ).catch((e) => e) as GatewayError;
 
     expect(err.statusCode).toBe(503);
     expect(err.message).toMatch(/briefly at capacity/i);
@@ -381,16 +381,80 @@ describe("v5.34.64 — the live resolver distinguishes 'no key' from 'broken key
     if (r.kind === "ok") expect(r.binding.keyHint).toBe("aaaa");
   });
 
-  it("'unusable' — not 'none' — when a key on file is switched off", async () => {
+  it("'unusable' only when the vendor REFUSED the key", async () => {
     /*
-     * The conflation this release removes. A disabled key returned `null`,
-     * which the voice route read as "no key on file", and the interview ran on
-     * the firm's credential. Both answers are null; only one of them is right.
+     * v5.34.69 narrowed this, and the narrowing is the point.
+     *
+     * v5.34.64 treated every non-active status as unusable, which over-applied
+     * the rule. `disabled` means the OWNER pressed "turn off" — a deliberate
+     * decision to put this client back on the firm's account — and `pending`
+     * means no key was ever supplied. Refusing an interview in either case
+     * contradicts the Owner's own instruction, and contradicted the keys screen,
+     * which said in as many words "disabled — running on your key".
+     *
+     * Only a credential the vendor refused belongs here, because that is the
+     * one that silently moves the bill.
      */
-    for (const status of ["disabled", "failed", "pending"] as const) {
+    const refused = await live({ row: { status: "failed" }, key: "K" })("t1", "Nestle");
+    expect(refused.kind).toBe("unusable");
+
+    for (const status of ["disabled", "pending"] as const) {
       const r = await live({ row: { status }, key: "K" })("t1", "Nestle");
-      expect(r.kind, status).toBe("unusable");
+      expect(r.kind, `${status} is the firm's own choice, not a broken key`).toBe("none");
     }
+  });
+
+  it("text and voice agree about what a switched-off key means", async () => {
+    /*
+     * The two paths answered differently for months: text skipped any
+     * non-active row (so the firm paid), voice called all of them unusable (so
+     * the interview was refused). Same key, same client, opposite outcomes,
+     * neither matching the screen. Pinned together so they cannot drift again.
+     */
+    const resolveText = makeByokResolver({
+      secretStore: { projectId: "p" },
+      lookup: async (_t, _c, provider) =>
+        provider === "gemini-aistudio" ? keyRow({ status: "disabled" }) : null,
+      fetchKey: async () => "K",
+    });
+    const text = await resolveText({ tenantId: "t1", clientName: "Nestle" });
+    expect(text.adapters.size).toBe(0);
+    expect(text.unusable, "text called a disabled key unusable").toEqual([]);
+
+    const voice = await live({ row: { status: "disabled" }, key: "K" })("t1", "Nestle");
+    expect(voice.kind).toBe("none");
+  });
+
+  it("a REFUSED key is unusable on both paths, so the firm is not billed twice over", async () => {
+    const resolveText = makeByokResolver({
+      secretStore: { projectId: "p" },
+      // Only the GOOGLE key is on file. A lookup that answers for every provider
+      // would report this client as having two refused keys when they have one.
+      lookup: async (_t, _c, provider) =>
+        provider === "gemini-aistudio"
+          ? keyRow({ status: "failed", lastError: "403 PERMISSION_DENIED" })
+          : null,
+      fetchKey: async () => "K",
+    });
+    const text = await resolveText({ tenantId: "t1", clientName: "Nestle" });
+    expect(text.adapters.size).toBe(0);
+    expect(text.unusable).toHaveLength(1);
+    /*
+     * v5.34.70. This used to assert the raw recorded error INSIDE `reason`.
+     * gateway.ts interpolates `reason` into the 402 MESSAGE, which reaches
+     * whoever was in the interview, and byok_keys.last_error holds whatever its
+     * last writer put there — recordResolveError stores driver and Secret
+     * Manager messages verbatim, which carry the secret's resource name and so
+     * the GCP project, the tenant uuid and the client_norm. The split is the
+     * fix; asserting it here is what keeps the two from being merged again.
+     */
+    expect(text.unusable[0].reason).not.toMatch(/PERMISSION_DENIED/);
+    expect(text.unusable[0].reason).toMatch(/refused by the provider/i);
+    expect(text.unusable[0].detail, "the operator still needs the real reason")
+      .toMatch(/403 PERMISSION_DENIED/);
+
+    const voice = await live({ row: { status: "failed" }, key: "K" })("t1", "Nestle");
+    expect(voice.kind).toBe("unusable");
   });
 
   it("'unusable' when the secret behind an active key cannot be read", async () => {

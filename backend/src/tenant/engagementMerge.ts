@@ -28,6 +28,8 @@ import {
   isRefreshRound,
   lowestRoundNumber,
   priorScoresFor,
+  roundEventRollup,
+  TIER_WEIGHT,
   type ScoringInterview,
 } from "./scoring.js";
 
@@ -44,6 +46,8 @@ export interface SessionRecord {
   refreshRound?: number | null;
   refreshScope?: string[];
   coverageByDim?: Record<string, number>;
+  /** v5.34.93: the lead/cover/light tiering that governed this interview. */
+  dimTiers?: Record<string, string>;
   eventDriven?: boolean;
   eventContext?: unknown;
   eventCoveredDims?: string[];
@@ -60,6 +64,13 @@ export interface EngagementRound {
   interviews: Record<string, unknown>[];
   scores: Record<string, number>;
   status: string;
+  /* v5.34.96 — external-event attribution, DERIVED from this round's interviews
+   * by roundEventRollup(). Declared here rather than cast in at the assignment
+   * because synthesis.html reads all three off the round (its ⚡ marker), which
+   * makes them part of the record's contract, not incidental extras. */
+  eventDriven?: boolean;
+  eventContext?: unknown;
+  eventCoveredDims?: string[];
 }
 
 export interface EngagementRecord {
@@ -78,6 +89,40 @@ const DIMS = ["D1", "D2", "D3", "D4", "D5", "D6", "D7"];
  *  seven real dimensions and only finite values in [0,1]; returns null rather
  *  than an empty object so "reported nothing" stays distinguishable from
  *  "reported zero coverage everywhere". */
+/**
+ * v5.34.93 — the tiering, sanitised on the way in.
+ *
+ * Exactly the shape of sanitizeCoverage below, and here for exactly the same
+ * reason: the session blob is authored by the INTERVIEWEE's browser, and this
+ * value lands in the weights that decide the client's headline number
+ * (dimensionWeights → overallOf). Keys restricted to the seven real dimensions,
+ * values to the three tier names — anything else is dropped rather than
+ * carried, so a crafted blob cannot invent a tier the scoring has never heard
+ * of and take the `0` fallback path by accident.
+ *
+ * What this does NOT do is make the tiering trustworthy, and it should not
+ * pretend to: the SCORES arrive in the same blob and are accepted as given, so
+ * anyone able to forge a tiering can already forge the number it weights.
+ * Sanitising here keeps the value well-formed; the trust boundary is the
+ * session blob itself and is unchanged by this version.
+ */
+function sanitizeDimTiers(t: Record<string, string> | undefined | null): Record<string, string> | null {
+  if (!t || typeof t !== "object") return null;
+  const out: Record<string, string> = {};
+  for (const d of DIMS) {
+    const v = (t as Record<string, unknown>)[d];
+    if (typeof v !== "string") continue;
+    if (!Object.prototype.hasOwnProperty.call(TIER_WEIGHT, v)) continue;
+    out[d] = v;
+  }
+  /* An empty result is a real answer, not a missing one: a role with every
+   * dimension switched off in Pre-Engagement legitimately tiers nothing. But
+   * `{}` and null behave identically downstream — dimensionWeights returns null
+   * either way — so returning null keeps one representation of "no usable
+   * tiering" rather than two that a future reader has to know are the same. */
+  return Object.keys(out).length ? out : null;
+}
+
 function sanitizeCoverage(cov: Record<string, number> | undefined | null): Record<string, number> | null {
   if (!cov || typeof cov !== "object") return null;
   const out: Record<string, number> = {};
@@ -279,6 +324,25 @@ export function mergeSessionIntoEngagement(
      * so this is untrusted input landing in a number the client is shown: keys
      * restricted to the seven real dimensions, values to finite [0,1]. */
     coverageByDim: session.isRefresh ? sanitizeCoverage(session.coverageByDim) : null,
+    /* v5.34.93 — THE SAME DEFECT AS coverageByDim ABOVE, one version later.
+     *
+     * v5.34.92 added dimTiers to the interview record in
+     * interview_agent.html's writeInterviewToEngagement(), and every consumer
+     * of the overall reads it. This function rebuilds the record field by
+     * field, so an interview completing through the DISTRIBUTED auto-flow —
+     * which is the path an interviewee-run invite takes, i.e. the normal one —
+     * arrived here carrying its tiering and left without it.
+     *
+     * dimensionWeights() is all-or-nothing per round by design, so a single
+     * distributed interview was enough to drop the whole round back to the
+     * plain mean. The weighting would have been dead in production on exactly
+     * the engagements the product is built around, while passing every test,
+     * because the consultant-run browser path writes the field directly and
+     * never goes through here.
+     *
+     * Unconditional, not gated on isRefresh: the tiering governs every
+     * interview, initial ones included. */
+    dimTiers: sanitizeDimTiers(session.dimTiers),
     eventCoveredDims: !session.isRefresh && session.eventDriven
       ? (session.eventCoveredDims || []).filter((d) => DIMS.indexOf(String(d)) >= 0).slice(0, DIMS.length)
       : null,
@@ -387,6 +451,16 @@ export function mergeSessionIntoEngagement(
     round.interviews.push(ivRecord);
   }
   round.status = "complete";
+
+  /* v5.34.96 — roll the event tags UP to the round; see roundEventRollup().
+   * Synthesis draws its ⚡ marker from round.eventDriven/eventCoveredDims and
+   * nothing had ever written them, on either path. eventContext is only filled
+   * in when the round has none: Pre-Engagement authors that string and the
+   * consultant's wording outranks an interview's. */
+  const _evt = roundEventRollup(round.interviews as ScoringInterview[]);
+  round.eventDriven = _evt.eventDriven;
+  round.eventCoveredDims = _evt.eventCoveredDims;
+  if (!round.eventContext && _evt.eventContext) round.eventContext = _evt.eventContext;
 
   /* Recompute this round's scores through the ONE formula (v5.32.59, F6).
    *

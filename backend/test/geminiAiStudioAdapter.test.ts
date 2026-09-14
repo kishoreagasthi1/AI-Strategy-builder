@@ -21,7 +21,7 @@ function captureFetch() {
     capturedHeaders = init?.headers as Record<string, string> | undefined;
     return new Response(JSON.stringify(OK_BODY), { status: 200, headers: { "content-type": "application/json" } });
   };
-  return { fetchImpl, getUrl: () => capturedUrl, getHeaders: () => capturedHeaders };
+  return { fetchImpl: fetchImpl as unknown as typeof fetch, getUrl: () => capturedUrl, getHeaders: () => capturedHeaders };
 }
 
 describe("gemini-aistudio adapter — key transport (v5.32.3)", () => {

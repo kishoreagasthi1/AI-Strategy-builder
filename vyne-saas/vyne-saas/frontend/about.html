@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>VYNE™ — About / Version</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet"/>
+<!--
+  Deliberately standalone — does NOT load vyne-client.js. That bridge
+  redirects unauthenticated visitors straight to the login screen for any
+  module page, which would defeat the point: this page needs to work when
+  you're not signed in, and when something else is broken, so you can
+  check "is this actually the build I just deployed" without a session.
+  See backend/src/version.ts for why this page exists.
+-->
+<style>
+:root{
+  --navy:#01203D;--navy-2:#0A2E4D;--ink:#132433;--paper:#F3F1EB;--panel:#FFFFFF;
+  --panel-raised:#FAF8F3;--line:#E8E3D8;--line-strong:#D8D3C7;--quiet:#6C7783;--quiet-soft:#9AA4AE;
+  --gold:#A88553;--gold-2:#C6A46B;--signal-bg:#F4ECDD;--live:#2F7D4F;--live-bg:#E9F2EC;
+  --warn:#A9761C;--warn-bg:#F8EFDC;--danger:#B0324B;--danger-bg:#F7E7EB;
+  --r-sm:9px;--r-lg:14px;--r-pill:999px;
+  --shadow:0 1px 2px rgba(16,33,47,.05),0 10px 30px rgba(16,33,47,.06);
+}
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:var(--paper);color:var(--ink);font-family:'Inter',system-ui,sans-serif;font-size:14px;line-height:1.55;
+  -webkit-font-smoothing:antialiased;min-height:100vh}
+.page{max-width:640px;margin:0 auto;padding:2rem}
+a{color:var(--gold);font-weight:600;text-decoration:none}
+a:hover{text-decoration:underline}
+.header{display:flex;align-items:center;justify-content:space-between;margin-bottom:26px;padding-bottom:1rem;border-bottom:1px solid rgba(184,151,42,0.3)}
+.logo-row{display:flex;align-items:center;gap:12px}
+.logo-hex{width:40px;height:40px}
+.logo-text{font-family:'Space Grotesk','Inter',sans-serif;font-size:18px;color:#132433;letter-spacing:0.08em}
+.logo-sub{font-size:10px;color:#7A5C1E;letter-spacing:0.2em;text-transform:uppercase;display:block}
+.sub{font-size:12px;color:var(--quiet);margin-bottom:18px}
+.panel{background:var(--panel-raised);border:1px solid var(--line);border-radius:var(--r-lg);box-shadow:var(--shadow);padding:22px;margin-bottom:20px}
+.panel h2{font-size:11.5px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;margin-bottom:14px;color:var(--gold)}
+.row{display:flex;justify-content:space-between;align-items:baseline;padding:10px 0;border-bottom:1px solid var(--line)}
+.row:last-child{border-bottom:none}
+.row-label{font-size:11.5px;color:var(--quiet-soft);text-transform:uppercase;letter-spacing:.05em;font-weight:700}
+.row-val{font-family:'Space Grotesk',sans-serif;font-size:16px;color:var(--ink)}
+.banner{border-radius:var(--r-lg);padding:16px 18px;font-size:13px;font-weight:600;margin-bottom:20px}
+.banner.ok{background:var(--live-bg);color:var(--live)}
+.banner.err{background:var(--danger-bg);color:var(--danger)}
+.banner.pending{background:var(--signal-bg);color:#7A5C1E}
+.hint{font-size:11.5px;color:var(--quiet-soft);line-height:1.6;margin-top:8px}
+</style>
+</head>
+<body>
+<div class="page">
+<div class="header">
+  <div class="logo-row">
+    <svg class="logo-hex" viewBox="0 0 40 40" fill="none">
+      <polygon points="20,2 36,10 36,30 20,38 4,30 4,10" fill="none" stroke="#C6A46B" stroke-width="1.8"/>
+      <circle cx="20" cy="20" r="9" fill="none" stroke="#C6A46B" stroke-width="1.4"/>
+      <line x1="14" y1="26" x2="26" y2="14" stroke="#C6A46B" stroke-width="1.4"/>
+    </svg>
+    <div>
+      <div class="logo-text">VYNORA</div>
+      <span class="logo-sub">About &amp; Version</span>
+    </div>
+  </div>
+</div>
+<div class="sub"><a href="index.html">← Back to VYNE</a></div>
+
+<div id="banner-container"></div>
+
+<div class="panel">
+  <h2>This build</h2>
+  <div class="row"><span class="row-label">Frontend version</span><span class="row-val" id="fe-version">—</span></div>
+  <div class="row"><span class="row-label">Backend version</span><span class="row-val" id="be-version">Checking…</span></div>
+  <div class="row"><span class="row-label">Backend environment</span><span class="row-val" id="be-env">—</span></div>
+  <div class="row"><span class="row-label">API base</span><span class="row-val" id="api-base" style="font-size:12px;font-family:'Inter',monospace"></span></div>
+  <div class="row"><span class="row-label">Page loaded</span><span class="row-val" id="loaded-at" style="font-size:13px"></span></div>
+</div>
+
+<div class="hint">
+  The frontend version above is baked into this HTML/JS bundle at packaging time (see the
+  <code>VYNE_VERSION</code> constant near the top of vyne-client.js). The backend version is fetched live
+  from <code>GET /api/version</code>. If a redeploy of one side didn't actually go out — a stale local
+  checkout, the wrong Firebase project selected, a Cloud Run deploy that silently no-op'd — the two will
+  disagree, and that disagreement is exactly what the banner above is watching for.
+</div>
+
+</div><!-- /.page -->
+
+<script>
+var API_BASE = window.VYNE_API_BASE || "";
+var FRONTEND_VERSION = "5.32.4"; // kept in lockstep with vyne-client.js's VYNE_VERSION by hand each release
+
+document.getElementById("fe-version").textContent = "v" + FRONTEND_VERSION;
+document.getElementById("api-base").textContent = API_BASE || "(same origin)";
+document.getElementById("loaded-at").textContent = new Date().toLocaleString();
+
+function showBanner(cls, html){
+  document.getElementById("banner-container").innerHTML = "<div class='banner " + cls + "'>" + html + "</div>";
+}
+
+showBanner("pending", "Checking backend version…");
+
+fetch(API_BASE + "/api/version")
+  .then(function(r){ if(!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
+  .then(function(d){
+    document.getElementById("be-version").textContent = d.version ? ("v" + d.version) : "unknown";
+    document.getElementById("be-env").textContent = d.env || "unknown";
+    if (d.version === FRONTEND_VERSION) {
+      showBanner("ok", "✓ Frontend and backend versions match (v" + FRONTEND_VERSION + ").");
+    } else {
+      showBanner("err", "⚠ Version mismatch — frontend is v" + FRONTEND_VERSION + " but backend reports v" +
+        (d.version || "unknown") + ". One side of the last deploy likely didn't go out. Redeploy the side that's behind.");
+    }
+  })
+  .catch(function(e){
+    document.getElementById("be-version").textContent = "unreachable";
+    document.getElementById("be-env").textContent = "—";
+    showBanner("err", "⚠ Could not reach the backend at " + (API_BASE || "(same origin)") + "/api/version — " + e.message +
+      ". The API may be down, or this frontend may be pointed at the wrong API base.");
+  });
+</script>
+</body>
+</html>

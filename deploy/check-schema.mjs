@@ -72,6 +72,15 @@ const EXPECTED = [
    */
   { migration: "036_byok_fallback_grant.sql", kind: "table", name: "byok_fallback_grant" },
   { migration: "036_byok_fallback_grant.sql", kind: "column", name: "client_routing.checked_against_keys" },
+  /*
+   * v5.34.67. These three are the binding that makes a client rename safe. If
+   * they are absent the lookups fall back to the client's NAME and a rename
+   * silently detaches the key, the preference and the grant — the firm starts
+   * paying and nothing on any screen changes.
+   */
+  { migration: "037_byok_engagement_binding.sql", kind: "column", name: "byok_keys.engagement_id" },
+  { migration: "037_byok_engagement_binding.sql", kind: "column", name: "client_routing.engagement_id" },
+  { migration: "037_byok_engagement_binding.sql", kind: "column", name: "byok_fallback_grant.engagement_id" },
 ];
 
 const client = new pg.Client({ connectionString: url });

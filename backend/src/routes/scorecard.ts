@@ -16,7 +16,13 @@
 import type { FastifyInstance } from "fastify";
 import { withTenant } from "../db/pool.js";
 import { allowedClientNorms, clientAllowed, normClient } from "../auth/clients.js";
-import { overallOf as canonicalOverallOf, sortRounds, type ScoringInterview } from "../tenant/scoring.js";
+import {
+  overallOf as canonicalOverallOf,
+  maturityLabel as canonicalMaturityLabel,
+  dimensionWeights,
+  sortRounds,
+  type ScoringInterview,
+} from "../tenant/scoring.js";
 
 const DIMS = ["D1", "D2", "D3", "D4", "D5", "D6", "D7"] as const;
 
@@ -30,18 +36,13 @@ export const DIMENSION_NAMES: Record<string, string> = {
   D7: "Culture & Change Readiness",
 };
 
-/** Same bands as interview_agent.html's MATURITY table. */
-const MATURITY = [
-  { min: 4.5, label: "AI-Native" },
-  { min: 3.5, label: "AI-Led" },
-  { min: 2.5, label: "AI Capable" },
-  { min: 1.5, label: "AI Exploring" },
-  { min: 0, label: "AI Unaware" },
-];
+/* v5.34.96: the bands moved to tenant/scoring.ts, beside the formula that
+ * produces the number they band — one definition, mirrored in
+ * frontend/vyne-scoring.js and pinned by scoringParity.test.ts. This file's
+ * copy was one of four that agreed only by luck. */
 
 export function maturityLabel(overall: number | null): string | null {
-  if (overall == null) return null;
-  return (MATURITY.find((m) => overall >= m.min) ?? MATURITY[MATURITY.length - 1]).label;
+  return canonicalMaturityLabel(overall);
 }
 
 /* v5.32.59 (F6). This had its own mean, and it counted a stored 0 as a score
@@ -49,8 +50,11 @@ export function maturityLabel(overall: number | null): string | null {
  * this dimension". A legacy record with a zeroed dimension therefore read a
  * whole maturity band lower on the portfolio scorecard than on the dashboard
  * showing the same engagement. Delegated to the canonical implementation. */
-export function overallOf(scores: Record<string, number> | null | undefined): number | null {
-  return canonicalOverallOf(scores);
+export function overallOf(
+  scores: Record<string, number> | null | undefined,
+  weights?: Record<string, number> | null,
+): number | null {
+  return canonicalOverallOf(scores, weights);
 }
 
 interface EngagementRoundLite {
@@ -111,8 +115,13 @@ export function buildScorecard(
     if (!scored.length) continue;
     const latest = scored[scored.length - 1];
     const prior = scored.length > 1 ? scored[scored.length - 2] : null;
-    const overall = overallOf(latest.scores);
-    const priorOverall = prior ? overallOf(prior.scores) : null;
+    /* v5.34.92: each round is weighted by ITS OWN roster's tiering, not the
+     * latest one. The delta is a comparison between two rounds, and re-weighting
+     * an old round by a roster it never had would move a number the client has
+     * already been shown — the delta would then report movement that no
+     * interview caused. */
+    const overall = overallOf(latest.scores, dimensionWeights(latest.interviews));
+    const priorOverall = prior ? overallOf(prior.scores, dimensionWeights(prior.interviews)) : null;
     const deltaScores: Record<string, number> = {};
     if (prior) {
       for (const d of DIMS) {

@@ -10,8 +10,12 @@
  * `error` until this release, which would have read "Could not save:
  * vendor_not_keyed".
  */
-import { describe, it, expect, afterEach } from "vitest";
+import { describe, it, expect, afterEach, vi } from "vitest";
 import { openPage, pageErrors, skipBrowser, type Harness } from "./harness.js";
+
+import { BROWSER_TEST_TIMEOUT_MS, BROWSER_HOOK_TIMEOUT_MS } from "./harness.js";
+/* Real browser work does not fit vitest's 5s default — see harness.ts. */
+vi.setConfig({ testTimeout: BROWSER_TEST_TIMEOUT_MS, hookTimeout: BROWSER_HOOK_TIMEOUT_MS });
 
 const SKIP = skipBrowser();
 
@@ -23,15 +27,26 @@ const GRANT = {
   grantedAt: "2026-09-13T02:00:00.000Z",
 };
 
+/*
+ * The server's actual 409 body, kept verbatim. v5.34.66 rewrote the last
+ * sentence: it used to end "or grant fallback for this client first", which was
+ * a remedy that does nothing — granting it in production and retrying produced
+ * the identical refusal. A stub carrying a message the server no longer sends
+ * is a test that passes while asserting fiction.
+ */
 const NOT_KEYED = {
   error: "vendor_not_keyed",
   detail: "ZZ BYOK Test supplies their own Google (Gemini) key, so their work runs on that provider "
     + "and is billed to them. Preferring Anthropic (Claude) would mean running their work on your "
-    + "account instead. Ask them for an Anthropic (Claude) key, or grant fallback for this client first.",
+    + "account instead. To move them to Anthropic (Claude), ask them for an Anthropic (Claude) key — "
+    + "a fallback grant does not change this, it only covers them when their own key fails.",
 };
 
 const stub = (over: { grants?: unknown[]; routingStatus?: number } = {}) =>
   (req: { method: string; url: string; body: any }) => {
+    // v5.34.67: the client fields are pickers now, so the stub has to offer the
+    // client this test selects. Free text is gone — see keysTabGating.test.ts.
+    if (req.url.startsWith("/api/byok/clients")) return { body: { clients: [{ clientName: "Nestlé", registered: true }, { clientName: "ZZ BYOK Test", registered: true }, { clientName: "Acme Industrial", registered: true }] } };
     if (req.url.startsWith("/api/byok/fallback-grants/revoke")) return { body: { ok: true } };
     if (req.url.startsWith("/api/byok/fallback-grants")) {
       if (req.method === "POST") return { body: { grant: req.body } };
@@ -94,7 +109,7 @@ describe.skipIf(SKIP)("v5.34.64 — the fallback grant panel", () => {
 
   it("posts the client and reason, and confirms the consequence", async () => {
     h = await openKeys();
-    await h.page.fill("#grant-client", "Nestlé");
+    await h.page.selectOption("#grant-client", "Nestlé");
     await h.page.fill("#grant-reason", "pilot, procurement pending");
     await h.page.click("#pane-keys button:has-text('Grant fallback')");
     await h.page.waitForTimeout(500);
@@ -164,7 +179,7 @@ describe.skipIf(SKIP)("v5.34.64 — a preference the client cannot pay for", () 
      * consequence nor the remedy.
      */
     h = await openKeys({ routingStatus: 409 });
-    await h.page.fill("#route-client", "ZZ BYOK Test");
+    await h.page.selectOption("#route-client", "ZZ BYOK Test");
     await h.page.selectOption("#route-vendor", "anthropic-api");
     await h.page.click("#pane-keys button:has-text('Save preference')");
     await h.page.waitForTimeout(500);
@@ -172,7 +187,7 @@ describe.skipIf(SKIP)("v5.34.64 — a preference the client cannot pay for", () 
     const msg = await h.page.textContent("#route-msg");
     expect(msg).not.toContain("vendor_not_keyed");
     expect(msg).toMatch(/billed to them/i);
-    expect(msg).toMatch(/grant fallback for this client first/i);
+    expect(msg).toMatch(/a fallback grant does not change this/i);
     expect(pageErrors(h.page)).toEqual([]);
   });
 

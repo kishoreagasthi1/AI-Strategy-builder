@@ -31,6 +31,7 @@
  */
 import { withTenant } from "../../db/pool.js";
 import { normClient } from "../../auth/clients.js";
+import { engagementIdFor, clientMatch } from "./engagementBinding.js";
 import type { KeyProbe } from "./verifyKey.js";
 
 export type ByokProvider = "gemini-aistudio" | "anthropic-api";
@@ -67,10 +68,25 @@ type Row = {
   probe: KeyProbe | null; last_error: string | null; last_error_at: Date | null;
 };
 
-const SELECT = `SELECT client_norm, client_name, provider, status, secret_name, key_hint,
-                       verified_at, paid_tier_attested, attested_by_email, attested_at, probe,
-                       last_error, last_error_at
-                  FROM byok_keys`;
+/*
+ * v5.34.67: the displayed client name comes from the ENGAGEMENT when the key is
+ * bound to one.
+ *
+ * byok_keys.client_name is a snapshot of whatever the client was called when
+ * the key was attached, and the rename path deliberately does not rewrite it —
+ * rewriting names across tables is the bulk key migration that migration 025
+ * exists to have ended. But a keys screen listing a client under a name they no
+ * longer go by is its own small lie, and it is the screen someone checks when
+ * they are trying to work out why a charge landed where it did. COALESCE costs
+ * one join and keeps the stored value as the fallback for unbound rows.
+ */
+const SELECT = `SELECT k.client_norm,
+                       COALESCE(e.client_name, k.client_name) AS client_name,
+                       k.provider, k.status, k.secret_name, k.key_hint,
+                       k.verified_at, k.paid_tier_attested, k.attested_by_email,
+                       k.attested_at, k.probe, k.last_error, k.last_error_at
+                  FROM byok_keys k
+                  LEFT JOIN engagements e ON e.id = k.engagement_id`;
 
 const shape = (r: Row): ByokKeyRow => ({
   clientNorm: r.client_norm,
@@ -92,10 +108,33 @@ const shape = (r: Row): ByokKeyRow => ({
  * The credential that should serve this client for this provider, or null to
  * mean "use the platform's and put it on their invoice".
  *
- * Only an ACTIVE row counts. A pending, failed or disabled key falls back
- * rather than failing the call — a client whose key lapsed should still be
- * interviewable, and the firm eats that cost until someone fixes it, which is
- * the right way round.
+ * ── Why this returns `failed` rows too (v5.34.70) ───────────────────────────
+ *
+ * This filtered `status = 'active'` in SQL, and the two callers that exist —
+ * resolve.ts and resolveLive.ts — both branch on `row.status === "failed"` to
+ * decide that a client is on BYOK but currently unspendable. That branch could
+ * never run: the row was filtered out one layer below it, so a refused key
+ * arrived at both resolvers as `null`, indistinguishable from a client who
+ * never brought a key at all.
+ *
+ * The effect was to undo v5.34.64 one call after it fired. The first refusal
+ * marks the row `failed` (server.ts's onByokRejected); from the second call on,
+ * this returned null, the resolver reported no BYOK, `confined` was false, the
+ * firm's chain ran, and the firm paid — silently, for as long as the key stayed
+ * broken. Every test over that path passed because each one injects a `lookup:`
+ * stub returning a hand-made failed row, so the seam and production disagreed.
+ * Found by an external audit of v5.34.69 and verified against a real database
+ * before this change: seeded a `failed` key, called this function, got null.
+ *
+ * So the status predicate belongs in the CALLERS, which already have it and
+ * already distinguish all four states. `disabled` and `pending` stay filtered
+ * out here because they genuinely mean "the firm pays": the Owner switched the
+ * key off, or the client never supplied one. Only `failed` is a key on file
+ * that cannot be spent, and only the caller can act on that difference.
+ *
+ * Callers MUST therefore check `row.status` — a returned row is no longer
+ * proof the credential is usable. Both do; see byokFailedReachable.test.ts,
+ * which exercises this function itself rather than a stub.
  */
 export async function activeKeyFor(
   tenantId: string,
@@ -104,11 +143,30 @@ export async function activeKeyFor(
 ): Promise<ByokKeyRow | null> {
   if (!clientName) return null;                 // unattributed work is the firm's
   const norm = normClient(clientName);
+  /*
+   * v5.34.67. Resolved by ENGAGEMENT, with the norm as a fallback.
+   *
+   * This used to match on client_norm alone, so renaming a client detached
+   * their key: /api/clients/rename has never touched byok_keys, the lookup
+   * found nothing, the client silently stopped being a BYOK client, and every
+   * call ran on the firm's credential while the keys screen still showed the
+   * key healthy under the old name. See migration 037, and 025 before it.
+   *
+   * The engagement lookup is a second round trip on a path that already does
+   * two (the row, then Secret Manager), and it is cheap: one indexed read on
+   * (tenant_id, vyne_norm_client(client_name)). Resolving it here rather than
+   * in the caller keeps every BYOK table answering "which client is this?"
+   * the same way.
+   */
+  const engagementId = await engagementIdFor(tenantId, clientName);
+  const m = clientMatch(engagementId, norm);
   return withTenant(tenantId, async (c) => {
     const r = await c.query<Row>(
-      `${SELECT} WHERE tenant_id = current_setting('app.tenant_id', true)::uuid
-                   AND client_norm = $1 AND provider = $2 AND status = 'active'`,
-      [norm, provider]
+      `${SELECT} WHERE k.tenant_id = current_setting('app.tenant_id', true)::uuid
+                   AND ${m.sql.replace(/\b(engagement_id|client_norm)\b/g, "k.$1")}
+                   AND k.provider = $${m.params.length + 1}
+                   AND k.status IN ('active', 'failed')`,
+      [...m.params, provider]
     );
     return r.rows[0] ? shape(r.rows[0]) : null;
   });
@@ -243,8 +301,8 @@ export async function revokeInvite(
 export async function listKeys(tenantId: string): Promise<ByokKeyRow[]> {
   return withTenant(tenantId, async (c) => {
     const r = await c.query<Row>(
-      `${SELECT} WHERE tenant_id = current_setting('app.tenant_id', true)::uuid
-        ORDER BY client_name, provider`
+      `${SELECT} WHERE k.tenant_id = current_setting('app.tenant_id', true)::uuid
+        ORDER BY COALESCE(e.client_name, k.client_name), k.provider`
     );
     return r.rows.map(shape);
   });
@@ -273,16 +331,29 @@ export interface UpsertArgs {
  */
 export async function upsertActiveKey(a: UpsertArgs): Promise<ByokKeyRow> {
   const norm = normClient(a.clientName);
+  /*
+   * v5.34.67. Stamped at attach time when the client already exists, and left
+   * NULL when they do not — a setup link can be redeemed before anyone has
+   * filled in Pre-Engagement. A NULL here is not a broken row: activeKeyFor()
+   * falls back to the norm exactly as it did before this release, and the row
+   * is upgraded the next time the key is re-attached with an engagement
+   * present.
+   */
+  const engagementId = await engagementIdFor(a.tenantId, a.clientName);
   return withTenant(a.tenantId, async (c) => {
     const r = await c.query<Row>(
       `INSERT INTO byok_keys
          (tenant_id, client_norm, client_name, provider, secret_name, key_hint,
           status, probe, verified_at, paid_tier_attested, attested_by_email,
-          attested_at, attestation_text, created_by)
+          attested_at, attestation_text, created_by, engagement_id)
        VALUES (current_setting('app.tenant_id', true)::uuid, $1, $2, $3, $4, $5,
-               'active', $6, now(), true, $7, now(), $8, $9)
+               'active', $6, now(), true, $7, now(), $8, $9, $10)
        ON CONFLICT (tenant_id, client_norm, provider) DO UPDATE SET
          client_name = EXCLUDED.client_name,
+         -- COALESCE, never overwrite with NULL: a row that already knows its
+         -- engagement must not lose that because a later attach happened
+         -- before the engagement could be resolved.
+         engagement_id = COALESCE(EXCLUDED.engagement_id, byok_keys.engagement_id),
          secret_name = EXCLUDED.secret_name,
          key_hint = EXCLUDED.key_hint,
          status = 'active',
@@ -296,7 +367,7 @@ export async function upsertActiveKey(a: UpsertArgs): Promise<ByokKeyRow> {
        RETURNING client_norm, client_name, provider, status, secret_name, key_hint,
                  verified_at, paid_tier_attested, attested_by_email, attested_at, probe`,
       [norm, a.clientName, a.provider, a.secretName, a.keyHint, JSON.stringify(a.probe),
-       a.attestedByEmail, a.attestationText, a.createdBy ?? null]
+       a.attestedByEmail, a.attestationText, a.createdBy ?? null, engagementId]
     );
     await audit(c, a.tenantId, norm, a.clientName, a.provider, "attached", a.createdBy, {
       keyHint: a.keyHint, attestedByEmail: a.attestedByEmail, probe: a.probe,
@@ -311,6 +382,57 @@ export async function upsertActiveKey(a: UpsertArgs): Promise<ByokKeyRow> {
  * onto their invoice, which is why this never needs an attestation and must
  * never be blocked by one.
  */
+/**
+ * Put a switched-off key back into service. (v5.34.69)
+ *
+ * ── Why this did not exist ──────────────────────────────────────────────────
+ *
+ * "turn off" shipped without a "turn on". The only route back was a fresh setup
+ * link and the client's administrator pasting their key again — a round trip to
+ * the CLIENT, to undo a click the firm made on its own screen, with nothing
+ * warning that the click was one-way.
+ *
+ * Nothing was ever destroyed: the secret is still in Secret Manager and
+ * secret_name is still on the row, so this is the status flip it always should
+ * have been.
+ *
+ * Only a `disabled` key can be re-enabled. A `failed` one was refused by its
+ * vendor, and flipping it back to active would re-assert that a broken
+ * credential works — the Owner would see "active" and the next call would fail
+ * again. Those have to be replaced, not re-enabled, and the route says so.
+ */
+export async function reactivateKey(
+  tenantId: string,
+  clientName: string,
+  provider: ByokProvider,
+  actorUserId?: string
+): Promise<"ok" | "not_disabled" | "no_secret"> {
+  const norm = normClient(clientName);
+  const engagementId = await engagementIdFor(tenantId, clientName);
+  const m = clientMatch(engagementId, norm);
+  return withTenant(tenantId, async (c) => {
+    const cur = await c.query<{ status: string; secret_name: string | null }>(
+      `SELECT status, secret_name FROM byok_keys
+        WHERE tenant_id = current_setting('app.tenant_id', true)::uuid
+          AND ${m.sql} AND provider = $${m.params.length + 1}`,
+      [...m.params, provider]);
+    if (!cur.rows[0] || cur.rows[0].status !== "disabled") return "not_disabled";
+    // byok_key_active_requires_attestation would reject the UPDATE anyway; this
+    // turns a constraint violation into a sentence somebody can act on.
+    if (!cur.rows[0].secret_name) return "no_secret";
+
+    await c.query(
+      `UPDATE byok_keys
+          SET status = 'active', last_error = NULL, last_error_at = NULL, updated_at = now()
+        WHERE tenant_id = current_setting('app.tenant_id', true)::uuid
+          AND ${m.sql} AND provider = $${m.params.length + 1}`,
+      [...m.params, provider]);
+    await audit(c, tenantId, norm, clientName, provider, "attached", actorUserId,
+                { note: "re-enabled by the firm" });
+    return "ok";
+  });
+}
+
 export async function deactivateKey(
   tenantId: string,
   clientName: string,

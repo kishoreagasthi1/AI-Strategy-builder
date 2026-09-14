@@ -71,8 +71,12 @@ export type ByokLiveResolution =
   /** Their key resolved; this session will be minted on it and billed to them. */
   | { kind: "ok"; binding: ByokLiveBinding }
   /**
-   * A key IS on file and could not be used — inactive, unreadable, or the
-   * secret is gone. Whoever called must decide whether the firm covers it.
+   * A key IS on file and the vendor REFUSED it, or its secret cannot be read.
+   * Whoever called must decide whether the firm covers it.
+   *
+   * v5.34.69 narrowed this: a key the Owner deliberately switched off, or one
+   * never supplied, is `none` — the firm pays, which is what the Owner asked
+   * for. Only a credential that stopped working belongs here.
    */
   | { kind: "unusable"; reason: string; clientName: string };
 
@@ -96,16 +100,35 @@ export function makeByokLiveResolver(opts: ByokLiveOptions) {
       const row = await lookup(tenantId, clientName, "gemini-aistudio");
       if (!row) return { kind: "none" };
       /*
-       * A row that exists but is switched off or has lost its secret is NOT
-       * "no key". The client supplied one; it is on file; it cannot be spent.
-       * Reporting that as `none` is exactly the conflation described above.
+       * v5.34.69. `disabled` and `pending` are NOT unusable.
+       *
+       * v5.34.64 treated every non-active status as "on file and unspendable",
+       * which over-applied the rule it was written for. `disabled` means the
+       * Owner pressed "turn off" — a deliberate decision to take this client
+       * off BYOK and back onto the firm's account — and `pending` means they
+       * never supplied a key at all. Refusing an interview in either case
+       * contradicts the Owner's own instruction, and contradicted the keys
+       * screen, which said in as many words "disabled — running on your key".
+       *
+       * Only `failed` belongs here: the vendor refused the credential, which is
+       * the silent-bill-shift this rule exists to stop. Text does the same —
+       * see ResolvedByok.unusable in resolve.ts — so the two paths now agree.
        */
-      if (row.status !== "active") {
+      if (row.status === "failed") {
+        /*
+         * v5.34.70. row.lastError is NOT interpolated here. It is raw text from
+         * whichever writer last touched the column, and recordResolveError
+         * stores driver and Secret Manager messages verbatim — see
+         * ResolvedByok.unusable in resolve.ts for the full reasoning. The Owner
+         * reads it on the keys screen, which is owner-only; this string reaches
+         * whoever was in the interview.
+         */
         return {
           kind: "unusable", clientName: row.clientName,
-          reason: `their key is on file but switched off (status: ${row.status})`,
+          reason: "their key was refused by Google and switched off automatically",
         };
       }
+      if (row.status !== "active") return { kind: "none" };
       if (!row.secretName) {
         return {
           kind: "unusable", clientName: row.clientName,
