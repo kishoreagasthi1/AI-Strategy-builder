@@ -666,6 +666,7 @@ body{font-family:'Inter',sans-serif;background:var(--navy);color:var(--white);mi
       <button class="btn-export" onclick="copyJSON()">📋 Copy JSON</button>
       <button class="btn-export" onclick="downloadJSON()">⬇️ Download JSON</button>
       <button class="btn-export primary" onclick="downloadText()">📄 Full Transcript</button>
+      <button class="btn-export" onclick="downloadVoiceDiagnostics()" title="The live-voice trace for this interview — what to send when a handover or a dropped answer needs diagnosing">🩺 Voice Diagnostics</button>
     </div>
     <div style="margin-top:8px;padding:10px 12px;background:rgba(16,185,129,0.08);border:1px solid rgba(16,185,129,0.3);border-radius:8px">
       <div style="font-size:11px;color:#14532D;font-weight:600;margin-bottom:6px">🛡️ Interview saved to recovery archive automatically.</div>
@@ -1883,6 +1884,21 @@ function saveSession(){
     benchmarks:S.benchmarks,
     mandatoryQuestions:S.mandatoryQuestions||[],
     eventContext:S.eventContext||null,
+    /*
+     * ── v5.34.121: the clock survives a resume. ───────────────────────────────
+     *
+     * Reported: "the clock seemed to start from zero and not where we left off,
+     * though the previous text was there." It could not do anything else —
+     * elapsed time was in no blob anywhere, so startClock() had nothing to
+     * restore and IV_CLOCK.accumulated began at 0 every time.
+     *
+     * Not only cosmetic. elapsedMin is minted into the interviewer's own
+     * instruction (v5.34.111), so on a resumed interview the persona was told
+     * it was three minutes into a fifty-question deep dive when it was
+     * twenty-five minutes in — and the wrap-up notice, which counts down from
+     * the planned length, is driven by the same clock.
+     */
+    elapsedMs:(function(){ try{ return clockElapsedMs(); }catch(e){ return S.elapsedMs||0; } })(),
     lastSaved:Date.now(),
   };
   // TASK 3: persist refresh metadata when this is a refresh interview
@@ -2643,7 +2659,43 @@ function agentInitials(){
 
 function addMessage(role,text,extra={}){
   const isAI=role==='ai';
-  const timestamp=new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
+  /*
+   * ── v5.34.121: a REPLAYED message is drawn, never re-stored. ───────────────
+   *
+   * Reported from the 2026-09-18 resumed interview: the entire restored history
+   * appeared twice, and every restored line was stamped with the resume time.
+   *
+   * launchInterviewScreen's resume branch replays with
+   *   S.displayMessages.forEach(m => addMessage(...))
+   * and the last line of this function pushes into S.displayMessages. forEach
+   * visits the indices present when it starts, so each replay appends one full
+   * copy: one resume doubles the transcript, two quadruple it, three give eight.
+   *
+   * This is precisely the defect fixed for FINDINGS in v5.32.54 — whose comment
+   * sits nine lines below the transcript replay that still had it. The fix
+   * there was to separate storing from drawing; the same split, done here with
+   * a flag rather than a second function, because addMessage is called from
+   * eleven places and a parallel renderMessage would be one more thing to keep
+   * in step.
+   *
+   * It is not a display bug. On the voice path the submitted record, the
+   * archive and the scoring pass are all built from S.displayMessages
+   * (finishInterview: `transcript: (S.displayMessages||[]).map(...)`), so the
+   * firm received every answer twice and conversationTurns —
+   * Math.floor(displayMessages.length/2) — was double the real count.
+   *
+   * Two consequences nobody reported, found while tracing this:
+   *   · buildLiveContext feeds the interviewer from the same array against a
+   *     15,000-character budget, so a resumed interview spent half its context
+   *     on repeats and truncation dropped genuine older material.
+   *   · the doubling compounds per resume, so a twice-resumed interview is at
+   *     four copies before anyone looks.
+   *
+   * `extra.at`/`extra.timestamp` carry the ORIGINAL time through, so restored
+   * history no longer reads as though it all happened at the moment of resume.
+   */
+  const replay = !!extra.replay;
+  const timestamp=extra.timestamp||new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
   /*
    * v5.34.41 — the interviewer has a NAME, and it is not "VYNE Agent".
    *
@@ -2683,6 +2735,7 @@ function addMessage(role,text,extra={}){
    * transcript's own `at` column has been null on every row ever written
    * because nothing here supplied one, and score movements need something
    * better than a formatted "09:42" to anchor against. */
+  if(replay) return;   // v5.34.121 — drawn, not re-stored. See the top of this function.
   S.displayMessages.push({role,text,timestamp,at:Date.now(),isClarification:extra.isClarification||false,isDoc:!!extra.docInfo});
   return div;
 }
@@ -3821,7 +3874,19 @@ function applyScoreData(scoreData){
     Object.keys(S.scores||{}).forEach(function(d){ if(S.coverage[d]==null && acceptRefreshScore(d)) S.coverage[d]=0.3; });
   }
   if(scoreData.finding && scoreData.finding.text)addFinding(scoreData.finding);
-  if(scoreData.questionsAsked)S.questionsAsked=scoreData.questionsAsked;
+  /*
+   * v5.34.121 — the progress bar read 18% at the end of a completed interview.
+   *
+   * This is ASSIGNED from the scoring model's own estimate, not incremented, so
+   * it is whatever that model counted in the transcript window it was given. On
+   * a resumed interview the second sitting's count (about nine) overwrote the
+   * first sitting's, and 9 of a 50-question deep dive is 18%.
+   *
+   * Monotonic is the honest minimum: the number of questions asked in an
+   * interview cannot fall. It is still a model's estimate rather than a count —
+   * a local counter off the transcript would be better and is not this change.
+   */
+  if(scoreData.questionsAsked)S.questionsAsked=Math.max(S.questionsAsked||0,scoreData.questionsAsked);
   renderScorecard();
 }
 
@@ -4833,6 +4898,28 @@ function startLiveVoice(isResume){
         return n;
       }catch(e){ return 0; }
     },
+    /*
+     * v5.34.111 — the interview's booked SIZE finally reaches the voice path.
+     *
+     * The consultant picks this on the depth control and the UI quotes the
+     * range straight back at them. The TEXT interviewer has been told it since
+     * the beginning ('- Interview Depth: ' + VyneDepth.prompt(S.depth), in
+     * buildSystemPrompt). The VOICE interviewer never was: create() passed
+     * context, agenda, mandatoryCount and askedCount, and nothing about how
+     * long the interview was meant to be. So the number of questions it asked
+     * was entirely its own guess — 22 on the v5.34.110 soak, against a booked
+     * 40-50, closing at 4.4 minutes on a --loop run where the tape was not the
+     * limit. Half the interview the client paid for, silently.
+     *
+     * Functions, resolved at each mint like everything else here, so a
+     * handover cannot hand the fresh session a stale budget.
+     */
+    questionTargetLow: function(){
+      try{ return VyneDepth.target(S.depth).low; }catch(e){ return undefined; }
+    },
+    questionTargetHigh: function(){
+      try{ return VyneDepth.target(S.depth).high; }catch(e){ return undefined; }
+    },
     // v5.34.14: surface connection progress so the setup window never reads
     // as a frozen/silent screen. The first spoken turn from a native-audio
     // model can take a few seconds; say what's happening meanwhile.
@@ -4947,6 +5034,53 @@ function startLiveVoice(isResume){
       // is the S1 signature; the trace line carries the verdict (quiet vs
       // server-side) and which experiment flag to try next.
       setVoiceBadge('live', LIVE_VOICE_IN_USE + ' · ⚠ your voice is not reaching the interviewer (' + (st && st.meanRms < 0.02 ? 'too quiet' : 'server did not react') + ')');
+    },
+    /*
+     * ── v5.34.121: the interviewer has said goodbye. Close the room. ──────────
+     *
+     * Reported from 2026-09-18: Jack said "Thank you so much for your time,
+     * Avery" and the product did nothing at all. The clock kept running, the
+     * interviewee was not moved on, the microphone stayed live — and ten
+     * minutes later the goAway handover fired and appended its recovery nudge
+     * to the closing line, so the transcript ends:
+     *
+     *   "...Thank you so much for your time, Avery.I'm sorry, I missed that
+     *    last part, could you tell me one more time?"
+     *
+     * Asking a person you have just thanked and dismissed to repeat themselves
+     * is the worst turn this product has produced. It is also the same cause as
+     * "it started speaking to me after some time the screen was open".
+     *
+     * ── Order matters here, and it is the v5.32.55 lesson ─────────────────────
+     *
+     * finalScore BEFORE stop. stop() sets `stopped`, which suppresses further
+     * scoring and discards a pass in flight — that is how the last minutes of
+     * every voice interview went unscored until v5.32.55. The closing exchange
+     * is often where a stakeholder says the thing that matters, so it is scored
+     * first and the session is torn down after.
+     *
+     * finishInterview() then finds liveActive() false and skips its own
+     * finalScore, which is correct: it has already been done, once.
+     *
+     * ── What this deliberately does NOT do ────────────────────────────────────
+     *
+     * It does not submit, and it does not navigate. The interview is closed and
+     * the room is quiet, and the consultant decides what happens next. An
+     * automatic jump to the export screen would take the room away from an
+     * interviewee with one more thing to say, and submission is irreversible.
+     */
+    onInterviewClosed: function(text){
+      try{ VL('APP: the interviewer closed the interview', { text: String(text||'').slice(0,160) }); }catch(e){}
+      try{ stopClock(); }catch(e){}
+      (async function(){
+        try{ setStatus('thinking','Scoring the last part of the conversation...'); }catch(e){}
+        try{ if(LIVE && typeof LIVE.finalScore === 'function') await LIVE.finalScore(12000); }catch(e){}
+        try{ if(LIVE && typeof LIVE.stop === 'function') LIVE.stop('interview_closed_by_agent'); }catch(e){}
+        try{ setListening(false); }catch(e){}
+        try{ setStatus('','' ); }catch(e){}
+        try{ saveSession(); }catch(e){}
+        try{ showInterviewFinishedBanner(); }catch(e){}
+      })();
     },
     onNoReply: function(n){
       // The model transcribed the interviewee and never answered. Say so on
@@ -5167,6 +5301,31 @@ var _liveLast = { who: null, el: null, text: '' };
  * textContent, never innerHTML: this is model output arriving over a socket,
  * and it is the one place in this page where escaping cannot be skipped.
  */
+/*
+ * ── v5.34.132: ONE writer for each spoken line ──────────────────────────────
+ *
+ * Every live line — interviewer and interviewee alike — was stored twice:
+ *
+ *     {"at":1789647196985, "text":"Hi Avery,"}
+ *     {"at":null,          "text":"Hi Avery, I'm Jack Smith. This is just a short…"}
+ *
+ * The new-bubble branch called addMessage(), whose last line pushes the entry
+ * into S.displayMessages, and then pushed a second entry of its own. Every later
+ * fragment updated only the LAST entry, so the first stayed frozen at the
+ * opening fragment. The screen drew one bubble, which is why it was never seen;
+ * the record held two. The 2026-09-18 Northwind interview was 52 spoken turns
+ * stored as 104 — 27 interviewer, 25 interviewee — and the `at` pattern above
+ * (addMessage stamps one, this push did not) held for all 52 with no exception.
+ *
+ * Two writers to one array: the same shape as the v5.34.121 resume doubling,
+ * and the same fix — one writer. The entry addMessage created is the one that
+ * grows. It carries the time the line STARTED, which is the right time.
+ *
+ * The entry is tracked by reference rather than found as "the last entry with
+ * this role", because anything else that writes a message mid-utterance — a
+ * warning, a status line — would make the last entry the wrong one, and the old
+ * rule then pushed a THIRD copy.
+ */
 function liveAppend(who, text){
   if(!text) return;
   try{
@@ -5181,18 +5340,55 @@ function liveAppend(who, text){
       _liveLast.text += text;
       _liveLast.el.textContent = _liveLast.text;
     }else{
+      var before = (S.displayMessages || (S.displayMessages = [])).length;
       addMessage(who, text);
       var last = wrap ? wrap.lastElementChild : null;
       var bubble = last ? last.querySelector('.msg-bubble') : null;
-      _liveLast = { who: who, el: bubble, text: text };
+      var dm = S.displayMessages;
+      /* addMessage stores exactly one entry unless it is replaying. If it ever
+       * stops doing so, store one here — never both. */
+      var entry = (dm.length === before + 1) ? dm[dm.length - 1] : null;
+      if(!entry){ entry = { role: who, text: text, at: Date.now() }; dm.push(entry); }
+      _liveLast = { who: who, el: bubble, text: text, entry: entry,
+                    clarify: last ? last.querySelector('.clarify-btn') : null };
     }
     if(wrap) wrap.scrollTop = wrap.scrollHeight;
 
-    // Mirror into the durable record so resume and export match the screen.
-    var t = S.displayMessages || (S.displayMessages = []);
-    if(sameSpeaker && t.length && t[t.length-1].role === who){ t[t.length-1].text = _liveLast.text; }
-    else { t.push({ role: who, text: text }); }
+    // The durable record follows the screen: the same entry, the whole line.
+    if(_liveLast.entry) _liveLast.entry.text = _liveLast.text;
+    /* "Add to this answer" quotes data-original back to the interviewee. It was
+     * written once from the first fragment, so a live answer was quoted as
+     * "Hey Jack." — the same frozen-first-fragment defect, one attribute over. */
+    if(_liveLast.clarify) _liveLast.clarify.setAttribute('data-original', encodeURIComponent(_liveLast.text));
   }catch(e){}
+}
+
+/*
+ * v5.34.121 — the visible half of onInterviewClosed.
+ *
+ * The screen stays where it is; this says the room is closed and points at the
+ * button that was always there. Built with textContent and createElement
+ * rather than innerHTML on purpose — innerHtmlSinks.test.ts ratchets the count
+ * of unresolvable innerHTML sinks in this file, and a ratchet is only worth
+ * having if new code is held to it.
+ */
+function showInterviewFinishedBanner(){
+  if(document.getElementById('iv-finished-banner')) return;
+  var wrap = document.getElementById('messages-wrap');
+  if(!wrap) return;
+  var b = document.createElement('div');
+  b.id = 'iv-finished-banner';
+  b.style.cssText = 'margin:18px 0 6px;padding:14px 16px;border:1px solid rgba(26,122,74,0.35);'
+    + 'background:rgba(26,122,74,0.08);border-radius:10px;text-align:center;line-height:1.6;';
+  var h = document.createElement('div');
+  h.style.cssText = "font-family:'Space Grotesk','Inter',sans-serif;font-size:15px;color:#14532D;font-weight:600;";
+  h.textContent = 'The interviewer has finished.';
+  var p = document.createElement('div');
+  p.style.cssText = 'font-size:13px;color:#46535F;margin-top:4px;';
+  p.textContent = 'The recording has stopped. Review the conversation above, then submit when you are ready.';
+  b.appendChild(h); b.appendChild(p);
+  wrap.appendChild(b);
+  wrap.scrollTop = wrap.scrollHeight;
 }
 
 /** A new speaker turn starts a new bubble even if the same person continues. */
@@ -5206,7 +5402,7 @@ function liveBreakTurn(){ _liveLast = { who: null, el: null, text: '' }; }
  * The clock is elapsed INTERVIEW time, not wall-clock, so a break for coffee
  * does not inflate the record the consultant later reads.
  */
-var IV_CLOCK = { startedAt: 0, accumulated: 0, tick: null, paused: false };
+var IV_CLOCK = { startedAt: 0, accumulated: 0, tick: null, paused: false, adopted: false };
 
 function clockElapsedMs(){
   return IV_CLOCK.accumulated + (IV_CLOCK.startedAt ? (Date.now() - IV_CLOCK.startedAt) : 0);
@@ -5221,6 +5417,15 @@ function renderClock(){
 }
 function startClock(){
   if(IV_CLOCK.tick) return;
+  /* v5.34.121 — pick up where the last sitting left off. Applied here rather
+   * than in resumeFromCode so it holds for every route into a saved session,
+   * and guarded so it is adopted once: accumulated is also the pause total, and
+   * re-adopting on every unpause would double every break taken. */
+  if(!IV_CLOCK.adopted){
+    IV_CLOCK.adopted = true;
+    var prior = Number(S && S.elapsedMs) || 0;
+    if(prior > 0){ IV_CLOCK.accumulated = prior; try{ VL('clock resumed from a previous sitting', { priorMs: prior }); }catch(e){} }
+  }
   IV_CLOCK.startedAt = Date.now();
   // v5.34.12: pause state is owned solely by setInterviewPaused(); startClock
   // no longer writes IV_CLOCK.paused so there is one writer, not two.
@@ -5461,8 +5666,14 @@ function launchInterviewScreen(isResume){
     }
   } else {
     // Resume: replay history + prefetch the "welcome back" turn now too.
-    S.displayMessages.forEach(m=>{
-      addMessage(m.role,m.text,{isClarification:m.isClarification,docInfo:m.isDoc?m.text:null});
+    /* v5.34.121 — replay:true so this does not append a second copy of every
+     * message, and the stored timestamp so the history keeps its own clock.
+     * Iterating a snapshot as well, belt and braces: the flag is the fix, and
+     * the slice() means a future caller that forgets it degrades to the old
+     * bug rather than to an infinite loop. */
+    S.displayMessages.slice().forEach(m=>{
+      addMessage(m.role,m.text,{isClarification:m.isClarification,docInfo:m.isDoc?m.text:null,
+                                replay:true,timestamp:m.timestamp});
     });
     // v5.32.54: addFinding() PUSHES into S.findings, and forEach walks the very
     // array being appended to. Every resume appended a second copy of every
@@ -5954,6 +6165,63 @@ function downloadInterviewRecord(){
 
 function copyJSON(){navigator.clipboard.writeText(window._exportJSON||'').then(()=>{const b=event.target;b.textContent='✅ Copied!';setTimeout(()=>b.textContent='📋 Copy JSON',2000);});}
 function downloadJSON(){const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([window._exportJSON||''],{type:'application/json'}));a.download=`Vynora_${S.client.replace(/\s+/g,'_')}_${new Date().toISOString().split('T')[0]}.json`;a.click();}
+/**
+ * The live-voice trace for this interview, as a file. (v5.34.116)
+ *
+ * Every transport question this project has had was settled from this trace and
+ * nothing else — the 186-second dead period, the handover that clipped an
+ * answer, the machine that went to sleep. Until now the only way to get it was
+ * `copy(vyneLiveLogDump())` in the browser console, which means it survives
+ * only if someone thinks to run it before closing the tab. On the 2026-09-15
+ * interview nobody did, the tab closed, and a reported fault at minute nine had
+ * to be reasoned about from the transcript instead of read from the log.
+ *
+ * Deliberately in the side panel, which interviewee sessions hide entirely:
+ * the trace carries both sides of the conversation, and it is the consultant's
+ * diagnostic, not the interviewee's. It does NOT contain the engagement
+ * briefing — vyne-live.js logs that a grant was minted, never its context — so
+ * this file is the interview plus transport events, nothing the firm holds
+ * privately.
+ *
+ * Falls back to the previous page instance's copy when the current one is
+ * empty, which is what a mid-interview reload or sign-out leaves behind.
+ */
+function downloadVoiceDiagnostics(){
+  var text = '';
+  try{ text = (window.vyneLiveLogDump && window.vyneLiveLogDump()) || ''; }catch(e){}
+  var source = 'this page instance';
+  if(!text || text.length < 200){
+    try{
+      var prev = (window.vyneLiveLogDumpPrev && window.vyneLiveLogDumpPrev()) || '';
+      if(prev && prev.indexOf('no previous trace') !== 0){ text = prev; source = 'the previous page instance'; }
+    }catch(e){}
+  }
+  if(!text){
+    alert('No voice trace found. This interview may have run on the standard voice path rather than live voice, or the page was reloaded since.');
+    return;
+  }
+  var header = [
+    'VYNORA — LIVE VOICE DIAGNOSTICS',
+    'Client:       ' + (S.client || 'unknown'),
+    'Stakeholder:  ' + (S.stakeholderName || 'unknown') + ' (' + (S.stakeholderRole || '') + ')',
+    'Session code: ' + (S.sessionCode || 'unknown'),
+    'Frontend:     v' + (window.VYNE_VERSION || 'unknown'),
+    'Captured:     ' + new Date().toISOString(),
+    'Trace source: ' + source,
+    'Lines:        ' + text.split('\n').length,
+    '',
+    'This is the transport trace: turn boundaries, handovers, microphone state',
+    'and connection events, plus transcript fragments as the model sent them.',
+    'It is what to attach when an answer went missing or a handover was rough.',
+    '', '--------------------------------------------------------------------', '',
+  ].join('\n');
+  var a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([header + text], { type: 'text/plain' }));
+  a.download = 'Vynora_VoiceDiagnostics_' + String(S.client || 'client').replace(/\s+/g,'_') +
+               '_' + new Date().toISOString().replace(/[:.]/g,'-').slice(0,19) + '.txt';
+  a.click();
+}
+
 function downloadText(){
   const convo=S.messages.map(m=>`[${m.role.toUpperCase()}]\n${m.content.replace(/<<<SCORES>>>[\s\S]*?<<<END_SCORES>>>/g,'').trim()}`).join('\n\n---\n\n');
   const report=`VYNORA CONSULTING -- AI DIAGNOSTIC SPRINT\n\nClient: ${S.client}\nStakeholder: ${S.stakeholderName||'N/A'} (${S.stakeholderRole})\nIndustry: ${S.industry}\nSession Code: ${S.sessionCode}\nDate: ${new Date().toLocaleDateString()}\n\nDIMENSION SCORES\n${DIMENSIONS.map(d=>`${d.code}: ${S.scores[d.code]?S.scores[d.code].toFixed(1):'N/A'} / 5`).join('\n')}\n\nKEY FINDINGS\n${S.findings.map((f,i)=>`${i+1}. [${f.dimension}] ${f.text}`).join('\n')}\n\nFULL INTERVIEW TRANSCRIPT\n${convo}`;

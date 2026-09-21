@@ -1,0 +1,29 @@
+-- 038_dedupe_doubled_transcripts.sql
+--
+-- A one-off production data repair. APPLIED — 2026-09-21T13:43:08Z — and recorded in
+-- schema_migrations. This file is a placeholder for it.
+--
+-- Removed the doubled block the v5.34.121 resume defect wrote into a transcript.
+-- One interview_transcripts row: 170 entries → 104, with every finding and
+-- score anchor moved to the same line and every turn's idx renumbered to its
+-- position (the review page resolves anchors by idx).
+--
+-- ── Why the repository holds a stub ───────────────────────────────────────────
+--
+-- The migration that ran carried the repaired transcript as data: a client
+-- interviewee's words, verbatim, with the findings drawn from them. That is
+-- client-confidential material and does not belong in source control, where
+-- history keeps it for good.
+--
+-- The runner keys on the FILE NAME and keeps no checksum (src/db/migrate.ts),
+-- so this stub changes nothing anywhere:
+--   · production recorded 038 when it ran, and will never run it again;
+--   · a fresh database never held the row, and the original skipped it there —
+--     exactly as this does.
+-- It keeps the number, so the next migration is still 039 on every checkout.
+--
+-- The file that ran:   sha1 81843cab06d91047d76670b9d157b14f519d5887
+-- Kept, uncommitted, in backend/repair-archive/ beside the verified backup it was
+-- generated from (deploy/dedupe-transcripts.mjs --emit-migration).
+
+SELECT 1;

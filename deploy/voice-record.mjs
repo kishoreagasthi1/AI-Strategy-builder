@@ -66,7 +66,7 @@
  */
 
 import { readFileSync, writeFileSync, appendFileSync, mkdirSync, existsSync,
-         openSync, writeSync, readSync, closeSync, statSync, unlinkSync } from "node:fs";
+         openSync, writeSync, readSync, closeSync, statSync, unlinkSync, copyFileSync } from "node:fs";
 import { join, dirname, isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 import vm from "node:vm";
@@ -138,6 +138,33 @@ let closeIgnored = false;
  */
 let stubReplies = 0;
 const MINUTES = SELFTEST ? 1.5 : Number(arg("minutes", 14));
+/*
+ * v5.34.111 — a non-numeric --minutes must be FATAL, not silent.
+ *
+ * Measured on 2026-09-15: `run-voice-record.sh --minutes 20 --loop` was run
+ * against a script that takes POSITIONAL arguments, so $1 was the literal
+ * string "--minutes" and this became NaN. Nothing rejected it. The run then
+ * armed its own time limit with setTimeout(finish, NaN * 60000), and a
+ * setTimeout with a NaN delay fires on the next tick — so the interview ended
+ * at 0.0s, before grant #1 had even come back, and printed a complete verdict:
+ *
+ *     minutes=NaN ... stopped because: reached the NaN-minute limit
+ *     replies: 0 ... first audio: NEVER — the interviewer never spoke
+ *
+ * Every line of that verdict was true and none of it was about the product.
+ * This file's own warning — "a broken harness and a broken product look
+ * identical from here, and this one has been wrong three times" — is exactly
+ * what happened, so it is now four, and the guard goes in rather than the
+ * warning being restated.
+ */
+if (!Number.isFinite(MINUTES) || MINUTES <= 0) {
+  console.error(`\n!! --minutes is "${arg("minutes", 14)}", which is not a positive number.`);
+  console.error("!! Refusing to start: a NaN limit ends the run on the first tick and still");
+  console.error("!! prints a full verdict, which reads as a dead product rather than a bad flag.");
+  console.error("!! Note that deploy/run-voice-record.sh takes POSITIONAL arguments:");
+  console.error("!!     bash deploy/run-voice-record.sh 20 soak\n");
+  process.exit(2);
+}
 const OUT = arg("out", SELFTEST ? "voice-selftest" : "voice-record");
 const MODEL = arg("model", "models/gemini-2.5-flash-native-audio-latest");
 const VOICE = arg("voice", "Kore");
@@ -232,6 +259,22 @@ if (LIVE_INSTRUCTION) {
       context: f.context, mandatoryCount: f.mandatoryCount, askedCount: f.askedCount,
       agenda: f.agenda && { lead: dims(f.agenda.lead), cover: dims(f.agenda.cover),
                             light: dims(f.agenda.light), evidenced: dims(f.agenda.evidenced) },
+      questionTargetLow: f.questionTargetLow, questionTargetHigh: f.questionTargetHigh,
+      elapsedMin: f.elapsedMin,
+      /*
+       * v5.34.111 — the interview's booked SIZE and the clock.
+       *
+       * Forwarded here for the reason the whole "render live, do not pin"
+       * design exists: a field the product sends and this harness does not is
+       * a field the paid run cannot exercise, while the verdict still reads as
+       * if it had. The v5.34.111 early-close fix is entirely carried by these
+       * three, so without this line tomorrow's soak would measure the old
+       * behaviour and report it as the new one.
+       *
+       * personaInputsReachTheWire.test.ts reads the field list off
+       * InterviewerContext and now checks THIS file too, so the next field
+       * added to the persona fails there the day it appears.
+       */
     });
     liveFixture = { ...fx };
     SYSTEM_INSTRUCTION = renderInstruction({ ...liveFixture, askedCount: 0 });
@@ -252,6 +295,121 @@ if (LIVE_INSTRUCTION) {
  * are still outstanding.
  */
 const askedQuestions = [];      // answered, deduped, oldest first
+/*
+ * ── v5.34.119: is the interviewer handing the answer back? ──────────────────
+ *
+ * Reported from the 2026-09-17 live interview — "Jack Smith was parroting what
+ * I said back to me" — and confirmed in the transcript: ten interviewer turns,
+ * ten openings of the form acknowledgement + "so" + their answer restated.
+ * "Right, so it's a core pillar." "Got it, so start with quick wins for R O I."
+ * "Makes sense, so embedded in the data pipelines."
+ *
+ * No rule asked for it and nothing measured it. A human had to sit through nine
+ * minutes and notice, which is the most expensive detector this project owns.
+ *
+ * v5.34.119 adds persona rules against it, and a prompt rule is not a fix until
+ * something checks whether the model obeyed. This is that check. It only has
+ * teeth on a run against the real model — the offline stub speaks a canned
+ * line — so it reports a rate rather than failing, and the paid soak is where
+ * it earns its place.
+ *
+ * Two shapes, because they have different causes and different fixes:
+ *   RECAP   — acknowledgement + "so" + a restatement. The persona habit.
+ *   VERBATIM— a long run of the interviewee's own words played back. The
+ *             handover nudge; see v5.34.119 in vyne-live-interview.js.
+ */
+/*
+ * ── v5.34.120: the detector had a hole, and the next interview found it. ────
+ *
+ * v5.34.119 cut the parroting from 9-of-10 turns to 5-of-15 on the 2026-09-17
+ * 08:13 interview. Two of those five were invisible to the rule above:
+ *
+ *   "I HEAR YOU, so you're tracking deviations from expected results."
+ *        — "i hear you" was not in the acknowledgement list.
+ *
+ *   "That's interesting that you're seeing such significant productivity gains
+ *    from your current workforce."
+ *   "Having those governance teams and data stewards is clearly essential for
+ *    managing quality across the board."
+ *        — praise, then a restatement, with no "so" anywhere. A phrase list
+ *          cannot catch this shape; there is no fixed phrase in it.
+ *
+ * So the detector would have reported ~20% against a true rate of ~33%. An
+ * instrument that understates the defect it was built for is worse than none,
+ * because it licenses the conclusion that the fix worked.
+ *
+ * Two rules now, with different mechanics on purpose:
+ *
+ *   RECAP_OPENER  — the "<ack>, so <restatement>" shape, by phrase, widened.
+ *   the overlap test below — a long, question-free opening sentence that
+ *     reuses a run of the interviewee's own words. No phrase list, so it
+ *     catches shapes nobody has seen yet.
+ *
+ * The overlap test has to spare the form v5.34.119 deliberately protects —
+ * "You mentioned a three-year roadmap. Is that formally funded now?" — so an
+ * opening that explicitly attributes ("you mentioned", "you said", "going back
+ * to") is exempt. That exemption is the whole reason this is two rules rather
+ * than one, and neverReadTheAnswerBack.test.ts holds both halves against the
+ * real transcript lines.
+ */
+const RECAP_OPENER = /^\s*(right|got it|gotcha|ok|okay|alright|all right|makes sense|interesting|understood|noted|i see|i hear you|i hear that|that's fair|fair enough|absolutely|of course|sure)\b[,.!]?\s+so\b/i;
+/* An opening that names them as the source is the permitted form, not a recap. */
+const ATTRIBUTED_OPENER = /^\s*(you (mentioned|said|described|talked about|noted)|going back to|coming back to|on the .{0,30}you)/i;
+/*
+ * There WAS a RECAP_MIN_WORDS floor here (10), on the theory that a short
+ * opening sentence is a reaction rather than a recap. Removing it changed no
+ * test, and no realistic clean opening is both short and shares a five-word run
+ * with the answer — the "?" check and the overlap threshold already carry the
+ * work. Deleted rather than kept as an unfalsifiable knob.
+ */
+/* Shared consecutive words that make an opening a restatement rather than reuse. */
+const RECAP_OVERLAP_WORDS = 5;
+let agentTurnsSeen = 0, recapOpeners = 0, recapRestates = 0, verbatimEchoes = 0;
+const recapExamples = [], restateExamples = [], echoExamples = [];
+/** The interviewee's last answer, for the verbatim check. */
+let lastAnswerSpoken = "";
+/** Longest run of consecutive words shared between the two strings. */
+function longestSharedRun(a, b) {
+  const wa = String(a).toLowerCase().replace(/[^a-z0-9 ]/g, " ").split(/\s+/).filter(Boolean);
+  const wb = String(b).toLowerCase().replace(/[^a-z0-9 ]/g, " ").split(/\s+/).filter(Boolean);
+  if (!wa.length || !wb.length) return 0;
+  let best = 0;
+  let prev = new Array(wb.length + 1).fill(0);
+  for (let i = 1; i <= wa.length; i++) {
+    const cur = new Array(wb.length + 1).fill(0);
+    for (let j = 1; j <= wb.length; j++) {
+      if (wa[i - 1] === wb[j - 1]) { cur[j] = prev[j - 1] + 1; if (cur[j] > best) best = cur[j]; }
+    }
+    prev = cur;
+  }
+  return best;
+}
+/* Eight words is well past coincidence and well inside a recited sentence. */
+const VERBATIM_RUN_WORDS = 8;
+/*
+ * The whole classification, as ONE pure function. (v5.34.120)
+ *
+ * It was inline in recordAgentTurn, and the tests that cover it had to rebuild
+ * the logic in order to call it — so three deliberate mutations of the real
+ * branch (dropping the restate shape, dropping the attributed-form exemption,
+ * dropping the overlap threshold to 2) all passed a green suite. The tests were
+ * grading a reimplementation, which is this harness's own signature failure
+ * appearing inside the check written to catch it.
+ *
+ * Extracted so neverReadTheAnswerBack.test.ts can lift this exact source and
+ * run it. Returns null, "opener" or "restate".
+ */
+function classifyAgentTurn(turn, lastAnswer) {
+  const whole = String(turn).replace(/\s+/g, " ").trim();
+  if (!whole) return null;
+  if (RECAP_OPENER.test(whole)) return "opener";
+  if (!lastAnswer || ATTRIBUTED_OPENER.test(whole)) return null;
+  /* First sentence only: a recap is a preamble, and content further in is the
+   * question it precedes. */
+  const first = (whole.split(/(?<=[.?!])\s/)[0] || "").trim();
+  if (first.includes("?")) return null;
+  return longestSharedRun(first, lastAnswer) >= RECAP_OVERLAP_WORDS ? "restate" : null;
+}
 const seenQuestion = Object.create(null);
 let pendingQuestion = null;     // asked, not yet answered
 let turnsSeen = 0;              // cursor into turns[], so answers are not skipped
@@ -297,6 +455,24 @@ function matchesMandatory(turnText, question) {
 
 /** Fold one completed VYNE turn into the record. Answered-ness is resolved later. */
 function recordAgentTurn(text) {
+  /* v5.34.119 — measured before the question extraction, which drops any turn
+   * without a '?' and would therefore miss a pure recap. */
+  const whole = String(text).replace(/\s+/g, " ").trim();
+  if (whole) {
+    agentTurnsSeen++;
+    const handedBack = classifyAgentTurn(whole, lastAnswerSpoken);
+    if (handedBack === "opener") {
+      recapOpeners++;
+      if (recapExamples.length < 4) recapExamples.push(whole.slice(0, 90));
+    } else if (handedBack === "restate") {
+      recapRestates++;
+      if (restateExamples.length < 4) restateExamples.push(whole.slice(0, 90));
+    }
+    if (lastAnswerSpoken && longestSharedRun(whole, lastAnswerSpoken) >= VERBATIM_RUN_WORDS) {
+      verbatimEchoes++;
+      if (echoExamples.length < 3) echoExamples.push(whole.slice(0, 90));
+    }
+  }
   const qs = String(text).split(/(?<=[?])\s+/)
     .filter((s) => s.includes("?"))
     .map((s) => s.replace(/\s+/g, " ").trim())
@@ -325,6 +501,27 @@ function settlePendingQuestion() {
  * not been asked, which is an instruction to ask it again — the exact fault
  * this version fixes.
  */
+/*
+ * ── v5.34.110: write down what the interviewer was actually told ───────────
+ *
+ * The instruction was built, sent, and never recorded — only its LENGTH
+ * reached the verdict. So when the interviewer closed at 3.3 minutes with both
+ * required questions outstanding, there was no way to tell whether it had been
+ * told about them and ignored it, or never been told at all. Those are a
+ * prompt fault and a context-assembly fault, and the fix differs for each.
+ *
+ * Called from BOTH mint paths, live and offline, so the capture itself is
+ * exercised on every free run rather than only on the paid ones.
+ */
+function recordInstruction() {
+  const text = currentInstruction();
+  try {
+    mintedInstructions.push(text);
+    writeFileSync(at(`instruction-${String(mintedInstructions.length).padStart(2, "0")}.txt`), text);
+  } catch (e) {}
+  return text;
+}
+
 function currentInstruction() {
   if (!renderInstruction || !liveFixture) return SYSTEM_INSTRUCTION;
   const all = fixtureMandatory();
@@ -352,6 +549,10 @@ function currentInstruction() {
     context: parts.join("\n"),
     mandatoryCount: due.length,
     askedCount: askedQuestions.length,
+    /* v5.34.111: minutes of conversation so far, as LiveInterview.elapsedMinutes()
+     * computes it in the product — from the start of the INTERVIEW, not of this
+     * connection, so it keeps counting across a handover. */
+    elapsedMin: Math.round((Date.now() - t0) / 60000),
   });
 }
 
@@ -362,6 +563,8 @@ const at = (name) => (isAbsolute(OUT) ? `${OUT}.${name}` : join(ROOT, `${OUT}.${
 const OUT_WAV = at("wav");
 const OUT_LOG = at("log");
 const OUT_TXT = at("txt");
+/* v5.34.103: per-run archive of the trace and verdict; set in finish(). */
+let ARCHIVE_DIR = null;
 /*
  * Cache answers by a hash of the TEXT, in this script's own directory.
  *
@@ -407,15 +610,60 @@ try { writeFileSync(OUT_TXT, `voice-record ${new Date().toISOString()} model=${M
 
 /* ── the interviewee's side: generated speech, cached ─────────────────────── */
 
+/*
+ * ── The interviewee's answers. (v5.34.114) ──────────────────────────────────
+ *
+ * Rewritten from a REAL 12-minute interview recorded on v5.34.111 with a group
+ * CIO, lightly generalised — the client's name and anything identifying is
+ * out; the substance, the register and the length of the answers are his.
+ *
+ * Why this matters more than it looks. The previous set had EIGHT answers, and
+ * a cycle costs about twenty-eight seconds of wall clock, so the tape ran out
+ * of distinct material at roughly 3.7 minutes. Every run past that point was
+ * the interviewer talking to a loop.
+ *
+ * That one number silently invalidated a great deal of work. The v5.34.110
+ * soak "closed at 4.4 minutes" and a 2026-09-13 recording "decided the
+ * interview was finished at roughly four minutes" — and both of those are just
+ * when the tape stopped saying anything new. They were read, including by me,
+ * as the interviewer deciding it was done, which sent a whole night after a
+ * defect whose evidence was an artefact of this array's length. The live
+ * 12-minute interview that produced these answers showed no such thing.
+ *
+ * Twenty-two answers is about ten minutes of distinct conversation. That
+ * crosses the ~9-minute handover with real material still in hand, which is
+ * the first time this harness can say anything honest about what happens
+ * after it. Keep it growing rather than looping: --loop is still there, and
+ * its verdict still says not to judge repetition from it, but the point is to
+ * need it less.
+ *
+ * These are ANSWERS ONLY. Nothing here is an instruction, a question, or
+ * anything the interviewer should treat as direction — the rig speaks them
+ * through TTS as the interviewee's turn, exactly as a person would.
+ */
 const ANSWERS = [
-  "We are a mid-sized manufacturer, about twelve hundred people, and I run technology and data for the group.",
-  "We centralised data and analytics roughly two years ago, so most reporting now runs through that one team.",
-  "Honestly the biggest constraint is not the tooling. It is that the business side cannot specify what it wants precisely enough to build against.",
-  "We have a data warehouse on Snowflake, a handful of Power BI workspaces, and far too many spreadsheets that nobody will admit to owning.",
-  "Skills worry me most. We can hire data engineers. Getting the operations managers to trust a model they did not build is the harder problem.",
-  "There is no formal governance body yet. Decisions get made in a weekly architecture call and written down afterwards, when someone remembers.",
-  "If I am honest, our last two analytics projects went over on time and neither one changed a decision anybody was making.",
-  "I would say the appetite is there at the executive level, but the middle layer has seen enough failed pilots to be sceptical.",
+  "I care about the ROI that AI produces. At the end of the day AI is another technology, and I don't distinguish it from any other technology in that sense. It's a tool to generate business value. The number one metric I follow is what is the value of the effort we're putting in.",
+  "We do that on every project, it's part of our governance process. We look at both hard ROI and cost avoidance. From a financial standpoint the only thing we really give weight to is hard ROI; we discount cost avoidance significantly. The other thing we value is revenue growth without cost increase.",
+  "The measurement tells you what is worth tackling. If the return on investment is highest, that pushes a project up the chain, and then the complexity of execution. High value and low complexity become quick wins. High value and medium complexity take second priority. Value is always the key driver.",
+  "It's a combination of different departments, not just one area. A very high return with a very high investment is not the highest percentage return. We look at it through the lens of highest percentage return, so we want maximum value for a dollar invested. That's how we prioritise.",
+  "When we look at projects we ask whether something can be done as a central capability, through our centre of excellence, and to what extent that can then be customised for regional or functional nuances. If the investment is made centrally we take the modification investment from the regions, and the costs and benefits are shared.",
+  "Not everything starts centrally. Sometimes projects start decentralised. But if it's a project that makes sense for many functions and many regions, we then bring it centrally to build something common that is customised for regions.",
+  "We have a global data warehouse and we also have regional data warehouses. The global one holds common data for global processes and data that can be leveraged across regions. If data is very specific to a regional system or a regional language, we let it sit in those decentralised zones and we access it through APIs when needed.",
+  "We do have situations where we have very specific siloed systems holding very specific data that isn't worth centralising, simply because the effort doesn't generate the ROI. In those cases we still make the data accessible to other interested parties who have the permissions, through APIs.",
+  "That is usually the long pole in the tent. Data captured well, entered properly, generated with quality, is easier to handle. Sometimes we have data coming from different sources that has to be normalised, and that effort sits with our data engineering centre of excellence. We take a lot of effort cleansing data to some set of standards.",
+  "I don't know the names of the frameworks, but we definitely rely on tools. We have data quality tools that we run. We also use some of our AI capabilities to identify opportunities to cleanse data. We have master data management systems, reference systems that are cleansed, catalogues that are maintained.",
+  "We have data scientists centrally and we also have some embedded data science teams. The embedded data scientists are people who also have domain specific knowledge.",
+  "The embedded teams report into the function head of the region or the department. They have a dotted line to the chief data officer's organisation.",
+  "We try our best to keep a good data catalogue. It is, I would say, about eighty to ninety percent up to date. Of course we have modifications sometimes that aren't fully current, but the attempt is to keep it up to date.",
+  "That is effort we do through our data governance process. We have a data governance committee across different domains. There are data stewards, and those stewards help keep the definitions up to date.",
+  "We are mostly cloud. Almost a hundred percent. We are trying to avoid anything on premises.",
+  "It's a combination. If it makes sense for us to buy something we always prefer that. But if it is something very customised to our needs we try to build it, and if there's nothing in the market that meets our requirements we build it. The preference is to buy a solution that brings us speed to market.",
+  "Model monitoring sits with the team that owns the product. We watch for drift on the inputs rather than waiting for the output to go wrong, and there is a retraining cadence, though I would not claim it is uniform across every model we run.",
+  "Adoption is the part people underestimate. We can deliver a model that is technically correct and still see a market ignore it because it doesn't fit how they actually work on a Tuesday morning. So we put change effort alongside the build now.",
+  "Risk and legal are involved from the start on anything customer facing. For internal productivity work the bar is lower and the team can move faster, but anything that touches a consumer or a regulated process goes through review before it ships.",
+  "Honestly, the skills gap is less about data science than about people who can translate between the business problem and the technical one. Those people are rare and we tend to grow them rather than hire them.",
+  "We have had failures. A couple of projects where we built something perfectly good that solved a problem nobody was being measured on, so it never got used. We learned to check who owns the number before we start.",
+  "If I look two years out, the thing that would change most is having the data foundation good enough that a new use case takes weeks rather than quarters. That is the constraint now, more than the models themselves.",
 ];
 
 function resample(src, from, to) {
@@ -578,9 +826,178 @@ function writeWav(path) {
 /* ── the browser shim ─────────────────────────────────────────────────────── */
 
 const now = () => (Date.now() - t0) / 1000;
+/*
+ * When this RUN's clock runs out. Assigned once the interviewee's answers have
+ * been synthesised and the interview is about to begin — see the note at the
+ * assignment. Declared here, and Infinity until then, so that a call before it
+ * is set cannot throw on a temporal-dead-zone const.
+ */
+let RUN_DEADLINE_AT = Infinity;
+
+/*
+ * ── Was this process actually RUNNING? (v5.34.112) ──────────────────────────
+ *
+ * v5.34.81 added a suspension warning, and it only fires when the TOTAL wall
+ * clock overruns the booking by 1.5x. That catches a laptop that slept and
+ * woke late. It cannot catch a suspension INSIDE a run, because `finish()` is
+ * itself driven by the wall clock: the run still ends on schedule, the frozen
+ * minutes are simply eaten out of the conversation, and every number in the
+ * verdict is quietly measuring a machine instead of a model.
+ *
+ * That is what the 20-minute v5.34.111 soak was. It reported 20.1 minutes for
+ * a 20-minute booking, so the existing detector stayed silent — while the
+ * trace showed a 30-SECOND drain timeout firing 184 seconds after it was
+ * armed:
+ *
+ *     283.4s answering (9.2s): "Honestly the biggest constraint..."
+ *     467.5s !! the uplink never drained (32 frames left)
+ *
+ * A 30s timer cannot fire 184s late on a running event loop. Timers were
+ * frozen. "The connection to Google jammed for three minutes" and "this
+ * laptop was asleep for three minutes" produce an identical trace, and the
+ * harness had no way to tell them apart — so it reported the first, which
+ * sends someone hunting a transport bug that may not exist.
+ *
+ * A one-second heartbeat settles it. Timer drift on a busy event loop is tens
+ * of milliseconds; a suspended process shows up as seconds. Recorded, summed
+ * and reported, so every future run says plainly whether its own numbers are
+ * about the product.
+ */
+const HEARTBEAT_MS = 1000;
+/* Anything past this is not scheduling jitter. Generous: a GC pause or a
+ * synchronous WAV write can cost a few hundred ms and must not count. */
+const SUSPEND_FLOOR_MS = 3000;
+const suspensions = [];
+let lastBeatAt = Date.now();
+setInterval(() => {
+  const gap = Date.now() - lastBeatAt;
+  lastBeatAt = Date.now();
+  if (gap > SUSPEND_FLOOR_MS) {
+    suspensions.push({ at: (Date.now() - t0 - gap) / 1000, frozenSec: (gap - HEARTBEAT_MS) / 1000 });
+  }
+}, HEARTBEAT_MS).unref?.();
+const suspendedSec = () => suspensions.reduce((a, s) => a + s.frozenSec, 0);
 let processors = [];
 let uplinkQueue = [];                                   // Int16Array chunks to send
 const trace = [];
+
+/*
+ * ── the floor-hold invariant (v5.34.101) ──────────────────────────────────
+ *
+ * The defect this exists to catch: a turn going to 'idle' while seconds of the
+ * interviewer's voice are still queued, which reopens the mic and invites the
+ * interviewee to talk over a question still being asked. It was invisible for
+ * a release because the numbers that show it — playbackPending, stillQueuedSec
+ * — were printed in the trace and read by nobody, while the verdict said the
+ * run was clean.
+ *
+ * So the rig now WATCHES rather than merely records. Every close that leaves
+ * real audio queued must be followed immediately by either a hold, or the
+ * goAway shortening that deliberately overrides it. Anything else is the bug
+ * back again, and the verdict says so in as many words.
+ *
+ * Passive, like the scoring observers: it counts and narrates, and changes no
+ * control flow. A rig that reacted would be testing itself.
+ */
+const FLOOR_HOLD_FLOOR_MS = 250;        // matches IDLE_DEFER_MIN_MS in vyne-live.js
+
+/*
+ * Read at verdict time over the whole trace rather than streamed line by line.
+ * _closeTurn banks usage and ends the playback run between the close line and
+ * the hold line, and either of those may log; a strict next-line match would
+ * then score every turn a violation and the rig would cry wolf on a correct
+ * build. A short window after each close is what the sequence actually
+ * guarantees.
+ */
+const FLOOR_HOLD_WINDOW = 6;            // lines after a close to look in
+function auditFloorHolds(lines) {
+  for (let i = 0; i < lines.length; i++) {
+    if (!/model turn ENDS/.test(lines[i])) continue;
+    const m = /"playbackRemainingMs":\s*(\d+)/.exec(lines[i]);
+    const ms = m ? Number(m[1]) : 0;
+    if (ms < FLOOR_HOLD_FLOOR_MS) continue;          // nothing left to hear
+    const window = lines.slice(i + 1, i + 1 + FLOOR_HOLD_WINDOW).join("\n");
+    if (/holding the floor until playback drains/.test(window)) { floorHolds++; continue; }
+    if (/shortening the floor hold/.test(window)) continue;   // goAway overrode it, by design
+    idleWhileSpeaking++;
+    if (ms > worstIdleWhileSpeakingMs) worstIdleWhileSpeakingMs = ms;
+  }
+}
+
+/*
+ * ── a turn closes once (v5.34.106) ─────────────────────────────────────────
+ *
+ * Two 'model turn ENDS' with no audio between them is the same turn closing
+ * twice. That double-banks the turn's usage, and since v5.34.105 it also
+ * flushes the interviewer's words into the transcript twice and spends a
+ * second paid scoring call on one conversation.
+ *
+ * Reachable only under --offline-late-turn-complete, which is why that mode
+ * exists: the no-turnComplete default can never produce a second close, and
+ * the legacy mode never salvages, so neither shape can reach it.
+ */
+function auditDoubleCloses(lines) {
+  /*
+   * Deliberately narrow: only a SALVAGE close followed by a turnComplete
+   * close, with no audio between, is counted.
+   *
+   * The first version of this flagged any two closes with no audio between,
+   * and flagged a turnComplete->turnComplete pair. That is not a defect the
+   * product agrees with: liveTurnOwnership drives three turns with bare
+   * turnComplete frames and requires three closes, because a real session
+   * once reported 367 output tokens for ten minutes of speech by treating
+   * several turns as one. A rig that calls that shape a bug would push
+   * somebody into re-breaking a thirteenfold under-count.
+   *
+   * Salvage-then-turnComplete is unambiguous: the salvage only ever fires
+   * when turnComplete did NOT arrive, so a turnComplete immediately after it,
+   * with nothing generated in between, is the same turn closing twice.
+   */
+  /*
+   * v5.34.106 — and the barge-in invariant, audited in the same pass.
+   *
+   * A flush stops scheduled audio: it will never be heard. Holding the floor
+   * for it would leave the interviewee waiting in silence for a sentence that
+   * was thrown away — the v5.34.101 defect inverted. PlaybackQueue.flush()
+   * zeroes _lastEnd to prevent that, and until this mode existed nothing
+   * offline had ever flushed, so the guarantee was never once exercised.
+   */
+  let flushedSinceAudio = false;
+  let lastCloseWasSalvage = false;
+  for (const line of lines) {
+    if (/playback flush/.test(line)) flushedSinceAudio = true;
+    else if (/frame AUDIO/.test(line)) flushedSinceAudio = false;
+    else if (flushedSinceAudio && /holding the floor until playback drains/.test(line)) {
+      heldAfterFlush++;
+      flushedSinceAudio = false;
+    }
+    if (/(late (turnComplete|close) ignored|close ignored — nothing has been generated)/.test(line)) {
+      lateClosesSuppressed++;
+      const g = /"msSinceSalvage":\s*(\d+)/.exec(line);
+      if (g) lateCloseGapsMs.push(Number(g[1]));
+      continue;                       // guarded: the turn did not close again
+    }
+    /*
+     * v5.34.109 — transcript counts as "something happened" here too.
+     *
+     * The audit used audio alone to mark a new turn, and reported two double
+     * closes on the mute-reply mode: a text-only turn HAS no audio, so a
+     * legitimate close looked like a duplicate. An audit that cries wolf on a
+     * correct build is worse than no audit, because the next real one gets
+     * waved through.
+     */
+    if (/frame AUDIO|frame agentTranscript/.test(line)) { lastCloseWasSalvage = false; continue; }
+    const m = /model turn ENDS[^\n]*"via":"(\w+)"/.exec(line);
+    if (!m) continue;
+    /*
+     * v5.34.109 — ANY close after a salvage, not only a turnComplete one. A
+     * second generationComplete re-arms the salvage timer, so salvage->salvage
+     * is reachable too, and the narrower audit was blind to it.
+     */
+    if (lastCloseWasSalvage) doubleClosedTurns++;
+    lastCloseWasSalvage = m[1] === "generationComplete";
+  }
+}
 
 function makeAudioContext(rate) {
   const c = {
@@ -663,7 +1080,7 @@ async function mint(setupExtra) {
     },
     /* v5.34.79: computed HERE, not captured. Every mint — the opening one and
      * every ~10-minute handover — gets the interview as it actually stands. */
-    systemInstruction: { parts: [{ text: currentInstruction() }] },
+    systemInstruction: { parts: [{ text: recordInstruction() }] },
     inputAudioTranscription: {},
     outputAudioTranscription: {},
     contextWindowCompression: { triggerTokens: 25600, slidingWindow: { targetTokens: 12800 } },
@@ -708,6 +1125,31 @@ win.fetch = async (url, init) => {
       return { ok: false, status: e.status || 500, json: async () => ({ error: "mint_failed", detail: e.message }) };
     }
   }
+  /*
+   * ── v5.34.100: SCORING IS STUBBED IN A LIVE RUN, NOT LEFT TO 404 ──────────
+   *
+   * Everything that was not a grant or a close fell through to the 404 below —
+   * including /api/llm/generate, which vyne-live-interview.js calls every 20s
+   * once two turns exist. The page read that as http_404 and counted a failed
+   * scoring pass, and the v5.34.85 scoring-dead stop then did exactly what it
+   * is supposed to do: after five failures and five minutes with nothing ever
+   * scored, it apologised to the interviewee and stopped the interview.
+   *
+   * So a 14-minute live run terminated at ~5 minutes and never reached the
+   * ~10-minute handover it was started for — a rig fault presenting as a
+   * product failure, which is this harness's oldest recurring trap.
+   *
+   * The offline path has stubbed this since v5.34.83 for the same reason. The
+   * live path needs it too: this rig measures voice transport, and it carries
+   * neither an API origin nor a session cookie, so it cannot score and should
+   * not pretend the attempt means anything. Answer score-shaped, count it, and
+   * say plainly in the verdict that scoring was NOT exercised.
+   */
+  if (/\/api\/llm\/generate$/.test(u.split("?")[0])) {
+    scoreStubCalls++;
+    return { ok: true, status: 200, json: async () => ({
+      text: JSON.stringify({ scores: {}, findings: [], rationale: "harness stub — scoring not exercised" }) }) };
+  }
   return { ok: false, status: 404, json: async () => ({}) };
 };
 
@@ -720,6 +1162,132 @@ win.fetch = async (url, init) => {
  * the harness plumbing, not to imitate a model.
  */
 const OFFLINE_GOAWAY_MS = Number(arg("offline-goaway", 25000));
+/*
+ * v5.34.114 — how much NOTICE the stub's goAway gives, matching production.
+ *
+ * The stub said "8s" and production says "50s" — measured in the 2026-09-15
+ * live trace as {"timeLeft":"50s"}. That four-second-versus-fifty-second gap
+ * is not cosmetic: v5.34.112 made the handover hold out for a real pause in
+ * the conversation while there is headroom to do so, relaxing only as the
+ * deadline nears. With 8s of notice there is never any headroom, so every
+ * offline run took the old 1500ms path and could not exercise the new logic at
+ * all — an offline check that would have reported PASS on a behaviour it never
+ * reached. The same trap as every other instrument bug in this file, one layer
+ * out: the stub was faithful to the frame's SHAPE and not to its CONTENT.
+ */
+const OFFLINE_GOAWAY_TIMELEFT = arg("offline-goaway-timeleft", "50s");
+/*
+ * Silence inserted INSIDE each answer, so the tape pauses for thought the way
+ * a person does. See the note where it is applied. Default 2000ms — measured
+ * against the reported defect, where a pause of roughly that length was read
+ * as the end of a turn. Set 0 for the old unbroken-speech tape.
+ */
+const OFFLINE_THINK_PAUSE_MS = Number(arg("offline-think-pause", 2000));
+/* v5.34.101 — see the stub's turn-ending frames. Opt-in for now so the existing
+ * wrapper stages keep their measured baselines; it is the truthful default once
+ * those are re-baselined. */
+/*
+ * v5.34.101 — production-shaped turn frames are now the DEFAULT.
+ *
+ * This shipped as an opt-in flag a few hours ago and that was the wrong call.
+ * The behaviour it simulates is not an edge case to be exercised on demand; it
+ * is what the model does on every turn in production, and a rig whose default
+ * is a world that stopped existing will keep passing while the product fails.
+ * The old pacing is kept behind --offline-legacy-turns, for bisecting against
+ * a build from before the model changed. --offline-prod-turns still parses so
+ * existing invocations and notes do not break.
+ */
+const OFFLINE_PROD_TURNS = !has("offline-legacy-turns");
+/*
+ * ── v5.34.106: --offline-late-turn-complete <ms> ──────────────────────────
+ *
+ * A third turn shape, and the one neither of the other two can produce.
+ *
+ * Production's flakiness is not only "turnComplete never comes". It is also
+ * "turnComplete comes LATE" — after TURN_CLOSE_GRACE_MS, so the salvage has
+ * already closed the turn. That sequence used to be harmless because
+ * _closeTurn set 'idle' immediately and the salvage timer's own guard made a
+ * closed turn uncloseable. v5.34.101 holds the floor, so the state stays
+ * 'speaking' and the late frame closes the same turn a second time: usage
+ * banked twice, and since v5.34.105 the transcript flushed twice and a second
+ * paid scoring call spent on the same conversation.
+ *
+ * Default 0 (off), because it is a THIRD shape rather than a replacement: the
+ * common production case is no turnComplete at all, and that stays the
+ * default. Set it above TURN_CLOSE_GRACE_MS (1200) or the salvage never fires
+ * and the mode tests nothing.
+ */
+const OFFLINE_LATE_TURN_COMPLETE = Number(arg("offline-late-turn-complete", 0)) || 0;
+
+/*
+ * ── v5.34.106: two more shapes the rig could never produce ────────────────
+ *
+ * --offline-mute-replies N   every Nth reply is TEXT with no voice at all
+ * --offline-barge-in N       every Nth reply is cut off by the interviewee
+ *
+ * Both are real, both are observed by this harness, and neither had ever
+ * happened in it. onReplyWithoutAudio has had a `say()` line since v5.34.40
+ * and no offline run has ever printed it; no run has ever sent an
+ * `interrupted` frame either. A handler that is watched but never exercised
+ * is the same dead wiring this codebase keeps finding in the product — here
+ * it was in the thing meant to catch it.
+ *
+ * The mute shape matters particularly for v5.34.106: a text-only reply gives
+ * no audio and no thinking-text, so nothing reopens the salvage close guard
+ * for it. Only LATE_TURN_COMPLETE_WINDOW_MS tells it from a late frame, and
+ * that reasoning was written without ever being run.
+ */
+const OFFLINE_MUTE_REPLIES = Number(arg("offline-mute-replies", 0)) || 0;
+/*
+ * v5.34.112 — THE MODEL GOES SILENT. The one fault this rig could not inject.
+ *
+ * The 20-minute v5.34.111 soak hit it twice for real:
+ *
+ *     283.4s answering (9.2s): "Honestly the biggest constraint is not..."
+ *     467.5s !! the uplink never drained (32 frames left) — dropping this answer
+ *     469.3s !! nothing has happened for 186s
+ *     494.9s onError: live_socket_error
+ *
+ * Three minutes of dead air, ended by the socket failing outright and a forced
+ * reconnect, whose first reply took 20.3s — the worst latency of the run and
+ * the longest hole an interviewee would sit through. Every other fault this
+ * harness can fake (a missing turnComplete, a mute reply, a barge-in, a failed
+ * mint, a goAway) was added after a real run exposed it. This is that, for the
+ * fault that matters most to a thirty-minute conversation: after reply N the
+ * stub answers nothing at all, forever.
+ *
+ * It is also the only way to check that the stall watchdog still has teeth
+ * after being re-based on model activity in this same version — a watchdog
+ * that no longer cries wolf is worth nothing if it also no longer barks.
+ */
+const OFFLINE_SILENT_AFTER = Number(arg("offline-silent-after", 0)) || 0;
+const OFFLINE_BARGE_IN = Number(arg("offline-barge-in", 0)) || 0;
+/*
+ * ── v5.34.117: the goAway'd connection that stops answering. ────────────────
+ *
+ * Reported from a live interview on v5.34.116 and read off the 🩺 trace: the
+ * server sent goAway at 9m07s, transcribed a 38.7-second answer, and then
+ * produced no model frame for twenty seconds. Total silence 25s, broken only
+ * by the interviewee asking whether anyone was there.
+ *
+ * Every offline fault this rig can fake was added after a real run exposed it,
+ * and this is the shape none of them covered. --offline-silent-after is the
+ * nearest: it silences the stub FOREVER, and forever is a different code path
+ * (`_watchRenewedSilence`, the retry ladder) from a socket that stalls once
+ * because it is closing. The difference matters — the whole v5.34.117 fix
+ * lives in the gap between them.
+ *
+ * Under this flag: the first interviewee turn AFTER a goAway is transcribed
+ * normally and then answered `--offline-stall-after-goaway` ms later instead
+ * of the usual 600. The client should never see that reply: it should notice
+ * the stall, hand over, and take the answer with it. The verdict measures how
+ * long the silence actually lasted, which is the number the interviewee feels.
+ */
+const OFFLINE_STALL_AFTER_GOAWAY = Number(arg("offline-stall-after-goaway", 0)) || 0;
+let stallsInjected = 0;
+let muteRepliesSent = 0;
+let muteRepliesDetected = 0;
+let bargeInsSent = 0;
 
 /*
  * v5.34.47 — FAULT INJECTION, offline only.
@@ -778,6 +1346,10 @@ if (OFFLINE) {
        * swallowed by design and changed nothing, but a rig that prints a red
        * line for its own stub trains you to ignore red lines.
        */
+      /* v5.34.100: counted, so the verdict says "NOT EXERCISED" here too. An
+       * offline run that reported "scoring passes: 2 succeeded" was claiming a
+       * success for this stub answering itself. */
+      scoreStubCalls++;
       return { ok: true, status: 200, json: async () => ({
         text: JSON.stringify({ scores: {}, findings: [], rationale: "offline stub" }) }) };
     }
@@ -801,6 +1373,7 @@ if (OFFLINE) {
     }
     grantCount++;
     say(`grant #${grantCount} (offline stub)`);
+    recordInstruction();          // same capture as the live path
     return { ok: true, status: 200, json: async () => ({
       token: "offline", model: MODEL, voice: VOICE, pinned: true, maxSeconds: 1800,
       sessionId: `offline-${grantCount}`,
@@ -813,6 +1386,9 @@ if (OFFLINE) {
     ws.onopen = ws.onmessage = ws.onclose = ws.onerror = null;
     const frame = (o) => ws.onmessage && ws.onmessage({ data: JSON.stringify(o) });
     let quiet = 0, spoke = false, closed = false;
+    /* v5.34.117 — per SOCKET, not per run: a goAway is a fact about one
+     * connection, and the stall must be injected on the dying one only. */
+    let goAwaySent = false, stalledThisSocket = false;
     ws.send = (d) => {
       let o; try { o = JSON.parse(d); } catch { return; }
       if (o.realtimeInput?.audio?.data) {
@@ -834,7 +1410,54 @@ if (OFFLINE) {
            * conversation the bug lived in.
            */
           frame({ serverContent: { inputTranscription: { text: "That is a fair question, and here is the answer." } } });
-          setTimeout(reply, 600);
+          /*
+           * v5.34.117 — transcribe it, then go quiet. The transcript is what
+           * makes this the reported defect rather than a dead uplink: the
+           * server demonstrably HEARD the turn, so nothing is lost, and the
+           * client's own `_awaitingReply` is armed and never cleared.
+           */
+          let replyIn = 600;
+          if (OFFLINE_STALL_AFTER_GOAWAY > 0 && goAwaySent && !stalledThisSocket) {
+            stalledThisSocket = true; stallsInjected++;
+            replyIn = OFFLINE_STALL_AFTER_GOAWAY;
+            /*
+             * v5.34.117 — and the INTERVIEWEE goes quiet, which is half the
+             * scenario.
+             *
+             * On the reported run they finished a 38.7-second answer and then
+             * waited. The rig's tape does the opposite: with --loop it talks
+             * almost continuously, and the product correctly refuses to tear a
+             * socket down mid-word — so the first version of this stage
+             * measured 13.1s and blamed the product for the tape.
+             *
+             * Dropping the queued audio here is the interviewee stopping. The
+             * pump keeps running (it must — see startPump: a harness that goes
+             * mute inflates every latency it measures), so the uplink carries
+             * silent frames, which is exactly what a person waiting sounds
+             * like.
+             */
+            const dropped = uplinkQueue.length;
+            uplinkQueue.length = 0;
+            /*
+             * v5.34.118 — and a SECOND goAway, ten milliseconds behind the
+             * transcript, because that is what the server actually does.
+             *
+             *   v5.34.116 trace   +549693 USER TURN #9   → +549704 goAway
+             *   v5.34.117 trace   +788650 USER TURN #13  → +788660 goAway
+             *
+             * Two builds, two live interviews, the same ten milliseconds, and
+             * in both the turn was never answered. Without this frame the rig
+             * reproduces the silence but not the SIGNAL, so the whole of
+             * v5.34.118 — which exists to act on that signal — would be
+             * untestable offline and the stage would report v5.34.117's 5.9s
+             * as if it were the best available.
+             */
+            setTimeout(() => closed || frame({ goAway: { timeLeft: OFFLINE_GOAWAY_TIMELEFT } }), 10);
+            say(`   (rig: goAway'd connection transcribed this turn, sent a second goAway on top ` +
+                `of it, and will not answer for ${(OFFLINE_STALL_AFTER_GOAWAY / 1000).toFixed(0)}s; ` +
+                `interviewee falls silent, ${dropped} queued frames dropped)`);
+          }
+          setTimeout(reply, replyIn);
         }
       }
       if (o.clientContent) setTimeout(reply, 700);       // a text nudge gets an answer too
@@ -859,6 +1482,15 @@ if (OFFLINE) {
        * multi-word patterns against sub-word pieces.
        */
       stubReplies++;
+      /* v5.34.112: past this point the model is gone. No frames of any kind —
+       * not audio, not text, not generationComplete — which is what a stalled
+       * uplink looks like from the page's side. */
+      if (OFFLINE_SILENT_AFTER > 0 && stubReplies > OFFLINE_SILENT_AFTER) {
+        if (stubReplies === OFFLINE_SILENT_AFTER + 1) {
+          say(`(rig: the model has gone SILENT after reply ${OFFLINE_SILENT_AFTER} — no further frames)`);
+        }
+        return;
+      }
       /*
        * v5.34.79 — the stub now GREETS the way the real model greets.
        *
@@ -896,20 +1528,120 @@ if (OFFLINE) {
         pcm[i] = Math.round(Math.sin(i / 11) * Math.sin(i / 900) * env * 7000);
       }
       const b64 = Buffer.from(pcm.buffer, pcm.byteOffset, pcm.byteLength).toString("base64");
+      /*
+       * ── v5.34.101: --offline-prod-turns reproduces what Google now does ─────
+       *
+       * The default stub paces audio in real time and ends with turnComplete.
+       * Production does neither. The real model pushes a whole answer down the
+       * socket as fast as it will go and then sends generationComplete, and as
+       * of 2026-09-14 gemini-2.5-flash-native-audio-latest sends no
+       * turnComplete at all (11 generationComplete, 0 turnComplete on a live
+       * run). So the rig has been testing a world that stopped existing, which
+       * is why `salvaged turns: 0` offline and 11 live, and why the turn-close
+       * defect could not be reproduced for free.
+       *
+       * Under this flag: burst the audio (so the playback queue builds a real
+       * backlog) and close with generationComplete only.
+       */
+      const burst = OFFLINE_PROD_TURNS;
+      /*
+       * v5.34.106 — a MUTE reply: transcript, no audio at all. The turn still
+       * ends (generationComplete), so it exercises the salvage on a turn that
+       * produced no audio, which is the one shape that reopens nothing in the
+       * v5.34.106 close guard.
+       */
+      const mute = OFFLINE_MUTE_REPLIES > 0 && stubReplies % OFFLINE_MUTE_REPLIES === 0;
+      if (mute) {
+        muteRepliesSent++;
+        say(`   (rig: reply ${stubReplies} sent as TEXT with no voice)`);
+        setTimeout(() => closed || frame({ serverContent: { generationComplete: true } }), 1200);
+        return;
+      }
       for (let o = 0; o < n; o += OUT_RATE / 4) {
         const part = pcm.subarray(o, Math.min(o + OUT_RATE / 4, n));
-        setTimeout(() => closed || frame({ serverContent: { modelTurn: { parts: [{ inlineData: {
+        const emit = () => closed || frame({ serverContent: { modelTurn: { parts: [{ inlineData: {
           mimeType: `audio/pcm;rate=${OUT_RATE}`,
-          data: Buffer.from(part.buffer, part.byteOffset, part.byteLength).toString("base64") } }] } } }),
-          (o / OUT_RATE) * 1000);
+          data: Buffer.from(part.buffer, part.byteOffset, part.byteLength).toString("base64") } }] } } });
+        if (burst) setTimeout(emit, 5); else setTimeout(emit, (o / OUT_RATE) * 1000);
       }
-      setTimeout(() => closed || frame({ serverContent: { turnComplete: true } }), dur * 1000 + 100);
+      /*
+       * v5.34.106 — a BARGE-IN: the interviewee talks over the answer. The
+       * server sends `interrupted`, the client flushes the playback queue, and
+       * v5.34.101's floor hold must release AT ONCE rather than waiting out
+       * audio that will never be heard. flush() zeroing _lastEnd is what makes
+       * that true, and nothing offline had ever tested it.
+       */
+      if (OFFLINE_BARGE_IN > 0 && stubReplies % OFFLINE_BARGE_IN === 0) {
+        bargeInsSent++;
+        say(`   (rig: interviewee barges in over reply ${stubReplies})`);
+        /*
+         * 1500ms, not 400: the turn is closed by the salvage at
+         * generationComplete + TURN_CLOSE_GRACE_MS (~1260ms) and the floor is
+         * then held for the ~1s of audio still queued. A barge-in at 400ms
+         * lands on a turn that has not closed yet and tests nothing about the
+         * hold. Landing it INSIDE the hold is the real sequence — the
+         * interviewee talks over the tail of the question — and it is the only
+         * way to reach the interaction between flush() and the deferred idle.
+         */
+        setTimeout(() => closed || frame({ serverContent: { interrupted: true } }), 1500);
+      }
+      if (burst) {
+        /*
+         * v5.34.106 — in barge-in mode the turn must END AFTER the
+         * interruption, not before it.
+         *
+         * With generationComplete at 60ms the turn is always closed by the
+         * time the barge-in lands, so the close computes its remaining
+         * playback before any flush — and the one guarantee flush() makes,
+         * that it zeroes _lastEnd, is never exercised. Removing that line
+         * changed nothing in the verdict, which is how a rig gives false
+         * assurance.
+         *
+         * Ordering it after the interrupt reaches the real sequence: the
+         * interviewee talks over the question, the queue is flushed, and THEN
+         * the model's turn ends. The close must find nothing left to play.
+         */
+        const bargingThisTurn = OFFLINE_BARGE_IN > 0 && stubReplies % OFFLINE_BARGE_IN === 0;
+        setTimeout(() => closed || frame({ serverContent: { generationComplete: true } }),
+                   bargingThisTurn ? 1900 : 60);
+        if (OFFLINE_LATE_TURN_COMPLETE > 0) {
+          /*
+           * ── v5.34.110: what production actually puts in the gap ───────────
+           *
+           * The live run of 2026-09-15 closed all 44 turns twice with a guard
+           * that should have stopped it. The guard was not at fault: SIXTEEN
+           * sessionResumptionUpdate frames sat between the salvage close and
+           * the late turnComplete, each carrying usageMetadata — which
+           * parseServerFrame reads off ANY frame, so every one of them looked
+           * like the model generating something and re-armed the guard.
+           *
+           * The rig sent an EMPTY gap, so no free run could reproduce it. It
+           * now fills that gap the way the server does. Without this the fix
+           * is untestable offline, and the next one would be guessed too.
+           */
+          for (let g = 200; g < OFFLINE_LATE_TURN_COMPLETE; g += 500) {
+            setTimeout(() => closed || frame({
+              sessionResumptionUpdate: { resumable: true, newHandle: `h${stubReplies}-${g}` },
+              usageMetadata: { promptTokenCount: 1200, responseTokenCount: 40 },
+            }), 60 + g);
+          }
+          /* After the salvage has already closed this turn. */
+          setTimeout(() => closed || frame({ serverContent: { turnComplete: true } }),
+                     60 + OFFLINE_LATE_TURN_COMPLETE);
+        }
+      } else {
+        setTimeout(() => closed || frame({ serverContent: { turnComplete: true } }), dur * 1000 + 100);
+      }
       void b64;
     }
     setTimeout(() => {
       ws.readyState = 1; ws.onopen && ws.onopen();
       setTimeout(() => frame({ setupComplete: {} }), 30);
-      setTimeout(() => closed || frame({ goAway: { timeLeft: "8s" } }), OFFLINE_GOAWAY_MS);
+      setTimeout(() => {
+        if (closed) return;
+        goAwaySent = true;
+        frame({ goAway: { timeLeft: OFFLINE_GOAWAY_TIMELEFT } });
+      }, OFFLINE_GOAWAY_MS);
     }, 20);
   };
   win.WebSocket.OPEN = 1;
@@ -984,6 +1716,33 @@ function resampleF(src, from, to) {
   return out;
 }
 function enqueueAnswer(pcm) {
+  /*
+   * ── A person pauses in the middle of an answer. (v5.34.114) ───────────────
+   *
+   * Every answer on this tape was one unbroken block of speech, because TTS
+   * produces one. Real people stop mid-thought — and that is precisely the
+   * defect reported from the 2026-09-15 live interview: at the handover the
+   * interviewee paused to think, the ~1500ms quiet rule read the pause as the
+   * end of his turn, the handover fired, and the fifteen seconds he then spoke
+   * went into a socket being torn down.
+   *
+   * A tape that never pauses cannot reproduce that, so every offline run
+   * "passed" a scenario it was incapable of reaching. The unit tests in
+   * handoverWaitsForAGap.test.ts cover the logic; this makes the harness
+   * capable of showing the whole thing end to end.
+   *
+   * Inserted at the midpoint rather than at a random offset: reproducible runs
+   * matter more than variety, and the midpoint is the worst case — it
+   * guarantees there is still speech to lose afterwards.
+   */
+  if (OFFLINE_THINK_PAUSE_MS > 0 && pcm.length > FRAME * 4) {
+    const silentFrames = Math.round((OFFLINE_THINK_PAUSE_MS / 1000) * IN_RATE / FRAME);
+    const mid = Math.floor(pcm.length / 2 / FRAME) * FRAME;
+    for (let i = 0; i < mid; i += FRAME) uplinkQueue.push(pcm.subarray(i, Math.min(i + FRAME, pcm.length)));
+    for (let k = 0; k < silentFrames; k++) uplinkQueue.push(new Int16Array(FRAME));
+    for (let i = mid; i < pcm.length; i += FRAME) uplinkQueue.push(pcm.subarray(i, Math.min(i + FRAME, pcm.length)));
+    return;
+  }
   for (let i = 0; i < pcm.length; i += FRAME) uplinkQueue.push(pcm.subarray(i, Math.min(i + FRAME, pcm.length)));
 }
 
@@ -997,6 +1756,24 @@ let speakingSince = null;
 let askedAt = null;
 let answerIndex = 0;
 let firstAudioAt = null;
+/*
+ * v5.34.100 — WHEN THE LIVE SESSION ACTUALLY CAME UP.
+ *
+ * t0 is process start, and a live run spends ~50s synthesising the eight
+ * scripted answers through the TTS model before it ever requests a grant. Two
+ * numbers were being measured against t0 and were therefore wrong by that
+ * whole prologue:
+ *
+ *   · "first audio: 65.0s" — the interviewer had in fact spoken 15.7s after the
+ *     session opened. 65s reads as a catastrophic warmup failure; it was TTS.
+ *   · the stall watchdog fired at 26s, while the answers were still being
+ *     synthesised and no session existed at all — a "recovery" from a stall
+ *     that could not happen, inflating stallRecoveries and cueing an answer
+ *     into a socket that was not there.
+ *
+ * Both are the harness measuring itself. Anchor them here instead.
+ */
+let sessionUpAt = null;
 let ended = null;
 let renewals = 0;
 let renewRetries = 0;   // retries inside the CURRENT handover (v5.34.47)
@@ -1012,6 +1789,27 @@ let scoreCalls = 0;
 let scoreErrors = 0;
 let scoringDead = null;
 const scoredDims = new Set();
+/* v5.34.101: failure code -> how many times. Printed in the verdict so a run
+ * that scores nothing says WHY without anyone scrolling back. */
+const scoreErrorCodes = new Map();
+/* v5.34.101: turns closed with audio still queued, and the worst offender.
+ * The floor-hold invariant — see the verdict line that reads them. */
+let idleWhileSpeaking = 0;
+let worstIdleWhileSpeakingMs = 0;
+let floorHolds = 0;
+/* v5.34.106: turns closed more than once, and guarded late closes. */
+let doubleClosedTurns = 0;
+let lateClosesSuppressed = 0;
+/* v5.34.107: every measured salvage -> turnComplete gap, so the window is
+ * never set from reasoning again. */
+const lateCloseGapsMs = [];
+/* v5.34.110: the full text handed to the interviewer at each mint. */
+const mintedInstructions = [];
+/* v5.34.106: a floor held over audio a barge-in already discarded. */
+let heldAfterFlush = 0;
+/* v5.34.100: scoring requests this rig answered with a stub. Non-zero means the
+ * scoring numbers below measure the stub, not the product. */
+let scoreStubCalls = 0;
 let chokes = 0;                 // interrupted while we were not speaking
 let lastTurnCompleteAt = 0;
 /* Set the instant finish() starts. Guards the periodic trace flush, and makes
@@ -1046,6 +1844,7 @@ const LI = win.vyneLiveInterview.create({
         const lat = now() - askedAt;
         turns.push({ n: turns.length + 1, latency: lat, at: now() });
         say(`reply ${turns.length}: ${lat.toFixed(1)}s after the answer ended`);
+        noteActivity();
         askedAt = null;
       }
     }
@@ -1107,7 +1906,10 @@ const LI = win.vyneLiveInterview.create({
   },
   onRenewSilent: () => { silentRenewals++; say(`!! the renewed session did not speak — dropping the handle and reconnecting`); },
   onQuotaExhausted: () => { say(`!! GOOGLE IS RATE-LIMITING THIS PROJECT — the run below is INVALID FOR COMPARISON`); },
-  onReplyWithoutAudio: () => { say(`!! a reply arrived as text with no voice`); },
+  onReplyWithoutAudio: () => {
+    muteRepliesDetected++;
+    say(`!! a reply arrived as text with no voice (detected ${muteRepliesDetected})`);
+  },
   /*
    * v5.34.75 — notice when the interviewer CLOSES, and stop.
    *
@@ -1264,7 +2066,18 @@ const LI = win.vyneLiveInterview.create({
   },
   onScoreError: (e) => {
     scoreErrors++;
-    say(`!! scoring pass FAILED (${scoreErrors}): ${(e && (e.code || e.message)) || e}`);
+    const code = String((e && (e.code || e.message)) || e);
+    /*
+     * v5.34.101 — tally the CODE, not just the count.
+     *
+     * The live run of 2026-09-14 reported "0 succeeded, 3 failed" and that is
+     * all that survived into the hands of the person who had to decide what to
+     * do next. The reason was in the scroll-back, three screens up. A verdict
+     * that says a thing failed without saying why costs another paid run to
+     * find out, so the codes now ride in the verdict itself.
+     */
+    scoreErrorCodes.set(code, (scoreErrorCodes.get(code) || 0) + 1);
+    say(`!! scoring pass FAILED (${scoreErrors}): ${code}`);
   },
   onScoringDead: (info) => {
     scoringDead = info || true;
@@ -1286,9 +2099,37 @@ const LI = win.vyneLiveInterview.create({
 let answering = false;
 /* Set by nextAnswer() and by the watchdog; read only for the stall report. */
 let lastCueAt = Date.now();
+/*
+ * v5.34.112 — WHAT A STALL IS MEASURED FROM.
+ *
+ * The watchdog fired on `Date.now() - lastCueAt >= STALL_MS`, and lastCueAt is
+ * set when an ANSWER IS CUED. So the 25-second window covered a whole healthy
+ * cycle: a nine-second answer, the interviewer's reply, and a scoring pass. Any
+ * cycle slower than 25s reported a stall even though every step of it worked.
+ *
+ * Measured on the 20-minute v5.34.111 soak: 7 stall recoveries reported, of
+ * which 5 were this. Recovery 4 is the clearest —
+ *
+ *     692.4s answering (8.6s)
+ *     702.1s reply 18: 1.2s after the answer ended     <- the model answered fine
+ *     707.4s score pass #17
+ *     717.4s !! nothing has happened for 25s           <- 25s after the CUE
+ *
+ * "Nothing has happened" while the trace directly above it shows three things
+ * happening. That number would have sent us hunting a transport stall that did
+ * not exist, and on a 30-minute run it would read as ~15 of them.
+ *
+ * A stall is silence from the MODEL, so it is timed from the last thing the
+ * model did. The two genuine stalls on that run — both preceded by "the uplink
+ * never drained" — are still caught, because in those the model really did go
+ * quiet (186 seconds, once).
+ */
+let lastActivityAt = Date.now();
+const noteActivity = () => { lastActivityAt = Date.now(); };
 let stallRecoveries = 0;
 async function nextAnswer() {
-  if (answering || ended || Date.now() - t0 > MINUTES * 60000) return;
+  /* v5.34.114: the RUN's deadline, not the process's — see RUN_DEADLINE_AT. */
+  if (answering || ended || Date.now() > RUN_DEADLINE_AT) return;
   if (uplinkQueue.length) { say(`(skipping a duplicate answer cue — ${uplinkQueue.length} frames still on the uplink)`); return; }
   answering = true;
   lastCueAt = Date.now();
@@ -1326,6 +2167,8 @@ async function nextAnswer() {
     }
     const text = ANSWERS[answerIndex % ANSWERS.length];
     answerIndex++;
+    lastAnswerSpoken = text;   // v5.34.119: for the verbatim-echo check
+
     const pcm = await speak(text, answerIndex - 1);
     say(`answering (${(pcm.length / IN_RATE).toFixed(1)}s): "${text.slice(0, 58)}…"`);
     enqueueAnswer(pcm);
@@ -1343,7 +2186,31 @@ async function nextAnswer() {
     const drainStartedAt = Date.now();
     const waitForDrain = setInterval(() => {
       if (uplinkQueue.length === 0) {
-        clearInterval(waitForDrain); askedAt = now(); answering = false; return;
+        /*
+         * v5.34.114 — THE ANSWER FINISHING IS ACTIVITY.
+         *
+         * Third and final correction to what a stall is measured from. The
+         * window ran from `lastCueAt`, the moment the answer was CUED, so a
+         * long answer plus a normal reply exceeded it and reported a stall on a
+         * healthy exchange — three of them on the 20-minute soak:
+         *
+         *     156.9s answering (23.6s): "We have a global data warehouse..."
+         *     182.2s !! nothing has happened for 25s
+         *
+         * The answer had finished 1.7 seconds earlier and the reply was on its
+         * way. v5.34.112 moved the window onto model activity and fixed the
+         * short-answer case; it did not fix this, because during a 23-second
+         * answer nothing counts as activity at all.
+         *
+         * The honest question a stall watchdog asks is "the interviewee has
+         * stopped speaking — has the model responded yet?", so the clock starts
+         * when the interviewee stops. Deliberately NOT set on the drain-timeout
+         * branch below: an uplink that never drained IS the fault, and the
+         * watchdog should fire for it.
+         */
+        clearInterval(waitForDrain); askedAt = now(); answering = false;
+        noteActivity();
+        return;
       }
       if (Date.now() - drainStartedAt > 30000) {
         clearInterval(waitForDrain);
@@ -1394,14 +2261,63 @@ const STALL_MS = Number(process.env.VYNE_HARNESS_STALL_MS || 25000);
  * for one retry ladder plus slack, and then the watchdog takes over again.
  */
 const RENEW_GRACE_MS = Number(process.env.VYNE_HARNESS_RENEW_GRACE_MS || 60000);
+/*
+ * v5.34.112 — THE TWO UNBOUNDED PASSES.
+ *
+ * v5.34.78 bounded the renewal pass and said exactly why: "Suppressing the
+ * watchdog for the duration of a handover is right; suppressing it FOREVER
+ * because a handover never completed would restore exactly the failure this
+ * watchdog exists to catch." Two of the four passes below were still forever.
+ *
+ *   uplinkQueue.length — suppressed while frames are waiting to go out. A
+ *     queue that stops draining therefore blinds the watchdog for as long as
+ *     it stays stuck. Measured on the v5.34.111 soak: the queue jammed at
+ *     283.4s and the watchdog said nothing until 469.3s, then reported "186s".
+ *     The one thing it exists to notice, and it was suppressed by it.
+ *
+ *   state speaking/thinking — suppressed while the model is mid-turn. A model
+ *     that goes silent WITHOUT closing its turn leaves the page in 'speaking'
+ *     with nothing to end it, so the watchdog never runs again. That is
+ *     verbatim the 2026-09-13 failure quoted in the comment above: "the client
+ *     never left 'speaking', no answer was ever cued again". The salvage in
+ *     vyne-live.js fixes the cause; this pass quietly reopened the symptom for
+ *     any silence the salvage cannot see, and --offline-silent-after proves it
+ *     (before this change: 0 stall recoveries on a model that stopped dead).
+ *
+ * Both now get a ceiling, for the same reason the renewal pass did: a pass
+ * granted while something is legitimately in progress, withdrawn once "in
+ * progress" has lasted longer than the thing could possibly take.
+ */
+const STUCK_MS = Number(process.env.VYNE_HARNESS_STUCK_MS || 45000);
+let uplinkBusySince = null;
+let turnBusySince = null;
 setInterval(() => {
-  if (ended || answering || uplinkQueue.length) return;
+  if (ended || answering) return;
+  /* v5.34.100: nothing to stall on before the session exists. See sessionUpAt. */
+  if (sessionUpAt === null) return;
   if (renewingSince !== null && Date.now() - renewingSince < RENEW_GRACE_MS) return;
-  if (state === "speaking" || state === "thinking") return;
-  if (Date.now() - lastCueAt < STALL_MS) return;
+
+  uplinkBusySince = uplinkQueue.length ? (uplinkBusySince ?? Date.now()) : null;
+  if (uplinkBusySince !== null && Date.now() - uplinkBusySince < STUCK_MS) return;
+
+  const midTurn = state === "speaking" || state === "thinking";
+  turnBusySince = midTurn ? (turnBusySince ?? Date.now()) : null;
+  if (turnBusySince !== null && Date.now() - turnBusySince < STUCK_MS) return;
+
+  if (Date.now() - Math.max(lastCueAt, lastActivityAt) < STALL_MS) return;
   stallRecoveries++;
-  say(`!! nothing has happened for ${Math.round((Date.now() - lastCueAt) / 1000)}s — cueing the next answer (recovery ${stallRecoveries})`);
+  say(`!! nothing has happened for ${Math.round((Date.now() - Math.max(lastCueAt, lastActivityAt)) / 1000)}s — cueing the next answer (recovery ${stallRecoveries})`);
   lastCueAt = Date.now();
+  noteActivity();
+  /* A stuck uplink is why we are here; clearing it is part of the recovery,
+   * not a side effect. Leaving it would re-suppress the next cue at the guard
+   * in nextAnswer(). */
+  if (uplinkQueue.length) {
+    say(`   (clearing ${uplinkQueue.length} frame(s) stuck on the uplink)`);
+    uplinkQueue.length = 0;
+  }
+  uplinkBusySince = null;
+  turnBusySince = null;
   nextAnswer();
 }, 2000);
 
@@ -1423,6 +2339,28 @@ function finish(why) {
   try { clearInterval(pumpTimer); } catch {}
   try { LI.stop("page_unload"); } catch {}
   const secs = writeWav(OUT_WAV);
+  /*
+   * ── v5.34.103: keep the evidence ───────────────────────────────────────────
+   *
+   * Every run wrote voice-record.log and voice-record.txt, and every run
+   * therefore destroyed the previous one's. On 2026-09-14 a live run reported
+   * "first audio: 65.0s" — 20s past the threshold this harness itself warns
+   * at — and by the time anyone came to diagnose it the trace had been
+   * overwritten by the next run. The question could not be answered from the
+   * evidence, only from another paid run.
+   *
+   * These runs cost real money and the trace is the only artefact that
+   * survives them, so it is now also written under a per-run name. The plain
+   * voice-record.log stays exactly where it is, because every runbook, every
+   * handoff note and the verdict lines below all point at it.
+   */
+  try {
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    const keepDir = join(ROOT, "voice-runs");
+    mkdirSync(keepDir, { recursive: true });
+    ARCHIVE_DIR = join(keepDir, `${OUT.split(/[\\/]/).pop()}-${stamp}`);
+    mkdirSync(ARCHIVE_DIR, { recursive: true });
+  } catch (e) { ARCHIVE_DIR = null; }
   try {
     const dump = win.vyneLiveLogDump ? String(win.vyneLiveLogDump()) : trace.join("\n");
     writeFileSync(OUT_LOG, dump);
@@ -1491,6 +2429,26 @@ function finish(why) {
    * Wall clock far beyond the booked ceiling can only mean the process stopped
    * running, since every other way a run can overrun is bounded.
    */
+  /*
+   * v5.34.112 — the first thing in the verdict, because it decides whether
+   * anything after it is a measurement of the product at all.
+   */
+  if (suspensions.length) {
+    const tot = suspendedSec();
+    say(`!! THIS PROCESS WAS SUSPENDED for ${tot.toFixed(0)}s across ${suspensions.length} gap(s) — ` +
+        `${((tot / Math.max(1, now())) * 100).toFixed(0)}% of the run.`);
+    suspensions.slice(0, 6).forEach((g) =>
+      say(`   frozen ${g.frozenSec.toFixed(0)}s starting at ${g.at.toFixed(1)}s`));
+    if (suspensions.length > 6) say(`   (and ${suspensions.length - 6} more)`);
+    say(`   On a laptop this is the machine sleeping. While suspended, timers do not fire,`);
+    say(`   the uplink does not drain and the socket dies — which reads in the trace as`);
+    say(`   "the uplink never drained" and a long silence, i.e. EXACTLY like a network`);
+    say(`   fault. The latencies, stall recoveries and dead-air gaps below are therefore`);
+    say(`   NOT measurements of the model. Re-run with the machine kept awake:`);
+    say(`     caffeinate -i bash deploy/run-voice-record.sh ${MINUTES} soak`);
+  } else {
+    say(`process suspensions: none — the event loop ran continuously, so the numbers below are the product's`);
+  }
   if (now() > MINUTES * 60 * 1.5 + 30) {
     say(`!! this run took ${(now() / 60).toFixed(1)} minutes of wall clock for a ${MINUTES}-minute booking.`);
     say(`   The process was suspended — on a laptop, that is the machine sleeping. Timers`);
@@ -1501,7 +2459,94 @@ function finish(why) {
   say(`recording:       ${OUT_WAV}  (${(secs / 60).toFixed(1)} min, L=interviewer R=interviewee)`);
   say(`page trace:      ${OUT_LOG}`);
   say(`grants minted:   ${grantCount}   handovers: ${renewals}   mute handovers recovered: ${silentRenewals}`);
+  /*
+   * ── v5.34.117: how long the stalled handover left the interviewee waiting ──
+   *
+   * Measured off the CLIENT's own trace, not the stub's intentions. The rig has
+   * misreported four times in this project, every time by trusting a clock it
+   * owned rather than one the product wrote, so this reads the two lines
+   * vyne-live.js and vyne-live-interview.js print and subtracts them.
+   *
+   * The number that matters is transcript → first audio of the new session:
+   * that is the hole the person sits in. 25s on the reported run.
+   */
+  if (OFFLINE_STALL_AFTER_GOAWAY > 0) {
+    /* The prefix is column-padded — `[VL + 42427ms]`. The first cut of this
+     * regex required the digits to touch the plus, so every timestamp parsed
+     * as null and the verdict printed "noticed after ?s". Fifth time this
+     * project's instrument has misreported; it stays cheap to check. */
+    const ms = (l) => { const m = /\[VL \+\s*(\d+)ms\]/.exec(l); return m ? Number(m[1]) : null; };
+    const find = (from, re) => { for (let i = from; i < trace.length; i++) if (re.test(trace[i])) return i; return -1; };
+    const iStall = find(0, /handing over because this connection has stopped answering/);
+    if (stallsInjected === 0) {
+      say(`stalled handover: NOT EXERCISED — the run ended before a goAway, so this proves nothing.`);
+      say(`   Run longer than the goAway interval (${(OFFLINE_GOAWAY_MS / 1000).toFixed(0)}s), or lower it with --offline-goaway.`);
+    } else if (iStall < 0) {
+      say(`!! stalled handover: the stall was injected ${stallsInjected}x and the client NEVER noticed it.`);
+      say(`   This is the v5.34.116 defect, unfixed: the handover is waiting for a turn`);
+      say(`   boundary on a connection that has stopped producing turns.`);
+    } else {
+      /* The transcribed turn the stall was injected on: the last USER TURN
+       * line at or before the escape. */
+      let iTurn = -1;
+      for (let i = iStall; i >= 0; i--) if (/USER TURN #/.test(trace[i])) { iTurn = i; break; }
+      const iAudio = find(iStall, /FIRST AUDIO FRAME — the agent is speaking/);
+      const t0 = iTurn >= 0 ? ms(trace[iTurn]) : null;
+      const tEsc = ms(trace[iStall]);
+      const tAud = iAudio >= 0 ? ms(trace[iAudio]) : null;
+      const noticedMs = t0 != null && tEsc != null ? tEsc - t0 : null;
+      const silenceMs = t0 != null && tAud != null ? tAud - t0 : null;
+      say(`stalled handover: noticed after ${noticedMs == null ? "?" : (noticedMs / 1000).toFixed(1)}s, ` +
+          `interviewee heard nothing for ${silenceMs == null ? "?" : (silenceMs / 1000).toFixed(1)}s ` +
+          `(injected stall ${(OFFLINE_STALL_AFTER_GOAWAY / 1000).toFixed(0)}s, reported defect 25.0s)`);
+      if (silenceMs != null && silenceMs > 12000) {
+        say(`!! that is longer than the 12s at which the product itself calls the line dead.`);
+      }
+      /*
+       * The nudge decides what the interviewee HEARS on the far side, and the
+       * two wrong ones are worse than the silence: "I'm still here" is what
+       * they got on the reported run, and "could you say it again" asks them
+       * to repeat an answer we hold in full.
+       */
+      const nudge = trace.slice(iStall).find((l) => /sendText -> WIRE/.test(l)) || "";
+      const wrong = /still there/i.test(nudge) ? "'still there'"
+                  : /say it again|repeat/i.test(nudge) ? "'say it again'" : null;
+      if (wrong) say(`!! the recovery nudge was the ${wrong} one — it should be answering the turn it already has.`);
+    }
+  }
   say(`replies:         ${turns.length}`);
+  /*
+   * v5.34.119 — the parroting rate. Reported on every run, above the scoring
+   * lines, because it is about whether the interview was BEARABLE rather than
+   * whether it produced data, and the reported complaint was the former.
+   */
+  if (agentTurnsSeen) {
+    const pct = (n) => `${Math.round((n / agentTurnsSeen) * 100)}%`;
+    const handed = recapOpeners + recapRestates;
+    say(`handing the answer back: ${handed}/${agentTurnsSeen} turns (${pct(handed)}) — ` +
+        `${recapOpeners} "<ack>, so ..." openers, ${recapRestates} restated it without one, ` +
+        `${verbatimEchoes} repeated ${VERBATIM_RUN_WORDS}+ of their words verbatim`);
+    if (verbatimEchoes) {
+      say(`!! a verbatim echo is the 2026-09-17 handover defect. The interviewer read their answer out loud.`);
+      echoExamples.forEach((e) => say(`   "${e}…"`));
+    }
+    if (handed * 2 >= agentTurnsSeen) {
+      say(`!! more than half the turns opened by restating the answer — this is what reads as parroting.`);
+      recapExamples.forEach((e) => say(`   "${e}…"`));
+      restateExamples.forEach((e) => say(`   "${e}…"`));
+    }
+    /*
+     * Named exactly as PERSONA_SOURCE names it. A near-miss here would print
+     * nothing and let a stub run be read as a measurement of the shipped
+     * rules, which is this harness's signature failure.
+     */
+    if (PERSONA_SOURCE.indexOf("HARNESS STUB") >= 0) {
+      say(`   (harness stub persona — this rate says NOTHING about the shipped rules)`);
+    }
+    if (OFFLINE) {
+      say(`   (offline: the stub speaks one canned line, so only a paid run measures this)`);
+    }
+  }
   /* In the verdict too: this is the line that says what was actually measured. */
   say(`persona:         ${PERSONA_SOURCE}`);
   /*
@@ -1513,12 +2558,133 @@ function finish(why) {
    * all. These four lines are the difference between "the conversation worked"
    * and "the interview worked".
    */
-  say(`scoring passes:  ${scoreCalls} succeeded, ${scoreErrors} failed` +
-      `${scoreCalls === 0 ? "  !! NOTHING WAS SCORED — this run produced no assessment" : ""}`);
-  say(`dimensions scored: ${scoredDims.size} of 7` +
-      `${scoredDims.size ? ` (${[...scoredDims].sort().join(", ")})` : ""}`);
+  /*
+   * v5.34.100 — say WHICH of three things happened, because "0 succeeded" read
+   * as a product failure when it was the rig having no API to call.
+   */
+  if (scoreStubCalls) {
+    say(`scoring:         NOT EXERCISED — ${scoreStubCalls} request(s) answered by the rig's stub.`);
+    say(`                 This harness carries no API origin or session, so it cannot score. Use`);
+    say(`                 the browser for scoring; these runs measure voice transport only.`);
+  } else {
+    say(`scoring passes:  ${scoreCalls} succeeded, ${scoreErrors} failed` +
+        `${scoreCalls === 0 ? "  !! NOTHING WAS SCORED — this run produced no assessment" : ""}`);
+    if (scoreErrorCodes.size) {
+      const codes = [...scoreErrorCodes.entries()]
+        .sort((a, b) => b[1] - a[1])
+        .map(([c, n]) => `${c} x${n}`).join(", ");
+      say(`scoring failed with: ${codes}`);
+      /*
+       * These three are the ones a consultant can act on without reading code,
+       * and they need different responses: a cap is a billing decision, a
+       * provider fault is a wait, and an unparseable response is ours.
+       */
+      if ([...scoreErrorCodes.keys()].some((c) => /cap|quota|429/i.test(c))) {
+        say(`                 a cap or quota — this is a billing limit, not a code fault.`);
+      }
+      if ([...scoreErrorCodes.keys()].some((c) => /unparseable|score_apply_failed/i.test(c))) {
+        say(`                 the model answered and WE could not use it — that one is ours.`);
+      }
+      if ([...scoreErrorCodes.keys()].some((c) => /^http_5/.test(c))) {
+        say(`                 5xx from the gateway — provider or backend, check the API logs.`);
+      }
+    }
+    say(`dimensions scored: ${scoredDims.size} of 7` +
+        `${scoredDims.size ? ` (${[...scoredDims].sort().join(", ")})` : ""}`);
+  }
+  /*
+   * v5.34.101 — the invariant this release exists to enforce.
+   */
+  auditFloorHolds(trace);
+  auditDoubleCloses(trace);
+  if (idleWhileSpeaking) {
+    say(`!! FLOOR RELEASED EARLY on ${idleWhileSpeaking} turn(s) — worst had ${(worstIdleWhileSpeakingMs / 1000).toFixed(1)}s`);
+    say(`                 of the interviewer's voice still queued. The mic reopens and the`);
+    say(`                 interviewee is invited to talk over a question still being asked.`);
+    say(`                 This is the v5.34.101 defect; it is back. Do not ship.`);
+  } else if (floorHolds) {
+    say(`floor holds:     ${floorHolds} turn(s) correctly held until the audio drained`);
+  } else {
+    say(`floor holds:     none needed — no turn closed with audio still queued`);
+  }
+  if (doubleClosedTurns) {
+    say(`!! TURN CLOSED TWICE on ${doubleClosedTurns} turn(s) — usage is double-banked, the`);
+    say(`                 interviewer's words go into the transcript twice, and a second paid`);
+    say(`                 scoring call is spent on the same conversation. See v5.34.106.`);
+  } else if (lateClosesSuppressed) {
+    say(`late closes:     ${lateClosesSuppressed} late turnComplete(s) correctly ignored after a salvage`);
+    if (lateCloseGapsMs.length) {
+      const sorted = [...lateCloseGapsMs].sort((a, b) => a - b);
+      say(`                 gaps ${(sorted[0] / 1000).toFixed(1)}s..${(sorted[sorted.length - 1] / 1000).toFixed(1)}s` +
+          ` (LATE_TURN_COMPLETE_WINDOW_MS must stay clear of the top of this range)`);
+    }
+  } else if (OFFLINE_LATE_TURN_COMPLETE > 0) {
+    say(`!! --offline-late-turn-complete was set but no late close was ever suppressed —`);
+    say(`                 the salvage never fired, so this run tested nothing. The delay must`);
+    say(`                 exceed TURN_CLOSE_GRACE_MS (1200ms).`);
+  }
+  /*
+   * v5.34.106 — a mode that produced nothing tested nothing, and must say so
+   * rather than let a clean verdict be read as a pass.
+   */
+  if (OFFLINE_MUTE_REPLIES > 0) {
+    if (!muteRepliesSent) {
+      say(`!! --offline-mute-replies produced no mute replies — the run was too short to`);
+      say(`                 reach reply ${OFFLINE_MUTE_REPLIES}. Nothing was tested.`);
+    } else if (!muteRepliesDetected) {
+      /*
+       * Measured on the first run of this mode, 2026-09-14: 4 sent, 0
+       * detected, and no "MUTE TURN" line in the trace at all.
+       *
+       * The reason is structural, not a flag. v5.34.40 arms a MUTE_REPLY_MS
+       * (6000ms) timer on the first text of a silent turn. v5.34.75 then added
+       * the salvage, which closes a turn ~1200ms after generationComplete —
+       * and _closeTurn clears that timer. So on a production-shaped mute turn
+       * the detection can no longer fire: a feature made unreachable by a
+       * later change, which is the same shape as the v5.34.105 defect.
+       *
+       * Reported, not asserted as a failure: onReplyWithoutAudio also needs
+       * vyneLiveFlags({speakMuteReplies:true}), which is off by default, so
+       * today the only loss is a diagnostic. Turn it on and the recovery is
+       * gone too.
+       */
+      say(`mute replies:    ${muteRepliesSent} sent, 0 detected.`);
+      say(`                 MUTE_REPLY_MS is 6000ms and the salvage closes a silent turn in`);
+      say(`                 ~1200ms, clearing the timer — so v5.34.40's detection cannot fire`);
+      say(`                 on a production-shaped mute turn. Harmless while`);
+      say(`                 vyneLiveFlags({speakMuteReplies:true}) is off; it is the recovery`);
+      say(`                 that is lost when it is on.`);
+    } else {
+      say(`mute replies:    ${muteRepliesSent} sent, ${muteRepliesDetected} detected and handed to the page`);
+    }
+  }
+  if (OFFLINE_BARGE_IN > 0) {
+    if (!bargeInsSent) {
+      say(`!! --offline-barge-in produced no interruptions — nothing was tested.`);
+    } else {
+      /*
+       * The choke count is NOT a fault here: this rig injects the interrupt on
+       * a timer, so some land while its scripted interviewee happens to be
+       * silent. In a live run that number means echo cancellation is not
+       * holding; in this mode it means the timer fired between answers.
+       */
+      say(`barge-ins:       ${bargeInsSent} sent (injected on a timer, so the choke count below`);
+      say(`                 is not evidence of echo in this mode)`);
+      if (heldAfterFlush) {
+        say(`!! FLOOR HELD AFTER A BARGE-IN on ${heldAfterFlush} turn(s) — the audio was discarded`);
+        say(`                 and the interviewee was made to wait for it anyway. flush() must`);
+        say(`                 zero _lastEnd; see v5.34.101.`);
+      } else {
+        say(`                 floor released immediately on every flush, as it must be`);
+      }
+    }
+  }
   if (scoringDead) {
     say(`scoring declared DEAD: the stop path fired — check the transcript for the apology before the stop`);
+    if (scoreStubCalls) {
+      say(`                 !! and it fired against the STUB, which should not happen — the stub`);
+      say(`                    answers 200, so this is a real defect in the scoring-health logic.`);
+    }
   } else if (scoreErrors && scoreCalls) {
     say(`scoring recovered after ${scoreErrors} failure(s) — the stop path correctly did NOT fire`);
   }
@@ -1541,7 +2707,6 @@ function finish(why) {
     if (repeats > 2) {
       say(`!! ${turns.length} replies but only ${askedQuestions.length} distinct questions — the interviewer is repeating itself.`);
     }
-    say(`instruction at last mint: ${currentInstruction().length} chars (was ${SYSTEM_INSTRUCTION.length} at open)`);
   }
   /*
    * Three numbers that say whether the RIG behaved, so a reader never again has
@@ -1566,7 +2731,7 @@ function finish(why) {
     say(`   quality, repetition or coverage from it — after answer ${ANSWERS.length} the`);
     say(`   interviewer is responding to a loop, and any repetition is the rig's.`);
   }
-  say(`stall recoveries:${stallRecoveries === 0 ? " 0 (the conversation never stalled)" : ` ${stallRecoveries} !! the uplink went quiet and the watchdog restarted it`}`);
+  say(`stall recoveries:${stallRecoveries === 0 ? " 0 (the conversation never stalled)" : ` ${stallRecoveries} !! the uplink went quiet and the watchdog restarted it` + (suspensions.length ? ` (but this process was suspended for ${suspendedSec().toFixed(0)}s — attribute these to that first)` : "")}`);
   say(`salvaged turns:  ${(LI.session && LI.session._salvagedTurns) || 0}${(LI.session && LI.session._salvagedTurns) ? " !! generationComplete with no turnComplete — see TURN_CLOSE_GRACE_MS" : ""}`);
   if (OFFLINE_FAIL_MINTS) say(faultVerdict());
   if (lat.length) {
@@ -1574,7 +2739,12 @@ function finish(why) {
     say(`latency mean:    first half ${mean(lat.slice(0, half)).toFixed(1)}s → second half ${mean(lat.slice(half)).toFixed(1)}s`);
     say(`latency worst:   ${Math.max(...lat).toFixed(1)}s`);
   }
-  say(`first audio:     ${firstAudioAt === null ? "NEVER — the interviewer never spoke" : firstAudioAt.toFixed(1) + "s"}`);
+  say(`first audio:     ${firstAudioAt === null
+        ? "NEVER — the interviewer never spoke"
+        : (sessionUpAt === null
+            ? firstAudioAt.toFixed(1) + "s"
+            : `${(firstAudioAt - sessionUpAt).toFixed(1)}s after the session opened ` +
+              `(${firstAudioAt.toFixed(1)}s from start; the first ${sessionUpAt.toFixed(1)}s is TTS prep)`)}`);
   if (!turns.length && firstAudioAt === null) {
     say("!! nothing was heard at all. Before believing this is a product fault, check the trace");
     say("   for 'grant REFUSED', 'auth_tokens', or a rate-limit close — a broken harness and a");
@@ -1594,10 +2764,92 @@ function finish(why) {
     say("!! no handover happened in a run long enough to need one — the ten-minute path was NOT exercised.");
   } else if (renewals === 0 && MINUTES >= 12) {
     say(`(the ~10-minute handover was not reached: the run ended at ${ranMin.toFixed(1)} min. ` +
-        `Use --loop for a soak if that path is what you want to exercise.)`);
+        (LOOP
+          ? `It was a --loop soak, so the tape was not the limit: the INTERVIEWER closed. ` +
+            `Reaching the handover needs an interview that does not wrap up first.)`
+          : `Use --loop for a soak if that path is what you want to exercise.)`));
   }
+  /*
+   * v5.34.110 — outside the persona guard, so a run that used the harness stub
+   * still reports what it sent. A capture that only reports on the expensive
+   * runs is a capture nobody can check for free.
+   */
+  say(`instruction at last mint: ${currentInstruction().length} chars (was ${SYSTEM_INSTRUCTION.length} at open)`);
+  /*
+   * v5.34.111 — did the interview reach the size it was booked for?
+   *
+   * The v5.34.110 soak closed at 22 questions against a 40-50 question Deep
+   * Dive and nothing in the verdict said so, because nothing in the verdict
+   * knew what the booking was: the harness never sent one and neither did the
+   * product. Both do now, so the run can be judged against it rather than
+   * against an impression of how long it felt.
+   *
+   * Reported whether or not the interviewer closed, because a run that closes
+   * AT the target and a run that closes at half of it look identical in every
+   * other line of this verdict.
+   */
+  {
+    const lo = liveFixture && liveFixture.questionTargetLow;
+    const hi = liveFixture && liveFixture.questionTargetHigh;
+    const asked = askedQuestions.length;
+    if (lo && hi) {
+      const pct = Math.round((asked / lo) * 100);
+      say(`booked size: ${lo} to ${hi} questions — asked ${asked} (${pct}% of the lower bound)`);
+      if (asked < lo) {
+        say(`!! SHORT OF THE BOOKING by ${lo - asked} question(s). If the interviewer closed here,`);
+        say(`   it closed below the length the client was sold. Check whether the last`);
+        say(`   instruction actually carried the size and the outstanding ground:`);
+        say(`     grep -n 'booked as' ${OUT}.instruction-*.txt`);
+        say(`     grep -n 'Ground you do not have yet\\|there is more to get' ${OUT}.instruction-*.txt`);
+      }
+    } else {
+      say(`!! the harness sent NO booked size — this run cannot exercise the v5.34.111 close rules.`);
+    }
+    const lastMint = mintedInstructions.length ? mintedInstructions[mintedInstructions.length - 1] : "";
+    if (lastMint) {
+      say(`size in the last instruction: ${/booked as \d+ to \d+ questions/.test(lastMint) ? "YES" : "NO — the size did not survive to the last mint"}`);
+      say(`outstanding ground in the last instruction: ${/Ground you do not have yet|there is more to get|booked for/.test(lastMint) ? "YES" : "NO — the agenda ended with nothing owed"}`);
+      say(`elapsed clock in the last instruction: ${/minutes? into this interview|start of this interview/.test(lastMint) ? "YES" : "NO"}`);
+    }
+  }
+  if (mintedInstructions.length) {
+  const last = mintedInstructions[mintedInstructions.length - 1];
+  const REQUIRED_HEADING = "must be asked before the interview ends";
+  const told = last.includes(REQUIRED_HEADING);
+    say(`instruction written to: ${OUT}.instruction-NN.txt  (${mintedInstructions.length} mint(s), verbatim)`);
+    if (!told) {
+    say(`!! the LAST instruction carried NO required-question list. If the interviewer`);
+    say(`   closed with required questions outstanding, it closed on what it was told —`);
+    say(`   the fault is in assembling the context, not in the interviewer.`);
+      } else {
+    say(`required questions WERE in the last instruction — if it still closed with them`);
+    say(`   outstanding, that is the interviewer overriding a direct instruction.`);
+    }
+  const askedBlock = /Questions you have ALREADY asked[\s\S]*?(?:\n\n|$)/.exec(last);
+    if (askedBlock) {
+    const n = (askedBlock[0].match(/^\d+\. /gm) || []).length;
+    say(`already-asked context: ${n} question(s), ${askedBlock[0].length} chars of the instruction`);
+    }
+  }
+
   say("Listen to the WAV. The things to judge by ear: does the voice stop and start mid-sentence,");
   say("is there a long hole after each handover, and does it still answer after minute ten.");
+  /*
+   * Last, so the archived .txt contains the whole verdict including the lines
+   * above. The WAV is deliberately NOT copied — it is tens of megabytes per
+   * run and the diagnosis always happens in the trace; the WAV stays at its
+   * usual path for listening to, and is the one artefact the next run still
+   * overwrites.
+   */
+  if (ARCHIVE_DIR) {
+    try {
+      copyFileSync(OUT_LOG, join(ARCHIVE_DIR, "trace.log"));
+      copyFileSync(OUT_TXT, join(ARCHIVE_DIR, "verdict.txt"));
+      say(`kept for later:  ${ARCHIVE_DIR}/  (trace.log, verdict.txt — the next run will not overwrite these)`);
+    } catch (e) {
+      say(`!! could not archive this run's trace (${e && e.message}) — copy ${OUT_LOG} by hand before the next run`);
+    }
+  }
   say("─────────────────────────────────────────────────────────────────────────");
   process.exit(0);
 }
@@ -1675,6 +2927,17 @@ LI.start().then(() => {
     LI._openingSent = sent;
     say(`opening sent through open(): ${sent}`);
   }
+  sessionUpAt = now();
+  /*
+   * v5.34.114: the stall window starts when the INTERVIEW does.
+   *
+   * Synthesising the 22 answers took 480 seconds on the 2026-09-15 run, and
+   * the watchdog's very first act once the session opened was to report
+   * "nothing has happened for 480s" — it had been timing the text-to-speech.
+   * One of the 18 stall recoveries on that verdict was this.
+   */
+  lastCueAt = Date.now();
+  noteActivity();
   say("live session up — waiting for the interviewer to speak");
   setTimeout(() => {
     if (firstAudioAt === null) say("!! 45s and still no audio — see the trace; this is the warmup-window failure if the nudge was dropped");
@@ -1684,4 +2947,31 @@ LI.start().then(() => {
   finish("start failed");
 });
 
+/*
+ * ── ONE clock for the run. (v5.34.114) ──────────────────────────────────────
+ *
+ * This line executes AFTER the interviewee's answers have been synthesised, so
+ * the run gets its full MINUTES of interview. `nextAnswer()` measured its own
+ * budget as `Date.now() - t0`, and t0 is set when the PROCESS starts — before
+ * that synthesis. Two clocks for one deadline, differing by however long the
+ * TTS took.
+ *
+ * Measured on the 22-minute live run of 2026-09-15, the first with the new
+ * 22-answer tape, so every answer had to be generated:
+ *
+ *     479.9s  session opens (8 minutes of TTS before it)
+ *    1314.3s  reply 27 — the LAST reply
+ *    1320.0s  t0 + 22 minutes: nextAnswer() starts returning immediately
+ *    1573.6s  handover #2, into a conversation that had nothing to say
+ *    1804.4s  finish, at the real 22-minute mark
+ *
+ * The interviewee went mute 14 minutes into a 22-minute interview and the run
+ * carried on for another eight. The product noticed and said so, 21 times over
+ * — "mic uplink SILENT for 15s while unmuted — frames flow but carry no audio;
+ * the model cannot hear" — and it read in the verdict as 18 stall recoveries
+ * and a dead interview. None of it was the product.
+ *
+ * So the deadline is a value, set once, read by both.
+ */
+RUN_DEADLINE_AT = Date.now() + MINUTES * 60000;
 setTimeout(() => finish(`reached the ${MINUTES}-minute limit`), MINUTES * 60000 + 5000);

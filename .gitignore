@@ -11,3 +11,23 @@ dist/
 coverage/
 .vscode/
 .idea/
+
+# v5.34.103: per-run voice-harness evidence (traces and verdicts). Kept on the
+# machine that ran them, never committed.
+voice-runs/
+
+# v5.34.132: client data and recordings never reach source control.
+# Repair backups hold client interviews verbatim; the full repair migrations are
+# archived beside them after they run, and a stub is committed in their place
+# (see 038, and migrationsCarryNoInterviewContent.test.ts).
+dedupe-backup-*.json
+confirm-after-*.json
+backend/repair-archive/
+# Voice-harness recordings and scratch output at the repo root. voice-record.wav
+# alone is 170 MB — over GitHub's 100 MB per-file limit, so it would fail the push.
+/voice-answers/
+/voice-*.wav
+/voice-*.txt
+/voice-*.log
+# A stray nested copy left by unzipping a release from inside backend/.
+/backend/vyne-saas/

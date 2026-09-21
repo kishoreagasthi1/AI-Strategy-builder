@@ -17,6 +17,67 @@ function toParts(content: LlmMessage["content"]): GeminiPart[] {
   });
 }
 
+/**
+ * ── v5.34.102: maxTokens means two different things on the two sides ────────
+ *
+ * Every caller in this codebase sets maxTokens as "how long an ANSWER do I
+ * need" — 400 for a field summary, 900 for a seven-number scorecard, 8000 for
+ * a strategy deck. On Gemini's thinking models `maxOutputTokens` is not that:
+ * it is the budget for the reasoning AND the reply together, and the reasoning
+ * is spent first.
+ *
+ * Measured against production on 2026-09-14, task interview_score,
+ * gemini-3.6-flash, the same prompt twice:
+ *
+ *   maxTokens  900 -> tokensOut  35, finishReason "length"  (truncated JSON)
+ *   maxTokens 4000 -> tokensOut 159, finishReason "stop"    (correct answer)
+ *
+ * Thirty-five visible tokens out of nine hundred: roughly 865 went on
+ * thinking. Under the old translation, every caller asking for a tight answer
+ * was quietly asking the model to think in the same breath, and the ones with
+ * small budgets got a sentence and a half.
+ *
+ * Where this actually bit: exactly one caller. vyne-client.js floors every
+ * budget that passes through vyneLLM at 8192 (16384 for synthesis) and has
+ * since v5.32.23, for this very reason — so the 400s and 900s at the module
+ * call sites are inert and were never at risk. The scoring pass in
+ * vyne-live-interview.js is the only code in the product that calls
+ * /api/llm/generate raw, and it sent its 900 through unfloored.
+ *
+ * That makes this a defence, not the fix for a widespread fault, and it is
+ * worth being clear about which. The narrow fix is the caller's own budget.
+ * This exists so that the NEXT raw caller — and the browser floor shows that
+ * a raw caller is exactly what gets written eventually — cannot reintroduce
+ * it silently. A difference between what the caller means and what the
+ * provider's field means belongs in the translation layer, which is the only
+ * place that sees both sides.
+ *
+ * The thinking is deliberately NOT disabled. thinkingConfig: { thinkingBudget:
+ * 0 } would also stop the truncation and would cost output quality on every
+ * hypothesis, sequencing and design call in the product. The reserve buys the
+ * room instead of taking it away.
+ *
+ * It costs nothing when unused: maxOutputTokens is a ceiling, and billing
+ * follows tokens actually produced. GEMINI_THINKING_RESERVE overrides it if a
+ * future model needs more (or none).
+ */
+const THINKING_RESERVE_DEFAULT = 4000;
+/** Gemini rejects an out-of-range maxOutputTokens outright, so the sum is capped. */
+const MAX_OUTPUT_CEILING = 64_000;
+
+export function geminiThinkingReserve(): number {
+  const raw = process.env.GEMINI_THINKING_RESERVE;
+  if (raw === undefined || raw === "") return THINKING_RESERVE_DEFAULT;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 0) {
+    console.warn(
+      `[geminiShared] GEMINI_THINKING_RESERVE="${raw}" ignored — must be a non-negative integer`,
+    );
+    return THINKING_RESERVE_DEFAULT;
+  }
+  return n;
+}
+
 export function buildGeminiBody(req: GenerateRequest): Record<string, unknown> {
   const system = req.messages
     .filter((m) => m.role === "system")
@@ -30,7 +91,11 @@ export function buildGeminiBody(req: GenerateRequest): Record<string, unknown> {
     contents,
     ...(system ? { systemInstruction: { parts: [{ text: system }] } } : {}),
     generationConfig: {
-      maxOutputTokens: req.maxTokens ?? 4096,
+      // The caller's answer budget PLUS room to think. See the note above.
+      maxOutputTokens: Math.min(
+        (req.maxTokens ?? 4096) + geminiThinkingReserve(),
+        MAX_OUTPUT_CEILING,
+      ),
       temperature: req.temperature ?? 0.7,
       ...(req.jsonSchema
         ? { responseMimeType: "application/json", responseSchema: req.jsonSchema }

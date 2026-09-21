@@ -264,6 +264,83 @@
   }
 
   /** Transcripts stream in fragments; join them into whole turns. */
+  /*
+   * ── v5.34.121: the product now notices when the interviewer says goodbye. ──
+   *
+   * Reported from the 2026-09-18 resumed interview. Jack said "We've covered a
+   * lot of ground today... Thank you so much for your time, Avery." and NOTHING
+   * happened: the clock kept running, the interviewee was not moved on, the
+   * microphone stayed hot and the session stayed live. Then the ~10-minute
+   * goAway arrived, the handover fired, and its recovery nudge was appended to
+   * the closing line —
+   *
+   *   "...Thank you so much for your time, Avery.I'm sorry, I missed that last
+   *    part, could you tell me one more time?"
+   *
+   * — which is the interviewer asking a person who has already been thanked and
+   * dismissed to repeat themselves. The same cause explains "it started
+   * speaking to me after some time the screen was open".
+   *
+   * Grepping the page for every spelling of this — onClosed, closingDetected,
+   * interviewClosed, farewell, goodbye — returns nothing. The detection was
+   * never built. The HARNESS has had one since v5.34.77 and has twice been
+   * corrected by real transcripts; the product it tests never got it.
+   *
+   * ── The regex is DUPLICATED from deploy/voice-record.mjs, deliberately ─────
+   *
+   * Same call as GOAWAY_HANDOVER_COST_MS: the rig is a node script and this is
+   * a browser file, and a shared module for one regex is not worth a build step
+   * here. A constant copied into two files is this project's most reliable
+   * source of defects, so parity is asserted by
+   * theInterviewerCanFinish.test.ts rather than left to discipline.
+   *
+   * Both of the rig's hard-won lessons come with it:
+   *
+   *   · "thanks for taking the time" is ALSO a greeting. A 2026-09-14 run ended
+   *     at eleven seconds on the opening line. Tightening the pattern is the
+   *     wrong fix — every closing wording appears in pleasantries — so the
+   *     guard is STRUCTURAL: three completed exchanges before any closing
+   *     language is believed. The shortest genuine close observed ran nine.
+   *
+   *   · "Thanks AGAIN for your time" defeated a contiguous pattern, so the
+   *     phrase allows up to 40 intervening characters.
+   */
+  var CLOSING_RE = new RegExp([
+    '(thanks|thank you)[^.?!]{0,40}\\b(your time|taking the time)\\b',
+    'that concludes|concludes our interview',
+    'covered everything (i|we)(\'ve| have)? ?(came|come) for',
+    'appreciate[^.?!]{0,25}\\b(your time|taking the time)\\b',
+  ].join('|'));
+  var MIN_TURNS_BEFORE_CLOSE = Number(window.VYNE_MIN_TURNS_BEFORE_CLOSE) || 3;
+
+  /**
+   * Fires opts.onInterviewClosed(text) at most once per interview.
+   *
+   * Counts the interviewee's completed turns rather than all turns: the
+   * interviewer's own greeting and its follow-up are one-sided, and it is
+   * answered exchanges that distinguish a conversation from an opening.
+   */
+  LiveInterview.prototype._checkInterviewerClosed = function () {
+    if (this._closedByAgent || this.stopped) return;
+    var last = this.turns[this.turns.length - 1];
+    if (!last || last.who !== 'VYNE' || !last.text) return;
+    var text = String(last.text);
+    if (!CLOSING_RE.test(text.toLowerCase())) return;
+    var answered = 0;
+    for (var i = 0; i < this.turns.length; i++) if (this.turns[i].who === 'You') answered++;
+    if (answered < MIN_TURNS_BEFORE_CLOSE) {
+      if (!this._closeIgnored) {
+        this._closeIgnored = true;
+        vlog('LiveInterview: closing language after only ' + answered + ' answered turn(s) — ' +
+             'an interview cannot close before it starts, so this is a greeting', { text: text.slice(0, 120) });
+      }
+      return;
+    }
+    this._closedByAgent = true;
+    vlog('LiveInterview: the interviewer has closed the interview', { answeredTurns: answered, text: text.slice(0, 160) });
+    if (this.opts.onInterviewClosed) { try { this.opts.onInterviewClosed(text); } catch (e) {} }
+  };
+
   LiveInterview.prototype._flushPending = function () {
     if (this.pendingUser.trim()) {
       this.turns.push({ who: 'You', text: this.pendingUser.trim() });
@@ -311,7 +388,47 @@
         task: 'interview_score',
         module: 'interview_agent',
         clientName: self.opts.clientName || undefined,
-        maxTokens: 900,
+        /*
+         * ── v5.34.102: 900 was a budget for the ANSWER, and the model spends
+         *    it on THINKING ───────────────────────────────────────────────────
+         *
+         * Measured against production on 2026-09-14, same prompt, twice:
+         *
+         *   maxTokens 900  -> tokensOut  35, finishReason "length", 60 chars,
+         *                     cut at {"scores":{"D1":2,"D2":0,"D3":
+         *   maxTokens 4000 -> tokensOut 159, finishReason "stop",  parses,
+         *                     D1=2 D6=1 — the right answer for the transcript
+         *
+         * Thirty-five visible tokens out of a 900 budget, and still "length":
+         * gemini-3.6-flash is a thinking model and maxOutputTokens covers the
+         * reasoning as well as the reply, so roughly 865 tokens went on
+         * thinking and the JSON was guillotined mid-value. vyneParseJson is
+         * right to refuse it — a flat object cut before any complete pair has
+         * nothing to salvage — so EVERY pass failed, and three consecutive
+         * failures is what declares scoring dead and stops the interview.
+         *
+         * Found by calling /api/llm/generate directly from a signed-in browser
+         * against production — NOT from the voice harness. The harness's own
+         * "scoring passes: 0 succeeded, 3 failed" on 2026-09-14 was a rig
+         * fault: before v5.34.100 it answered that endpoint with a 404, and
+         * the page dutifully counted three failures. Two separate problems
+         * that looked identical in the output. The truncation below is the
+         * real one; it is reproducible on demand and has nothing to do with
+         * the harness.
+         *
+         * 4000 is a CEILING, not a spend: only tokens actually produced are
+         * billed, and the measured answer is ~160. The headroom is for the
+         * thinking, which grows with the transcript.
+         *
+         * v5.34.103 — this number is back to an ANSWER budget, which is what
+         * every call site in the product means by maxTokens. The thinking room
+         * is now added once, in buildGeminiBody, because the mismatch was
+         * between what the caller means and what Gemini's maxOutputTokens
+         * means, and the translation layer is the only place that sees both.
+         * 1200 is the measured answer (~160 tokens) with room for a long
+         * finding; the reserve covers the rest.
+         */
+        maxTokens: 1200,
         temperature: 0,
         messages: [{ role: 'user', content: scorePrompt(self.opts.state || {}, text) }]
       })
@@ -544,6 +661,17 @@
     if (DELIBERATE.indexOf(r) !== -1) return false;
     return r === 'max_duration' || r.indexOf('closed:') === 0 ||
            r === 'socket_closed' || r === 'error' || r === 'goaway' ||
+           /*
+            * v5.34.112 — the page was suspended, so the socket is stale.
+            *
+            * Raised by vyne-live.js's wall-clock heartbeat the moment this page
+            * starts running again. It is the SAME condition v5.34.44 describes
+            * below ("the laptop slept at minute five, and on waking the socket
+            * was long dead"), caught at the wake instead of whenever the dead
+            * socket gets round to admitting it — which is where the 20.3-second
+            * hole on the 2026-09-15 run came from.
+            */
+           r === 'live_suspended' ||
            // v5.34.42: a resumed session that never spoke — reconnect WITHOUT
            // the handle rather than leave the interviewee in silence.
            r === 'renew_silent_retry' ||
@@ -620,6 +748,31 @@
       agenda: this.opts.agenda || undefined,
       mandatoryCount: this.opts.mandatoryCount !== undefined ? this.opts.mandatoryCount : undefined,
       askedCount: this.opts.askedCount !== undefined ? this.opts.askedCount : undefined,
+      /*
+       * v5.34.111 — the interview's booked size, and the clock.
+       *
+       * Same forwarding rule as the three above, and personaInputsReachTheWire
+       * .test.ts now reads the field list off InterviewerContext itself, so a
+       * field added to the persona fails this layer the day it appears. That
+       * test is what caught these three the moment they were declared.
+       */
+      questionTargetLow: this.opts.questionTargetLow !== undefined ? this.opts.questionTargetLow : undefined,
+      questionTargetHigh: this.opts.questionTargetHigh !== undefined ? this.opts.questionTargetHigh : undefined,
+      /*
+       * The clock comes from HERE, not from the page, because this object
+       * already owns it: _startedAt is when the INTERVIEW began rather than
+       * when this connection did, so elapsedMinutes() is continuous across
+       * handovers. A function, so vyne-live.js resolves it at each mint — a
+       * frozen value would tell a session opening at minute twenty-five that
+       * it was minute zero, which is precisely the state the v5.34.79 context
+       * bug put the model in.
+       *
+       * Note this is NOT plannedMinutes. That one is still dormant (see
+       * _armWrapUp): the product records no booked DURATION anywhere. It does
+       * record a booked SIZE — the consultant's depth choice — which is what
+       * questionTargetLow/High above carry.
+       */
+      elapsedMin: function () { try { return self.elapsedMinutes(); } catch (e) { return undefined; } },
       // v5.34.29: the previous connection's resumption handle, if it gave one.
       resumeHandle: this._resumeHandle || undefined,
       onResumeHandle: function (h) { if (h) self._resumeHandle = h; },
@@ -655,6 +808,46 @@
         if (self.opts.onQuotaExhausted) { try { self.opts.onQuotaExhausted({ reason: reason }); } catch (e) {} }
       },
       onGoAway: function (timeLeftMs) {
+        /*
+         * ── v5.34.118: a goAway ON TOP of an unanswered turn is the answer. ──
+         *
+         * Two live traces, on two different builds, show the same ten
+         * milliseconds:
+         *
+         *   v5.34.116   +549693  USER TURN #9 transcribed
+         *               +549704  goAway            (11ms later)
+         *               ...      no model frame for 20 seconds
+         *
+         *   v5.34.117   +788650  USER TURN #13 transcribed
+         *               +788660  goAway            (10ms later)
+         *               ...      no model frame at all; we handed over
+         *
+         * In both, the interviewee's answer was transcribed — so the socket was
+         * healthy and the server was listening — and in both, a goAway landed a
+         * hair later and the turn was never answered. The server accepts the
+         * audio, transcribes it, and declines to generate, because it is
+         * draining the connection.
+         *
+         * v5.34.117 waits GOAWAY_STALL_MS (5s) to be SURE the model is not
+         * merely slow. That five seconds is the dominant term in the 7.3-second
+         * silence measured at minute nine of the 2026-09-16 interview: the
+         * handover machinery itself costs 1.6s. It is a margin against a
+         * possibility the server has already ruled out for us.
+         *
+         * So when a goAway arrives while a transcribed turn is outstanding, the
+         * wait drops to GOAWAY_STALL_CONFIRMED_MS. Not zero — see that
+         * constant — but near enough that the pause reads as a pause.
+         *
+         * Recorded against the TURN, not as a bare flag: a goAway that arrived
+         * before this turn began says nothing about whether this turn will be
+         * answered, and a flag would carry that stale claim forward.
+         */
+        var s = self.session;
+        if (s && s._awaitingReply && s._userTurnStartedAt) {
+          self._goAwayDuringTurn = s._userTurnStartedAt;
+          vlog('LiveInterview: that goAway landed on a turn this connection has not answered', {
+            unansweredMs: Date.now() - s._userTurnStartedAt });
+        }
         vlog('LiveInterview: goAway received', { timeLeftMs: timeLeftMs, idle: self._turnState !== 'speaking' && self._turnState !== 'thinking' });
         self._goAwayPending = true;
         self._maybeRenewOnGoAway();
@@ -699,6 +892,10 @@
       onTurnComplete: function () {
         self._flushPending();
         if (self.opts.onTurns) { try { self.opts.onTurns(self.turns.slice()); } catch (e) {} }
+        /* v5.34.121 — after _flushPending, so the closing line is in turns[],
+         * and before _score, so the page can stop the room while the scoring
+         * of that last exchange is still allowed to finish. */
+        self._checkInterviewerClosed();
         self._score();
       },
       onInterrupted: function () {
@@ -977,7 +1174,103 @@
              * plainly that this wording should not change without one, and that
              * remains true of this version too — see NEXT_SESSION_SPEC.md.
              */
-            self.open(resumed
+            /*
+             * v5.34.112 — WHEN WE TOOK WORDS OFF THEM, SAY SO.
+             *
+             * Reported from the 2026-09-15 live interview: at the handover the
+             * interviewee spoke for about fifteen seconds, none of it arrived,
+             * and the interviewer came back asking for the answer as though
+             * nothing had been said — opening with "I am still here".
+             *
+             * That line is not a model quirk. It is this instruction: "Say in
+             * one short sentence that you are still there." We scripted it, for
+             * the case where the handover lands in a genuine gap and the
+             * interviewee is waiting — where it is the right thing to say.
+             *
+             * It is the wrong thing to say when we have just cut someone off
+             * mid-answer. To them, they spoke for fifteen seconds and the agent
+             * announced its own presence and re-asked the question: that reads
+             * as not being listened to, which is the one thing this persona is
+             * built to avoid. _cutOffInterviewee (set at the teardown) tells
+             * the two cases apart, so the interviewer can do what a person
+             * would — admit it missed the answer and ask for it again.
+             *
+             * Deliberately still naming ACTIONS rather than saying "please
+             * continue": that is the v5.34.43 lesson, where an open-ended nudge
+             * was echoed back verbatim eighteen times in ninety minutes.
+             */
+            /*
+             * v5.34.117 — the stalled-connection branch, first.
+             *
+             * Named as an ACTION with an explicit prohibition on the two wrong
+             * moves, for the v5.34.43 reason: an open-ended "carry on" was
+             * echoed back verbatim eighteen times in ninety minutes.
+             *
+             * "already in the conversation you can see" is load-bearing. The
+             * answer reaches the new session through buildLiveContext whether
+             * or not Google's resume handle survived, so the model is being
+             * pointed at something that is actually in front of it.
+             */
+            /*
+             * ── v5.34.119: the nudge that made it read the transcript out. ───
+             *
+             * The v5.34.117 wording was:
+             *
+             *   "they have already given you a full answer to your last
+             *    question and IT IS THERE IN THE CONVERSATION YOU CAN SEE, but
+             *    a connection problem meant you did not respond to it. RESPOND
+             *    TO THAT ANSWER NOW, DIRECTLY, as though you had just heard it."
+             *
+             * Reported from the 2026-09-17 live interview, at the 9-minute
+             * handover — the first thing the fresh session said:
+             *
+             *   Avery:  "...there is a committee that sits and discusses this
+             *           for initiatives that especially touch customers and
+             *           employees. We we definitely take a serious look at
+             *           that. I forget what the second part of your question
+             *           was."
+             *   Jack:  "Yeah, when it comes to the responsible A I, there is a
+             *           committee that sits and discusses this for initiatives
+             *           that especially touch customers and employees. We we
+             *           definitely take a serious look at that. I forget what
+             *           the second part of your question was. When you're
+             *           linking all those systems, does your technology stack
+             *           make that easy...?"
+             *
+             * Word for word, including "I forget what the second part of your
+             * question was" — his sentence, read back to him — and then the
+             * missing half of its own question appended.
+             *
+             * That is not the mirroring habit the persona now forbids. It is
+             * this instruction, obeyed: I pointed the model at a transcript and
+             * told it to respond to what was in it, and it read the entry out.
+             * The give-away is the trailing-off clause: mirroring paraphrases,
+             * reading recites, and no one paraphrases "I forget what the second
+             * part of your question was".
+             *
+             * So the nudge must name the action WITHOUT naming the transcript.
+             * The answer is already in context and needs no pointing at; what
+             * was missing was what to DO, and "respond to that answer" turned
+             * out to have a worse reading than the one intended.
+             *
+             * v5.34.117's actual requirement survives intact: do not make them
+             * repeat a long answer we hold in full. "Take it as heard and carry
+             * on" achieves that without inviting a recitation.
+             */
+            self.open(self._replyStalled
+              ? 'Just for this one turn: a connection problem meant you never responded to the last thing '
+                + 'they said. Take it as heard and carry straight on — ask your next question, or a '
+                + 'follow-up on what they said if there is one worth asking. Do not read their answer back '
+                + 'to them, do not summarise it, do not repeat any of their words, do not apologise, do not '
+                + 'ask them to repeat anything, do not say you missed it, do not greet them again, do not '
+                + 'say you are still there, and do not mention the connection — now or in any later turn.'
+              : self._cutOffInterviewee
+              ? 'Just for this one turn: the connection dropped for a couple of seconds while they were '
+                + 'speaking, so you did not hear the last thing they said. Apologise briefly in one short '
+                + 'sentence, say you missed that last part, and ask them to say it again. Do not greet them '
+                + 'again, do not say you are still there, and do not explain the connection. From your next '
+                + 'turn onwards carry on as normal and never mention this again.'
+              : resumed
               ? 'Just for this one turn: our connection was briefly renewed and you still have the whole '
                 + 'conversation. Say in one short sentence that you are still there, then either wait for the '
                 + 'rest of my answer or, if I had not started answering, ask your last question once more. '
@@ -986,6 +1279,8 @@
               : 'Just for this one turn: the connection was renewed mid-interview. Continue exactly where you '
                 + 'left off with your next question — do not greet them again and do not mention the '
                 + 'interruption, now or later.');
+            self._cutOffInterviewee = false;
+            self._replyStalled = false;
             self._watchRenewedSilence();
           };
           var onRenewalFail = function (e) {
@@ -1095,6 +1390,10 @@
         vlog('LiveInterview: clearing the previous connection\'s goAway — it does not apply to this one');
         self._goAwayPending = false;
       }
+      /* v5.34.118: and the turn that goAway landed on belonged to that socket
+       * too. Left set, it would compare against a fresh session's turn clock
+       * and could shorten the wait on a turn no goAway has touched. */
+      self._goAwayDuringTurn = null;
       /* v5.34.33: remember this grant's sessionId so the NEXT connection can
        * identify itself as its continuation (see _sessionOpts.renewalOf). */
       if (s && s.grant && s.grant.sessionId) self._lastSessionId = s.grant.sessionId;
@@ -1376,26 +1675,325 @@
    *  and only while the interviewee is not mid-sentence (v5.34.31): the
    *  ~1.5 s of handover has no socket, so anything said then is lost, and a
    *  half-heard answer is exactly the "went a bit silent" that follows. */
-  LiveInterview.prototype._maybeRenewOnGoAway = function () {
+  /*
+   * ── How long a gap is a real gap? (v5.34.112) ───────────────────────────────
+   *
+   * Reported from a 12-minute live interview on v5.34.111: at about minute
+   * nine the interviewee spoke for roughly fifteen seconds, the interviewer did
+   * not hear any of it, and came back asking for the answer as though nothing
+   * had been said.
+   *
+   * Minute nine is the handover. The guard below already defers a handover
+   * while the interviewee is speaking — and then settles for the first 1500ms
+   * of quiet it sees. Fifteen hundred milliseconds is well inside how long a
+   * senior executive pauses in the middle of composing an answer. So the pause
+   * for thought reads as the end of the turn, the handover starts, and
+   * everything said during the teardown and reconnect goes into a socket that
+   * is being thrown away.
+   *
+   * The two numbers that produced this were set independently and never
+   * related to each other: Google's goAway gives FIFTY SECONDS of notice
+   * (measured, "timeLeft":"50s"), and we were spending 1.5 of them. There is
+   * room to wait for a gap that actually means something.
+   *
+   * So the requirement starts high and relaxes as the deadline approaches —
+   * hold out for a real turn boundary while there is time, accept a short
+   * pause when there is not, and go anyway rather than let the server cut us,
+   * because a server-cut handover is worse than an awkward one.
+   */
+  /*
+   * What a graceful handover costs in socket time.
+   *
+   * DUPLICATED from vyne-live.js, which declares it inside its own IIFE and so
+   * cannot be read from here. Duplicated deliberately rather than exported: a
+   * global would be reachable from the interviewee's page, and this number is
+   * only ever compared against a deadline the server set. goAwayHandoverCost
+   * parity is asserted by handoverWaitsForAGap.test.ts, because a constant
+   * copied into two files is this project's most reliable source of defects.
+   */
+  var GOAWAY_HANDOVER_COST_MS = 1500;
+  var GOAWAY_QUIET_IDEAL_MS = Number(window.VYNE_GOAWAY_QUIET_IDEAL_MS) || 4000;
+  var GOAWAY_QUIET_MIN_MS = Number(window.VYNE_GOAWAY_QUIET_MIN_MS) || 1500;
+  /* Below this much headroom, stop being fussy about the gap. */
+  var GOAWAY_RELAX_BELOW_MS = 12000;
+  /* Loud within this long before the teardown means we cut them off. */
+  var CUTOFF_WINDOW_MS = 2500;
+  /*
+   * ── v5.34.117: a dying connection that stops answering. ─────────────────────
+   *
+   * Reported from a live interview on v5.34.116, and read off the trace the
+   * 🩺 button produced:
+   *
+   *   +547254  goAway (server will close this connection)
+   *   +547255  handover deferred — they are mid-answer; waiting for the next
+   *            turn boundary
+   *   +549160  mic: utterance ends (~38.7s of speech)
+   *   +549693  USER TURN #9 — model transcribed the interviewee
+   *   +561694  !!! NO MODEL ACTIVITY 12s after the interviewee was transcribed
+   *   +569820  model ACTIVITY on user turn #9 (20127ms after transcript began)
+   *   +571855  renewing ahead of goAway at a turn boundary
+   *   +574003  *** FIRST AUDIO FRAME — the agent is speaking ***
+   *
+   * Twenty-five seconds of total silence, and the interviewee had to ask
+   * whether anyone was there. Every other reply in that session started inside
+   * 650ms; the connection had already announced its own death and then simply
+   * stopped generating. It kept transcribing — so the answer was never lost —
+   * but it produced no model frame for twenty seconds.
+   *
+   * Two rules, both correct, met here for the first time:
+   *
+   *   "never hand over while the model is thinking or speaking"
+   *        — protects a reply that is in flight.
+   *   "mid-answer with time in hand: WAIT for the turn boundary" (v5.34.115)
+   *        — protects the interviewee's answer, and was working exactly as
+   *          designed; the deferral at +547255 is the right call.
+   *
+   * Their conjunction is an unbounded wait on a socket that is not coming
+   * back. Nothing in either rule notices that the thing being waited for has
+   * stopped happening. Worse, the thinking gate sat ABOVE the mustGoNow
+   * branch, so even the server's own 50-second deadline could not break it:
+   * had the interviewee stayed quiet, this would have run to the server cut at
+   * ~47s rather than 25.
+   *
+   * The signal needed already existed and was only ever written to the log:
+   * vyne-live.js arms a watchdog on every transcribed user turn and fires
+   * `NO MODEL ACTIVITY 12s` when nothing answers it. That is this defect,
+   * detected, twelve seconds in, and thrown away.
+   *
+   * So: when a goAway is pending and a transcribed turn has gone unanswered
+   * for GOAWAY_STALL_MS, treat the connection as finished and hand over.
+   *
+   * This is the CHEAPEST moment in the whole turn to do it, which is what
+   * makes the fix safe rather than a trade:
+   *   - the interviewee has stopped speaking (that is why we are waiting at
+   *     all), so nothing of theirs is lost to the teardown;
+   *   - their answer is already transcribed and travels to the new session
+   *     through buildLiveContext, so nothing has to be repeated.
+   * Both of the things a handover normally costs are already paid.
+   *
+   * Five seconds, against a measured worst-case healthy latency of 650ms and
+   * the 12s watchdog that named the problem. Deliberately well below the
+   * watchdog: by the time that line prints, the interviewee is already
+   * wondering if the line is dead.
+   */
+  var GOAWAY_STALL_MS = Number(window.VYNE_GOAWAY_STALL_MS) || 5000;
+  /*
+   * ── v5.34.118: the same stall, once the server has confirmed it. ───────────
+   *
+   * See onGoAway for the evidence. When a goAway lands on a turn that is
+   * already transcribed and unanswered, the server has told us twice, and
+   * waiting the full five seconds only adds five seconds of silence to a
+   * conclusion already reached.
+   *
+   * One second rather than zero, for one reason: `_awaitingReply` clears on the
+   * FIRST model frame of any kind, so this window only ever covers "heard it,
+   * produced literally nothing". A reply that has begun is never at risk. The
+   * second is there for a reply that is about to begin — measured healthy
+   * latency on the 2026-09-16 interview was 5, 8, 8, 14, 16, 19 and 599ms, so
+   * one second clears the worst of them by 400ms and the typical one by
+   * fiftyfold. Below about 700ms this would start racing real replies; there is
+   * no case for shaving it further.
+   *
+   * Expected effect at minute nine: 7.3s of silence becomes about 3.3s, of
+   * which 1.6s is the mint-and-reconnect that no threshold can remove.
+   */
+  var GOAWAY_STALL_CONFIRMED_MS = Number(window.VYNE_GOAWAY_STALL_CONFIRMED_MS) || 1000;
+
+  /*
+   * Re-check every 300ms for as long as the handover is deferred.
+   *
+   * Armed on EVERY deferral path, including the model-is-thinking gate. That
+   * gate used to return without arming anything and relied on onTurnState
+   * delivering 'idle' later — which is precisely what a stalled connection
+   * never does, so the stall escape below would have had nothing to call it.
+   */
+  LiveInterview.prototype._armGoAwayPoll = function () {
     var self = this;
+    if (this._goAwayPoll) return;
+    this._goAwayPoll = setInterval(function () {
+      if (!self._goAwayPending || self.stopped) { clearInterval(self._goAwayPoll); self._goAwayPoll = null; return; }
+      self._maybeRenewOnGoAway();
+    }, 300);
+  };
+
+  LiveInterview.prototype._maybeRenewOnGoAway = function () {
     if (!this._goAwayPending || this.stopped || this._muted) return;
-    if (this._turnState === 'speaking' || this._turnState === 'thinking') return;
     if (!this.session || this.session.closed) return;
     var s = this.session;
     var quietMs = s._micLastLoudAt ? Date.now() - s._micLastLoudAt : Infinity;
-    if (s._micInUtterance || quietMs < 1500) {
+    /*
+     * Headroom to the server's own cut, less what a graceful handover costs.
+     * No deadline recorded (an older server, or a renewal not driven by
+     * goAway) means no budget to spend, so keep the original behaviour.
+     */
+    var headroomMs = s._goAwayDeadlineAt
+      ? s._goAwayDeadlineAt - Date.now() - GOAWAY_HANDOVER_COST_MS
+      : 0;
+    var wantQuietMs = headroomMs > GOAWAY_RELAX_BELOW_MS
+      ? GOAWAY_QUIET_IDEAL_MS : GOAWAY_QUIET_MIN_MS;
+    /*
+     * The deadline overrides everything, INCLUDING an interviewee who is
+     * audibly mid-sentence. Expressed as its own flag rather than by zeroing
+     * the threshold: the first cut of this set wantQuietMs = 0 and left the
+     * `_micInUtterance` clause below intact, so a deadline reached while
+     * someone was speaking still deferred and the server cut us anyway — which
+     * is the outcome this whole branch exists to prevent. Caught by
+     * handoverWaitsForAGap.test.ts before it shipped.
+     */
+    /*
+     * ── v5.34.115: hand over at a TURN BOUNDARY, not at a quiet patch. ──────
+     *
+     * v5.34.112 raised the required silence from 1500ms to 4000ms and used the
+     * fifty seconds of notice Google gives. Reported from a real 20-minute
+     * interview on that build, at minute nine:
+     *
+     *     Jack:  "...could you point to a recent example of a project that's
+     *             had a real impact on costs or speed?"
+     *     Avery:  "of use cases and therefore we are reducing our cost
+     *             significantly and improving our opportunity overall."
+     *     Jack:  "Apologies, I missed that last part. Could you say it again?"
+     *
+     * The answer in the transcript BEGINS mid-sentence: the front of it was
+     * spoken into the connection being torn down. A deliberate speaker giving
+     * a long answer paused for more than four seconds in the middle of it, and
+     * four seconds of silence was again read as the end of a turn.
+     *
+     * Raising the threshold again does not fix this, and that is the point: no
+     * measure of silence DURATION can separate "finished answering" from
+     * "thinking mid-answer", because for a senior executive they are the same
+     * sound. The threshold only decides which of the two mistakes to make.
+     *
+     * So stop inferring it. There is one moment per turn that is unambiguously
+     * safe — the interviewer has just finished asking, and the interviewee has
+     * not started answering. vyne-live.js now marks exactly that
+     * (`_spokeSinceTurnEnd`, cleared when the model's turn closes, set the
+     * instant the microphone hears speech). Take that window when it comes,
+     * and fall back to the silence rule only once the deadline is near enough
+     * that waiting for the next question costs more than an awkward cut.
+     *
+     * Fifty seconds of notice is two or three turns at this pace, so the
+     * fallback should be rare.
+     */
+    var atTurnBoundary = s._spokeSinceTurnEnd === false;
+    var mustGoNow = !!s._goAwayDeadlineAt && headroomMs <= 0;
+    /*
+     * v5.34.117 — has the connection stopped answering? See GOAWAY_STALL_MS.
+     *
+     * `_awaitingReply` is set by vyne-live.js the moment a user turn is
+     * transcribed and cleared by the first model frame of any kind, so this
+     * measures exactly "it heard a turn and has produced nothing since".
+     *
+     * `!_micInUtterance` because they may have started speaking again — asking
+     * whether anyone is there, which is what happened on the reported run.
+     * Tearing the socket down mid-word is the one thing this whole branch
+     * exists to avoid, so wait for that sentence to end first.
+     */
+    var stalledMs = (s._awaitingReply && s._userTurnStartedAt)
+      ? Date.now() - s._userTurnStartedAt : 0;
+    /*
+     * v5.34.118 — did a goAway land on THIS turn? Compared by the turn's own
+     * start time rather than a boolean, so a goAway from before this turn (or
+     * from the previous connection) cannot shorten the wait on it.
+     */
+    var confirmedByGoAway = !!stalledMs && this._goAwayDuringTurn === s._userTurnStartedAt;
+    var wantStallMs = confirmedByGoAway ? GOAWAY_STALL_CONFIRMED_MS : GOAWAY_STALL_MS;
+    var replyStalled = stalledMs >= wantStallMs && !s._micInUtterance;
+    /*
+     * The model-is-working gate. Below mustGoNow and the stall check, not
+     * above them: sitting above was what made the reported 25-second silence
+     * unbounded, and what put the server's own deadline out of reach.
+     */
+    if (!replyStalled && !mustGoNow &&
+        (this._turnState === 'speaking' || this._turnState === 'thinking')) {
+      this._armGoAwayPoll();
+      return;
+    }
+    if (mustGoNow && (s._micInUtterance || quietMs < GOAWAY_QUIET_MIN_MS)) {
+      vlog('LiveInterview: handing over ON the goAway deadline even though the interviewee is mid-sentence — a server cut is worse', {
+        quietMs: quietMs === Infinity ? null : quietMs, headroomMs: headroomMs });
+    }
+    /*
+     * Three states, in order of certainty:
+     *
+     *   at a turn boundary        — they have not begun answering. Go now,
+     *                               however short the silence has been.
+     *   mid-answer, time in hand  — WAIT, whatever the silence says. This is
+     *                               the case a duration threshold gets wrong,
+     *                               and the one that cost a real answer.
+     *   anything else             — the silence rule, as before: an unknown
+     *                               boundary state, or a deadline close enough
+     *                               that waiting costs more than cutting.
+     */
+    var midAnswer = s._spokeSinceTurnEnd === true;
+    var waitForBoundary = midAnswer && headroomMs > GOAWAY_RELAX_BELOW_MS;
+    if (!mustGoNow && !replyStalled && !atTurnBoundary &&
+        (waitForBoundary || s._micInUtterance || quietMs < wantQuietMs)) {
       if (!this._goAwayPoll) {
-        vlog('LiveInterview: handover deferred — interviewee is speaking');
-        this._goAwayPoll = setInterval(function () {
-          if (!self._goAwayPending || self.stopped) { clearInterval(self._goAwayPoll); self._goAwayPoll = null; return; }
-          self._maybeRenewOnGoAway();
-        }, 300);
+        vlog('LiveInterview: handover deferred — they are mid-answer; waiting for the next turn boundary',
+             { quietMs: quietMs === Infinity ? null : quietMs, wantQuietMs: wantQuietMs,
+               spokeSinceTurnEnd: s._spokeSinceTurnEnd !== false,
+               headroomSec: Math.round(headroomMs / 1000) });
       }
+      this._armGoAwayPoll();
       return;
     }
     if (this._goAwayPoll) { clearInterval(this._goAwayPoll); this._goAwayPoll = null; }
     this._goAwayPending = false;
-    vlog('LiveInterview: renewing ahead of goAway at a turn boundary', { hasResumeHandle: !!this._resumeHandle });
+    /*
+     * Logged HERE, not at the point the stall is detected.
+     *
+     * The first cut printed it the moment `replyStalled` went true, above the
+     * deferral branch — so a build that detected the stall and then deferred
+     * anyway produced a trace line saying it had handed over, and the rig's
+     * verdict reported "noticed after 5.1s" on a run that sat through the full
+     * 25-second stall. A log line that claims an action must sit after the
+     * action is committed. Caught by running the harness against the v5.34.116
+     * code on purpose, which is the only reason it was ever seen.
+     */
+    if (replyStalled) {
+      vlog('LiveInterview: handing over because this connection has stopped answering — ' +
+           'it transcribed a turn and produced nothing since', {
+        unansweredMs: stalledMs, waitedMs: wantStallMs,
+        confirmedByGoAway: confirmedByGoAway, turnState: this._turnState,
+        headroomSec: Math.round(headroomMs / 1000) });
+    }
+    /*
+     * v5.34.112 — did we cut them off? The nudge on the far side depends on it.
+     *
+     * Anything the interviewee says between here and the new session answering
+     * is gone: the old socket is being discarded and the new one does not exist
+     * yet. If they were audible moments ago, the honest assumption is that we
+     * took words off them, and the interviewer should say so rather than open
+     * with "I am still here" — which is what made a lost answer read as a
+     * broken agent on the 2026-09-15 live interview.
+     */
+    this._cutOffInterviewee = !atTurnBoundary && (!!s._micInUtterance ||
+      (s._micLastLoudAt ? Date.now() - s._micLastLoudAt < CUTOFF_WINDOW_MS : false));
+    /*
+     * v5.34.117 — the stalled handover is its own case, and it must not be
+     * read as either of the other two.
+     *
+     * `_cutOffInterviewee` would be TRUE here on the reported run (they were
+     * audible seconds ago, asking whether anyone was there), and it would
+     * produce "I missed that last part, could you say it again" — asking a
+     * senior executive to repeat a thirty-nine second answer that we have in
+     * full, in the transcript, and that the new session can read. That is a
+     * worse version of the v5.34.112 defect, not a fix for it.
+     *
+     * The `resumed` branch is wrong too: "I'm still here" is what the
+     * interviewee got on this run, and it is what made a stalled server read
+     * as a broken agent.
+     *
+     * Nothing was missed and nothing needs repeating. The only thing owed is
+     * the answer to what they already said.
+     */
+    this._replyStalled = replyStalled;
+    if (replyStalled) this._cutOffInterviewee = false;
+    vlog('LiveInterview: renewing ahead of goAway at a turn boundary', {
+      hasResumeHandle: !!this._resumeHandle,
+      quietMs: quietMs === Infinity ? null : quietMs,
+      replyStalled: replyStalled,
+      cutOffInterviewee: this._cutOffInterviewee });
     // stop() with a renewable reason drives the normal onEnded → renewal path.
     s.stop('goaway');
   };

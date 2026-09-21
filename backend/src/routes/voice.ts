@@ -109,6 +109,14 @@ const LiveSessionBody = z.object({
    * data fence, so it must be something that cannot carry words. The questions
    * themselves stay inside `context`. */
   askedCount: z.number().int().min(0).max(500).optional(),
+  /* v5.34.111 — how many questions this interview was booked for, and how far
+   * in it is. Bounded integers for the same reason as the two counts above:
+   * they land ABOVE the data fence and this request comes from the
+   * interviewee's own browser, so they must be things that cannot carry words.
+   * The depth TABLE that produces them stays in frontend/vyne-depth.js. */
+  questionTargetLow: z.number().int().min(1).max(200).optional(),
+  questionTargetHigh: z.number().int().min(1).max(200).optional(),
+  elapsedMin: z.number().int().min(0).max(600).optional(),
   /** Validated against the allowlist in liveSession.ts, never forwarded raw. */
   voice: z.string().max(40).optional(),
   /** What the interviewer calls itself. Spoken aloud, so it is bounded and
@@ -415,6 +423,9 @@ export async function voiceRoutes(
           agenda: parsed.data.agenda,
           mandatoryCount: parsed.data.mandatoryCount,
           askedCount: parsed.data.askedCount,
+          questionTargetLow: parsed.data.questionTargetLow,
+          questionTargetHigh: parsed.data.questionTargetHigh,
+          elapsedMin: parsed.data.elapsedMin,
         });
         const grant = await effectiveLive.mint(sessionId, maxSeconds, instruction, parsed.data.voice,
           { manualVad: !!parsed.data.manualVad, resumeHandle: parsed.data.resumeHandle });
@@ -509,6 +520,12 @@ export async function voiceRoutes(
                 agenda: parsed.data.agenda,
                 mandatoryCount: parsed.data.mandatoryCount,
                 askedCount: parsed.data.askedCount,
+                // Same reason as the agenda above: a fallback session that ran
+                // without the interview's booked size would quietly be a
+                // different, shorter interview.
+                questionTargetLow: parsed.data.questionTargetLow,
+                questionTargetHigh: parsed.data.questionTargetHigh,
+                elapsedMin: parsed.data.elapsedMin,
               });
               const grant2 = await live.mint(retryId, maxSeconds, instruction2, parsed.data.voice,
                 { manualVad: !!parsed.data.manualVad, resumeHandle: parsed.data.resumeHandle });

@@ -131,6 +131,36 @@ describe("v5.34.84 — the persona's inputs reach the grant", () => {
     }
   });
 
+  it("the VOICE HARNESS supplies them too, or the paid run proves nothing", () => {
+    /*
+     * v5.34.111 — the same parity check, pointed at deploy/voice-record.mjs.
+     *
+     * The harness deliberately renders the SHIPPED persona rather than a copy
+     * of it ("render live, do not pin"), which is what lets a recorded run
+     * exercise the real instruction. But it builds the context object itself,
+     * so a field the product sends and the harness omits is a field the paid
+     * run silently cannot test — while the verdict still reads as though it
+     * had. That is this file's own documented trap ("a correctly-built thing,
+     * correctly tested, connected to nothing") pointed at the instrument
+     * instead of the product.
+     *
+     * Caught exactly this on v5.34.111: the three fields carrying the
+     * early-close fix were wired through all four product layers and not
+     * through the harness, so the next soak would have measured the old
+     * behaviour.
+     */
+    const RIG = read("deploy/voice-record.mjs");
+    const at = RIG.indexOf("renderInstruction = (f) =>");
+    expect(at, "the harness's instruction renderer moved — update this test").toBeGreaterThan(-1);
+    const body = RIG.slice(at, RIG.indexOf("\n    });", at));
+    const missing = personaStateFields().filter((f) => !new RegExp(`\\b${f}:`).test(body));
+    expect(
+      missing,
+      `deploy/voice-record.mjs renders the persona without: ${missing.join(", ")} — ` +
+        "a recorded run cannot exercise them, and the verdict will not say so",
+    ).toEqual([]);
+  });
+
   it("the page supplies them, so there is something to forward", () => {
     const at = PAGE.indexOf("window.vyneLiveInterview.create({");
     expect(at, "the page no longer creates a live interview — update this test").toBeGreaterThan(-1);

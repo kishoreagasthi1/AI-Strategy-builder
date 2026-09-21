@@ -750,7 +750,17 @@ describe("v5.34.31 — no handover while the interviewee is speaking", () => {
     w.sockets[0].onmessage({ data: JSON.stringify({ goAway: { timeLeft: "8s" } }) });
     await wait(50);
     expect(w.sockets.length).toBe(1);
-    expect(w.trace()).toMatch(/handover deferred — interviewee is speaking/);
+    expect(w.trace()).toMatch(/handover deferred — they are mid-answer/);
+    /*
+     * v5.34.112 — this case still takes the 1500ms path, deliberately.
+     *
+     * The required gap now scales with the goAway headroom: hold out for a
+     * real turn boundary while there is time, accept a short pause when there
+     * is not. This test's goAway says "8s", which after the handover cost is
+     * ~6.5s of headroom — below the relax threshold — so 1500ms still renews,
+     * and the behaviour asserted here is unchanged. The LONG-headroom case is
+     * handoverWaitsForAGap.test.ts's job.
+     */
     // quiet: the utterance closes, the 1.5 s quiet rule holds it a moment longer
     feed(w, silentFrame(), 1);
     await wait(50);
@@ -758,6 +768,43 @@ describe("v5.34.31 — no handover while the interviewee is speaking", () => {
     LI.session._micLastLoudAt = Date.now() - 2000;       // simulate 2 s of quiet
     await wait(400);
     expect(w.sockets.length).toBe(2);
+    LI.stop("finished");
+  });
+
+  it("with a long deadline, a pause inside an answer is never enough — it waits for the boundary", async () => {
+    /*
+     * v5.34.112, from a live 12-minute interview: at the handover the
+     * interviewee spoke for ~15 seconds and none of it arrived. The handover
+     * had fired during a pause for thought, because 1500ms of quiet counted as
+     * the end of a turn. Google gives 50 seconds of notice; there is room to
+     * wait for a gap that means something.
+     */
+    const w = makeWorld23({}, { VYNE_UTTERANCE_GAP_MS: 30 });
+    const LI = w.win.vyneLiveInterview.create({});
+    await LI.start(); await wait(10);
+    feed(w, speechFrame(), 3);
+    w.sockets[0].onmessage({ data: JSON.stringify({ goAway: { timeLeft: "50s" } }) });
+    await wait(50);
+    feed(w, silentFrame(), 1);
+    LI.session._micLastLoudAt = Date.now() - 2000;       // a pause for thought
+    await wait(400);
+    expect(w.sockets.length, "handed over during a pause — the next 15s of answer is lost").toBe(1);
+    /*
+     * v5.34.115 supersedes what this test used to assert. A SIX-second gap was
+     * "a real gap" under .112's duration rule and handed over; it is not enough
+     * any more, because the interviewee is still mid-answer and a long answer
+     * can contain a six-second pause. That was the minute-nine failure on the
+     * 2026-09-15 20-minute interview, where the transcript of a long answer
+     * begins mid-sentence.
+     */
+    LI.session._micLastLoudAt = Date.now() - 6000;
+    await wait(400);
+    expect(w.sockets.length, "a long pause inside an answer was taken as the end of it").toBe(1);
+    /* The model finishes its next question: nobody has answered it yet. That
+     * is the boundary, and it is the moment a handover costs nothing. */
+    LI.session._spokeSinceTurnEnd = false;
+    await wait(400);
+    expect(w.sockets.length, "the safe turn boundary came and the handover never took it").toBe(2);
     LI.stop("finished");
   });
 });
@@ -1560,7 +1607,21 @@ describe("v5.34.49 — what the session reports as used is what it used", () => 
   /** Feed a usageMetadata frame straight at the socket, as Google does. */
   const usage = (w: any, u: any) =>
     w.sockets[0].onmessage({ data: JSON.stringify({ usageMetadata: u }) });
-  const endTurn = (w: any) => w.sockets[0].frame({ turnComplete: true });
+  /*
+   * v5.34.110 — a turn SPEAKS before it ends.
+   *
+   * These drove turns with a usage frame and a bare turnComplete and no audio
+   * at all, which is not a sequence the server ever produces: every real turn
+   * generates something. v5.34.109's duplicate-close guard reads exactly that
+   * — has the model generated anything since the last close — so a turn with
+   * no audio now reads as the same turn closing twice and is correctly
+   * ignored.
+   *
+   * The fix is the frame sequence, not the guard. The assertions below are
+   * untouched: they are about token arithmetic after a real 13x under-count,
+   * and a speak() before the close is what a real turn looks like.
+   */
+  const endTurn = (w: any) => { w.sockets[0].speak(); w.sockets[0].frame({ turnComplete: true }); };
 
   async function started() {
     const w = makeWorld23({});
@@ -1710,7 +1771,8 @@ describe("v5.34.51 — a recording must use the model production runs", () => {
 describe("v5.34.52 — usage is accumulated per turn, not maxed across the session", () => {
   const usage = (w: any, u: any) =>
     w.sockets[0].onmessage({ data: JSON.stringify({ usageMetadata: u }) });
-  const turnEnd = (w: any) => w.sockets[0].frame({ turnComplete: true });
+  /* v5.34.110: a turn speaks before it ends — see the note on endTurn above. */
+  const turnEnd = (w: any) => { w.sockets[0].speak(); w.sockets[0].frame({ turnComplete: true }); };
 
   async function started() {
     const w = makeWorld23({});

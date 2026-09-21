@@ -807,6 +807,11 @@
     }
     this.sources = [];
     this.nextAt = 0;
+    /* v5.34.101: nothing is queued any more, so a deferral waiting on playback
+     * is waiting on audio that has been stopped. Pause, barge-in and stop all
+     * reach here; without this the floor would stay "held" for the remainder of
+     * speech that will never be heard. */
+    this._lastEnd = 0;
     this.endRun('flush');
   };
   /** Close the per-turn playback rollup (on turnComplete, flush, or stop). */
@@ -822,6 +827,17 @@
     this._runPushes = 0; this._lastEnd = 0; this._runFirstAt = null;
   };
   PlaybackQueue.prototype.pending = function () { return this.sources.length; };
+  /**
+   * Milliseconds until the audio already scheduled has finished playing.
+   *
+   * v5.34.101. _lastEnd is the context time at which the final scheduled chunk
+   * ends, so this is the honest "how much of the interviewer's voice is still
+   * to come". Read it BEFORE endRun(), which clears _lastEnd.
+   */
+  PlaybackQueue.prototype.remainingMs = function () {
+    if (!this.ctx || !this._lastEnd) return 0;
+    return Math.max(0, Math.round((this._lastEnd - this.ctx.currentTime) * 1000));
+  };
 
   // ── Session ────────────────────────────────────────────────────────────────
 
@@ -1018,6 +1034,12 @@
       this._micLastLoudAt = now;
       if (!this._micInUtterance) {
         this._micInUtterance = true;
+        /*
+         * v5.34.115 — has the interviewee begun ANSWERING the question on the
+         * table? See _maybeRenewOnGoAway: a handover must not land inside an
+         * answer, and no silence threshold can tell "finished" from "thinking".
+         */
+        this._spokeSinceTurnEnd = true;
         this._touchAppSession();   // v5.34.33: speaking counts as being present
         this._utteranceStartedAt = now;
         this._uttSum = 0; this._uttN = 0; this._uttPeak = 0;
@@ -1188,6 +1210,29 @@
 
   VyneLiveSession.prototype._noteModelActivity = function (f) {
     var now = Date.now();
+    /*
+     * ── v5.34.110: only GENERATION counts, measured against production ──────
+     *
+     * Audio and thinking-text, and nothing else. Two other things were tried
+     * and both were wrong, for the same underlying reason: they arrive between
+     * a turn's close and the late turnComplete that follows it.
+     *
+     *   f.usage      added in v5.34.109 so a text-only reply would not lose
+     *                its close. But parseServerFrame sets usage from ANY frame
+     *                carrying usageMetadata, and the live run of 2026-09-15
+     *                had SIXTEEN sessionResumptionUpdate frames sitting in that
+     *                gap. Every one of them re-armed the guard, so it never
+     *                fired once and all 44 turns closed twice. A usage report
+     *                is bookkeeping about a turn, not the model producing one.
+     *
+     *   f.agentText  transcript trails a finished turn (v5.34.106), and gating
+     *                it on "the interviewee has spoken" does not save it: this
+     *                model's turnComplete arrives 2 to 8.5 seconds late, which
+     *                is well into the next exchange.
+     *
+     * A text-only reply is handled at the close instead — see _closeTurn.
+     */
+    if (f.audio.length || f.modelText) this._contentSinceClose = true;
     if (this._awaitingReply && (f.modelText || f.audio.length || f.agentText || f.turnComplete)) {
       this._awaitingReply = false;
       if (this._replyWatchdog) { clearTimeout(this._replyWatchdog); this._replyWatchdog = null; }
@@ -1300,6 +1345,33 @@
      * by stop()/renewal. See TURN_CLOSE_GRACE_MS for the measurement that made
      * this necessary. The close is the SAME path turnComplete takes, so a
      * salvaged turn and a normal one leave identical state behind.
+     *
+     * ── v5.34.105: except it did not. The APP was never told. ───────────────
+     *
+     * _closeTurn restored the SESSION's state — usage banked, playback run
+     * ended, flags cleared. But the notification the app actually acts on was
+     * fired somewhere else entirely, straight off the frame:
+     *
+     *     if (f.turnComplete && self.opts.onTurnComplete) ...
+     *
+     * and onTurnComplete is not cosmetic. In vyne-live-interview.js it does
+     * three things: _flushPending() commits the interviewer's words to the
+     * transcript, onTurns() hands that transcript to the page, and _score()
+     * runs the scoring pass. A salvaged turn did none of them, and _closeTurn
+     * then cleared _turnText, so the question was destroyed rather than
+     * delayed: absent from the transcript, absent from the page, unscored, and
+     * never registered as asked by the no-repeat machinery.
+     *
+     * While turnComplete was reliable this was invisible — the salvage was
+     * pathological and rare. On 2026-09-14 the model sent 11 generationComplete
+     * and 0 turnComplete, so it was every turn in the interview.
+     *
+     * The notification cannot simply move into _closeTurn: _noteModelActivity
+     * runs BEFORE onAgentText in the frame handler, so firing there would
+     * commit the transcript a beat before the turn's last words arrive. So
+     * _closeTurn raises a flag and the two places that can safely deliver it
+     * drain that flag — the frame handler once the text is out, and the
+     * salvage timer, which has no frame following it.
      */
     if (f.generationComplete && !f.turnComplete && !this._turnCloseTimer) {
       var selfTC = this;
@@ -1311,6 +1383,8 @@
                turnHadAudio: !!selfTC._turnAudio });
         selfTC._salvagedTurns = (selfTC._salvagedTurns || 0) + 1;
         selfTC._closeTurn('generationComplete');
+        /* No frame follows this timer, so deliver it here. */
+        selfTC._drainTurnCompleteNotice();
       }, TURN_CLOSE_GRACE_MS);
     }
     if (f.turnComplete) {
@@ -1365,11 +1439,206 @@
    * a turn closed two slightly different ways is a state-machine bug waiting
    * to happen — and this function is what banks usage and frees the state.
    */
+  /*
+   * ── v5.34.101: A TURN IS NOT OVER WHILE THE INTERVIEWER IS STILL TALKING ───
+   *
+   * generationComplete means the model finished GENERATING. It says nothing
+   * about playback, and the two are seconds apart: the model emits its whole
+   * answer as fast as the socket allows, and the audio then plays out locally
+   * in real time.
+   *
+   * Measured on the 2026-09-14 live run, at the moment each turn was closed:
+   *
+   *     playbackPending   30  25  12  15  15  10  14  14  16  14
+   *     stillQueuedSec   9.1 7.1 3.3 4.6 4.5 3.1 4.0 3.6 4.5 4.3
+   *
+   * Every turn went to 'idle' with between three and nine seconds of the
+   * interviewer's voice still queued. Downstream, idle is the signal that the
+   * floor is free: the UI clears "speaking", the mic reopens, and the
+   * interviewee is invited to answer a question that is still being asked. On
+   * the harness that shows up as the tape talking over the model; in a real
+   * interview it is an executive being cued to interrupt.
+   *
+   * This was invisible until now for two compounding reasons. turnComplete used
+   * to arrive and close the turn at the right moment, so the salvage path was
+   * pathological and rare — 3 occurrences in a 30-minute recording. As of
+   * 2026-09-14 gemini-2.5-flash-native-audio-latest stopped sending
+   * turnComplete at all (11 generationComplete, 0 turnComplete, 11 salvages),
+   * so the salvage became the ONLY way a turn closes and its timing became the
+   * conversation's timing. And the offline rig always sent turnComplete, so no
+   * amount of free testing could have reproduced it.
+   *
+   * Everything else about the close still happens immediately — usage is
+   * banked, the playback rollup ends, per-turn flags clear. Only the state
+   * transition waits, because only the state transition is a claim about
+   * whether the interviewer has stopped speaking.
+   */
+  var IDLE_DEFER_MIN_MS = 250;      // below this, not worth a timer
+  var IDLE_DEFER_MAX_MS = 20000;    // a ceiling, so a bad _lastEnd cannot pin 'speaking'
+  /* What a graceful handover needs: the renewal tears down and remints in
+   * roughly 1.5s (measured, v5.34.31). Holding the floor into that window is
+   * what turns a clean handover into a server-cut one. */
+  var GOAWAY_HANDOVER_COST_MS = 1500;
+  /*
+   * ── The machine went to sleep. (v5.34.112) ─────────────────────────────────
+   *
+   * A laptop that sleeps, or a tab the browser freezes, stops this page dead:
+   * timers do not fire, the microphone graph stops, and nothing is sent. The
+   * socket does not close — it simply rots, because neither end writes. On
+   * waking, the page is holding a WebSocket that looks open and is not.
+   *
+   * v5.34.44 already made that survivable: `live_socket_error` is renewable,
+   * and the comment there names this exact case ("the laptop slept at minute
+   * five, and on waking the socket was long dead"). What it does not do is
+   * notice. Recovery waits for the dead socket to ADMIT it is dead — a failed
+   * send, a server RST, or a watchdog — and that admission is what costs the
+   * time. Measured on the 2026-09-15 20-minute run: the process froze, and the
+   * first reply after it came 20.3 seconds after the interviewee stopped
+   * speaking, of which the renewal itself was 2.6.
+   *
+   * A wall-clock heartbeat closes that gap. Scheduling jitter on a busy page is
+   * tens of milliseconds; a suspended process shows up as seconds. So a beat
+   * that arrives late by more than the floor below did not happen late — this
+   * page was not running, and the connection it is holding is stale by exactly
+   * that much. Renew immediately instead of discovering it a sentence later.
+   *
+   * The floor is deliberately well clear of jitter: a long synchronous task, a
+   * GC pause or a slow paint cost tens to hundreds of milliseconds, and a
+   * genuine suspend is seconds. Below the floor, nothing happens at all.
+   */
+  var SUSPEND_BEAT_MS = 1000;
+  var SUSPEND_FLOOR_MS = 4000;
+  /*
+   * v5.34.107 measured what production actually does, and v5.34.109 made the
+   * measurement unnecessary. Kept because it is the evidence for the rule:
+   * every gap between a salvage close and the turnComplete that followed it,
+   * live run of 2026-09-14 —
+   *
+   *   10817  5696  2880  4996  5616  3755  5435  3969  5373  7051  4436  (ms)
+   *
+   * Eleven salvages, eleven late turnCompletes: production sends the frame for
+   * EVERY turn, seconds after the model has stopped talking. A 5000ms window
+   * caught five of them. No window catches all of them reliably, which is why
+   * the guard is no longer timed.
+   */
+
+  VyneLiveSession.prototype._clearIdleDefer = function () {
+    if (this._idleDeferTimer) { clearTimeout(this._idleDeferTimer); this._idleDeferTimer = null; }
+  };
+
+  /**
+   * Tell the app a turn ended — exactly once per turn, whichever way it ended.
+   * (v5.34.105)
+   *
+   * Exactly once matters in both directions. Twice would double-score a turn
+   * and push the interviewer's words into the transcript twice; never is what
+   * shipped, and it silently discarded every salvaged turn.
+   */
+  VyneLiveSession.prototype._drainTurnCompleteNotice = function () {
+    if (!this._turnNeedsNotify) return;
+    /*
+     * v5.34.111 — a paused session owes the app nothing.
+     *
+     * The frame handler cancels the notice explicitly when it discards a turn
+     * (see the muted branch there), which covers every turn closed BY a frame.
+     * This covers the other closer: the generationComplete salvage runs off a
+     * timer, with no frame and no muted check, so without this a turn salvaged
+     * during a pause would be announced while every frame of it was discarded.
+     */
+    if (this.muted) { this._cancelTurnCompleteNotice('paused'); return; }
+    this._turnNeedsNotify = false;
+    if (this.opts.onTurnComplete) { try { this.opts.onTurnComplete(); } catch (e) {} }
+  };
+
+  /**
+   * Forget that a turn ended, because its content was thrown away. (v5.34.111)
+   *
+   * Only ever correct when the turn itself was discarded — a notice that is
+   * merely LATE must still be delivered, which is what the drain sites are
+   * for. Separate from the drain so the two intentions cannot be confused at
+   * a call site.
+   */
+  VyneLiveSession.prototype._cancelTurnCompleteNotice = function (why) {
+    if (!this._turnNeedsNotify) return;
+    this._turnNeedsNotify = false;
+    vlog('turn-close notice dropped — the turn it described was discarded', { via: why });
+  };
+
   VyneLiveSession.prototype._closeTurn = function (why) {
     var now = Date.now();
+    /*
+     * ── v5.34.109: a turn closes once, and "once" is defined by CONTENT ─────
+     *
+     * A close with nothing generated since the previous close is not a turn
+     * ending — it is the same turn being closed again. It double-banks usage,
+     * and since v5.34.105 it also flushes the interviewer's words into the
+     * transcript twice and spends a second paid scoring call on one
+     * conversation.
+     *
+     * This began as a guard against ONE observed sequence: a salvage followed
+     * by the late turnComplete production sends 2.9s to 10.8s afterwards. That
+     * guard was scoped to that sequence, timed by a window, and enumerating
+     * every four- and five-frame ordering through this file's own session
+     * found three more shapes it missed — a second generationComplete
+     * re-arming the salvage, a generationComplete after a turnComplete close,
+     * and a bare repeated turnComplete.
+     *
+     * They are all the same fact. So the rule is now that fact, with no window
+     * and no special case, and the ordering test holds it in place.
+     *
+     * It does not swallow real turns: the server reports usage for every turn,
+     * and usage counts as content. liveTurnOwnership drives three turns with
+     * bare turnComplete frames — each preceded by its usage report — and still
+     * banks three, which is the thirteenfold under-count that test exists to
+     * prevent.
+     */
+    /*
+     * v5.34.110 — a text-only (mute) reply is a real turn even though it
+     * generated no audio. It has accumulated transcript and no audio of its
+     * own, which a DUPLICATE close never has: _closeTurn clears _turnText, and
+     * the measured gap between a close and the late turnComplete carries no
+     * transcript at all.
+     */
+    var muteTurn = !this._turnAudio && !!this._turnText;
+    if (!this._contentSinceClose && !muteTurn) {
+      /*
+       * v5.34.109 — the one case this rule cannot see, said out loud.
+       *
+       * A text-only (mute) reply produces no audio and no thinking-text, so
+       * the only thing marking it as a new turn is the server's usage report.
+       * Where that report arrives — and it does for every turn observed so far
+       * — this is correct. Where it does not, a mute turn's close is swallowed
+       * and its question never reaches the transcript or the scorer, which is
+       * the v5.34.105 defect for that one turn type.
+       *
+       * Transcript deliberately does NOT count as content: it trails a
+       * finished turn word by word, and treating it as a new turn is what let
+       * six turns close twice in v5.34.106. Between losing a rare mute turn
+       * and double-closing every ordinary one, this is the cheaper failure —
+       * but it is a real trade, so it is logged rather than assumed away.
+       */
+      vlog('close ignored — nothing has been generated since the last one',
+           { via: why, hadTranscriptOnly: !this._turnAudio && !!this._turnText });
+      return;
+    }
+    this._contentSinceClose = false;
+    /*
+     * v5.34.115 — a new question has just been asked, so nobody has answered
+     * it yet. This is the one moment in a turn where a handover costs nothing.
+     */
+    this._spokeSinceTurnEnd = false;
+    /* Read BEFORE endRun(), which clears the value this is computed from. */
+    var remainingMs = this.queue ? this.queue.remainingMs() : 0;
     vlog('model turn ENDS', { via: why, turnHadAudio: !!this._turnAudio,
       playbackPending: this.queue ? this.queue.pending() : null,
+      playbackRemainingMs: remainingMs,
       msSinceLastUtteranceEnd: this._micLastLoudAt ? now - this._micLastLoudAt : null });
+    /*
+     * v5.34.105 — the app is owed a turn-close notice, however this close was
+     * reached. Raised here and drained by _drainTurnCompleteNotice(); see the
+     * note at the generationComplete salvage for why it is not fired inline.
+     */
+    this._turnNeedsNotify = true;
     this._bankTurnUsage();          // v5.34.52 — before the turn state resets
     if (this.queue) this.queue.endRun(why);
     this._turnAudio = false; this._loggedTurnAudio = false;
@@ -1377,7 +1646,64 @@
     this._turnText = '';
     if (this._muteReplyTimer) { clearTimeout(this._muteReplyTimer); this._muteReplyTimer = null; }
     if (this._turnCloseTimer) { clearTimeout(this._turnCloseTimer); this._turnCloseTimer = null; }
-    this._setTurnState('idle');
+    this._clearIdleDefer();
+
+    var waitMs = Math.min(remainingMs, IDLE_DEFER_MAX_MS);
+    /*
+     * A pending goAway outranks the tail of a sentence. The renewal needs
+     * roughly GOAWAY_HANDOVER_COST_MS of socket to land gracefully; past that
+     * the server cuts us and the handover is rough. Losing the last second of
+     * audio is the cheaper failure, so the deadline wins.
+     */
+    if (this._goAwayDeadlineAt) {
+      var headroom = this._goAwayDeadlineAt - now - GOAWAY_HANDOVER_COST_MS;
+      if (headroom < waitMs) {
+        vlog('shortening the floor hold — a goAway deadline is closer than the audio', {
+          wantedMs: waitMs, headroomMs: headroom });
+        waitMs = headroom;
+      }
+    }
+    if (waitMs < IDLE_DEFER_MIN_MS) { this._setTurnState('idle'); return; }
+
+    var selfID = this;
+    vlog('holding the floor until playback drains', { waitMs: waitMs, via: why });
+    this._idleDeferTimer = setTimeout(function () {
+      selfID._idleDeferTimer = null;
+      /* State may have moved on — a new turn, a barge-in, a renewal. Only the
+       * transition this close was responsible for is still ours to make. */
+      if (selfID._turnState === 'speaking' || selfID._turnState === 'thinking') {
+        selfID._setTurnState('idle');
+      }
+      /*
+       * v5.34.111 — DELIVER THE TURN, rather than waiting for traffic.
+       *
+       * The notice raised by _closeTurn was drained in exactly two places: the
+       * generationComplete salvage, and the socket frame handler — meaning
+       * "whenever the next frame happens to arrive". For every turn but the
+       * last of a connection that is fine, because another frame always comes.
+       *
+       * The handover is the case where one does not, and it is engineered that
+       * way: _maybeRenewOnGoAway waits for this very 'idle' transition before
+       * renewing, so the renewal is timed to the gap after a turn closed and
+       * before anything else happens. The notice sat on _turnNeedsNotify, the
+       * session was stopped, and onTurnComplete never ran — so the interviewer's
+       * last words never reached the transcript, the page never persisted, and
+       * that turn was never scored. The next mint then built askedCount, the
+       * evidenced list and the "already asked" list from a transcript missing
+       * exactly the turn that had just happened, which is how a question comes
+       * back a minute after a handover.
+       *
+       * Only ever intermittent, because a stray usageMetadata or
+       * sessionResumptionUpdate frame in the gap drains it by accident — the
+       * v5.34.110 trace shows sixteen of them in one gap, and no guarantee.
+       *
+       * This is the deterministic end of the turn, and it is asynchronous with
+       * respect to the frame handler, so _flushPending() still sees the turn's
+       * last words. _drainTurnCompleteNotice is idempotent, so the frame
+       * handler getting here first costs nothing.
+       */
+      selfID._drainTurnCompleteNotice();
+    }, waitMs);
   };
   /**
    * Add the turn just finished to the session total. (v5.34.52)
@@ -1396,9 +1722,43 @@
   };
 
   VyneLiveSession.prototype._setTurnState = function (s) {
+    /*
+     * v5.34.101: a deferred idle belongs to the turn that scheduled it. Once
+     * anything else moves the state — a new turn, a barge-in, a renewal — that
+     * timer would otherwise fire later and announce 'idle' in the middle of the
+     * NEXT turn, which is the same wrong claim in the opposite direction.
+     */
+    if (s !== 'idle') this._clearIdleDefer();
     if (this._turnState === s) return;
     this._turnState = s;
     if (this.opts.onTurnState) { try { this.opts.onTurnState(s); } catch (e) {} }
+  };
+
+  /**
+   * Notice that this page stopped running, and treat the socket as gone.
+   * (v5.34.112) — see SUSPEND_FLOOR_MS above.
+   */
+  VyneLiveSession.prototype._watchForSuspend = function () {
+    var self = this;
+    this._lastBeatAt = Date.now();
+    this._suspendTimer = setInterval(function () {
+      var gap = Date.now() - self._lastBeatAt;
+      self._lastBeatAt = Date.now();
+      if (gap <= SUSPEND_FLOOR_MS || self.closed) return;
+      var frozenMs = gap - SUSPEND_BEAT_MS;
+      vlog('!!! THIS PAGE WAS SUSPENDED — the connection it is holding is stale', {
+        frozenSec: Math.round(frozenMs / 1000),
+        wsState: rs(self.ws),
+        muted: !!self.muted,
+      });
+      /*
+       * A paused interview is meant to sit idle (v5.34.8: let the grant lapse
+       * quietly; the Resume handler reconnects). Forcing a renewal here would
+       * wake an interview the interviewee deliberately stopped.
+       */
+      if (self.muted) return;
+      self._fail('live_suspended', new Error('page suspended for ' + Math.round(frozenMs / 1000) + 's'));
+    }, SUSPEND_BEAT_MS);
   };
 
   VyneLiveSession.prototype.start = function () {
@@ -1458,6 +1818,29 @@
           try{ var v = typeof a === 'function' ? a() : a; return typeof v === 'number' ? v : undefined; }
           catch(e){ return undefined; }
         })(self.opts.askedCount),
+        /*
+         * v5.34.111 — the interview's booked SIZE and how far in it is.
+         *
+         * Resolved at MINT like the four above, and for the sharpest version of
+         * the same reason: after a ~10-minute handover the fresh session has no
+         * memory of the conversation, so a frozen elapsedMin would tell a
+         * session starting at minute twenty-five that it was minute zero. The
+         * target is constant for the interview; the clock is not.
+         *
+         * Integers only — these land above the persona's data fence.
+         */
+        questionTargetLow: (function(v){
+          try{ var n = typeof v === 'function' ? v() : v; return typeof n === 'number' && isFinite(n) ? Math.round(n) : undefined; }
+          catch(e){ return undefined; }
+        })(self.opts.questionTargetLow),
+        questionTargetHigh: (function(v){
+          try{ var n = typeof v === 'function' ? v() : v; return typeof n === 'number' && isFinite(n) ? Math.round(n) : undefined; }
+          catch(e){ return undefined; }
+        })(self.opts.questionTargetHigh),
+        elapsedMin: (function(v){
+          try{ var n = typeof v === 'function' ? v() : v; return typeof n === 'number' && isFinite(n) && n >= 0 ? Math.round(n) : undefined; }
+          catch(e){ return undefined; }
+        })(self.opts.elapsedMin),
         intervieweeName: self.opts.intervieweeName || undefined,
         intervieweeRole: self.opts.intervieweeRole || undefined,
         industry: self.opts.industry || undefined,
@@ -1774,6 +2157,9 @@
           self._set('live');
           var maxMs = (self.grant.maxSeconds || 2700) * 1000;
           self.timer = setTimeout(function () { self.stop('max_duration'); }, maxMs);
+          /* v5.34.112: armed HERE rather than in start(), so the seconds a slow
+           * connect legitimately takes cannot read as a suspension. */
+          self._watchForSuspend();
           vlog('setupComplete — session is live', { msSinceOpen: Date.now() - self.startedAt, micFramesHeldBeforeSetup: self._preSetupFrames || 0 });
           if (!settled) { settled = true; resolve(self); }
           /*
@@ -1839,6 +2225,21 @@
           var tl = msg.goAway.timeLeft;
           var ms = typeof tl === 'string' && /^\d+(\.\d+)?s$/.test(tl) ? Math.round(parseFloat(tl) * 1000) : null;
           self.goAwayAt = Date.now();
+          /*
+           * v5.34.101 — the deadline, not just the fact.
+           *
+           * The bridge renews at a TURN BOUNDARY (_maybeRenewOnGoAway returns
+           * early while speaking/thinking and re-enters on onTurnState 'idle').
+           * Holding the floor for playback moves that boundary later by the
+           * length of the queued audio — 3 to 9 seconds, measured live — and
+           * the observed goAway grace is 8000ms. Left alone, a goAway landing
+           * mid-turn would routinely miss its own window and the handover
+           * would become a server-cut instead of a graceful one.
+           *
+           * So the close records where the wall is; _closeTurn will not hold
+           * the floor past it.
+           */
+          self._goAwayDeadlineAt = ms ? (Date.now() + ms) : null;
           if (self.opts.onGoAway) { try { self.opts.onGoAway(ms); } catch (e) {} }
         }
         var f = parseServerFrame(msg);
@@ -1926,6 +2327,25 @@
             if (self._discarded === 1) vlog('turn DISCARDED — session is muted/paused (further frames of this turn rolled up)');
           }
           if (f.turnComplete && self._discarded) { vlog('discarded turn ends', { frames: self._discarded }); self._discarded = 0; }
+          /*
+           * v5.34.111 — DROP THE NOTICE WITH THE TURN.
+           *
+           * _noteModelActivity ran above this check, so a turnComplete arriving
+           * mid-pause has already closed the turn and raised the app's
+           * turn-close notice. This early return then skips the drain at the
+           * bottom of the handler, and the notice SURVIVES the discard: it sits
+           * on the session until some later frame delivers it — typically the
+           * first frame after the interviewee resumes, by which point the
+           * conversation has moved on. onTurnComplete then commits text to the
+           * transcript, persists it and scores it, for a turn this branch had
+           * just decided to throw away. A turn the product chose not to have,
+           * landing in the client's record at the wrong moment.
+           *
+           * "Drop the entire turn" (v5.34.28) has to include the fact that it
+           * happened. Cancelled rather than delivered, because there is no
+           * correct later moment for it — the content it described is gone.
+           */
+          self._cancelTurnCompleteNotice('paused');
           return;
         }
         // First actual audio also ends any "preparing" state, even when the
@@ -1941,7 +2361,13 @@
         }
         if (f.userText && self.opts.onUserText) { try { self.opts.onUserText(f.userText); } catch (e) {} }
         if (f.agentText && self.opts.onAgentText) { try { self.opts.onAgentText(f.agentText); } catch (e) {} }
-        if (f.turnComplete && self.opts.onTurnComplete) { try { self.opts.onTurnComplete(); } catch (e) {} }
+        /*
+         * v5.34.105 — drain the turn-close notice AFTER onAgentText above, so
+         * _flushPending() sees the turn's last words. Was
+         * `if (f.turnComplete && ...)`, which meant a turn closed by the
+         * generationComplete salvage never reached the app at all.
+         */
+        self._drainTurnCompleteNotice();
       };
 
       ws.onerror = function (e) {
@@ -2128,10 +2554,25 @@
       })()
     });
     this.closed = true;
+    /*
+     * v5.34.111 — LAST CHANCE to deliver a turn that closed but was never
+     * announced. Before anything below is torn down, because onTurnComplete
+     * commits the interviewer's words to the transcript and hands them to the
+     * page, and the queue flush directly under here ends the run it reads.
+     *
+     * A connection can die between a turn closing and the notice draining: the
+     * handover does it by design (see the idle-defer timer), and a socket error
+     * or a server cut does it by accident. Idempotent, so in the ordinary case
+     * where the notice has already gone out this does nothing at all.
+     */
+    this._drainTurnCompleteNotice();
+    /* v5.34.101: a stopped session must not announce 'idle' a few seconds later. */
+    this._clearIdleDefer();
     if (this.timer) { clearTimeout(this.timer); this.timer = null; }
     if (this._replyWatchdog) { clearTimeout(this._replyWatchdog); this._replyWatchdog = null; }
     if (this._ignoredWatchdog) { clearTimeout(this._ignoredWatchdog); this._ignoredWatchdog = null; }
     if (this._openingRetryTimer) { clearTimeout(this._openingRetryTimer); this._openingRetryTimer = null; }
+    if (this._suspendTimer) { clearInterval(this._suspendTimer); this._suspendTimer = null; }
     if (this.queue) this.queue.flush();
     try { if (this.ws && this.ws.readyState <= 1) this.ws.close(); } catch (e) {}
     if (this.stream) {

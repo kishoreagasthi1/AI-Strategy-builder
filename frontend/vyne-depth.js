@@ -53,6 +53,8 @@
     quick: {
       label: "Quick Screen",
       range: "20–25 questions",
+      /** The booked size, as numbers. `high` must equal `initial` — vyneDepth.test.ts pins it. */
+      target: { low: 20, high: 25 },
       initial: 25,
       prompt: "20-25 questions -- prioritize highest-impact questions only",
       /* One question per topic, floored at 3 so even a single-item agenda gets
@@ -63,6 +65,8 @@
     standard: {
       label: "Standard",
       range: "28–35 questions",
+      /** The booked size, as numbers. `high` must equal `initial` — vyneDepth.test.ts pins it. */
+      target: { low: 28, high: 35 },
       initial: 35,
       prompt: "28-35 questions -- full coverage of priority dimensions",
       /* v5.33.8: this was 3 per item on its first draft, which made standard
@@ -75,6 +79,8 @@
     deep: {
       label: "Deep Dive",
       range: "40–50 questions",
+      /** The booked size, as numbers. `high` must equal `initial` — vyneDepth.test.ts pins it. */
+      target: { low: 40, high: 50 },
       initial: 50,
       prompt: "40-50 questions -- comprehensive coverage of the in-scope dimensions (deep, not broad-for-its-own-sake)",
       /* DO NOT CHANGE without reading vyneDepth.test.ts. These three numbers
@@ -97,6 +103,17 @@
 
   /** The agent's question budget for a first-round interview. */
   function initialBudget(d) { return spec(d).initial; }
+
+  /*
+   * The booked size as a pair of numbers, for the LIVE interviewer. (v5.34.111)
+   *
+   * `range` is prose for the consultant's screen ("40–50 questions"); `prompt`
+   * is prose for the TEXT model. The VOICE interviewer needs integers, because
+   * they land above its data fence and a string there could carry words. Same
+   * table, so the consultant's control, the preview sheet, the text prompt and
+   * the voice prompt cannot disagree about how long the interview is.
+   */
+  function target(d) { var t = spec(d).target; return { low: t.low, high: t.high }; }
 
   /**
    * The agent's question budget for an agenda-driven follow-up.
@@ -124,6 +141,7 @@
     range: function (d) { return spec(d).range; },
     prompt: function (d) { return spec(d).prompt; },
     initialBudget: initialBudget,
+    target: target,
     followUpBudget: followUpBudget,
   };
 

@@ -85,10 +85,25 @@ describe("v5.34.73 — the live interviewer has a dimension agenda", () => {
   });
 
   it("tells it not to re-ask what this conversation already evidenced", () => {
-    // The point of recomputing the agenda at every ~10-minute handover.
+    /*
+     * The point of recomputing the agenda at every ~10-minute handover.
+     *
+     * v5.34.111 — the WORDING of this sentence changed and the assertion moved
+     * with it, deliberately. It used to open "You already have real evidence
+     * on ...", which is the exact premise CLOSING_RULES makes DONE conditional
+     * on ("when you have real evidence across the dimensions ... the interview
+     * is DONE"), asserted on the strength of `score > 0`. The agenda was
+     * satisfying the closing rule's own exit condition, and the v5.34.110 soak
+     * closed at 4.4 minutes because of it. See interviewerDoesNotCloseEarly
+     * .test.ts, which pins the absence of that claim so it cannot come back.
+     *
+     * What this test protects is unchanged: the dimensions are named, and the
+     * interviewer is told not to put those questions again.
+     */
     const out = buildInterviewerInstruction({ agenda: { lead: ["D1"], evidenced: ["D3", "D6"] } });
-    expect(out).toMatch(/already have real evidence on .*D3 AI Strategy & Vision.*D6 Governance & Risk/);
-    expect(out).toContain("Do not ask about those again");
+    expect(out).toMatch(/already covered .*D3 AI Strategy & Vision.*D6 Governance & Risk/);
+    expect(out).toContain("Do not put those same questions again");
+    expect(out).not.toMatch(/have real evidence on/);
   });
 
   it("never tells it to read the dimensions out loud", () => {

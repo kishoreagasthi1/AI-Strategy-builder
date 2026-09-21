@@ -150,4 +150,42 @@ describe("the module is a usable source for the three UIs that read it", () => {
       expect(rangeUpper, key).toBe(VyneDepth.initialBudget(key));
     }
   });
+
+  /*
+   * v5.34.111 — the VOICE interviewer's copy of the same promise.
+   *
+   * `range` is prose for the consultant, `prompt` is prose for the text model,
+   * and `target` is the integer pair for the live model (integers because they
+   * land above the persona's data fence). Three renderings of one number, and
+   * the defect this whole module exists to prevent is exactly them drifting —
+   * so all three are pinned to each other, not just to themselves.
+   */
+  it("the voice target agrees with the range and the budget", () => {
+    for (const key of VyneDepth.ORDER) {
+      const t = VyneDepth.target(key);
+      const m = VyneDepth.range(key).match(/(\d+)[–-](\d+)/) || [];
+      expect(t.low, key).toBe(Number(m[1]));
+      expect(t.high, key).toBe(Number(m[2]));
+      expect(t.high, key).toBe(VyneDepth.initialBudget(key));
+      expect(t.low, key).toBeLessThan(t.high);
+    }
+  });
+
+  it("target falls back to the default for anything unrecognised", () => {
+    // Same normalisation as every other accessor — an old row or a typo must
+    // not produce an undefined budget that silently disables the size rule.
+    for (const bad of [undefined, null, "", "DEEP-ish", 7]) {
+      expect(VyneDepth.target(bad as never)).toEqual(VyneDepth.target("deep"));
+    }
+  });
+
+  it("a deeper interview is never booked shorter than a shallower one", () => {
+    const q = VyneDepth.target("quick");
+    const s = VyneDepth.target("standard");
+    const d = VyneDepth.target("deep");
+    expect(q.high).toBeLessThan(s.high);
+    expect(s.high).toBeLessThan(d.high);
+    expect(q.low).toBeLessThan(s.low);
+    expect(s.low).toBeLessThan(d.low);
+  });
 });
